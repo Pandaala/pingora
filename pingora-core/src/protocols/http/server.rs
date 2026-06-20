@@ -14,6 +14,7 @@
 
 //! HTTP server session APIs
 
+use super::body_buffer::{EarlyBodyReplay, RequestBodyBuffer};
 use super::custom::server::Session as SessionCustom;
 use super::error_resp;
 use super::subrequest::server::HttpSession as SessionSubrequest;
@@ -678,6 +679,25 @@ impl Session {
             Self::H2(s) => s.get_retry_buffer(),
             Self::Subrequest(s) => s.get_retry_buffer(),
             Self::Custom(s) => s.get_retry_buffer(),
+        }
+    }
+
+    /// Register an app-supplied request body buffer (opt-in). Supported on the H1/H2
+    /// data plane only; a no-op for subrequest/custom sessions.
+    pub fn set_request_body_buffer(&mut self, buffer: Box<dyn RequestBodyBuffer>) {
+        match self {
+            Self::H1(s) => s.set_request_body_buffer(buffer),
+            Self::H2(s) => s.set_request_body_buffer(buffer),
+            Self::Subrequest(_) | Self::Custom(_) => {}
+        }
+    }
+
+    /// Source the upstream body from a registered early buffer (see `EarlyBodyReplay`).
+    pub async fn take_early_body_for_replay(&mut self) -> Result<EarlyBodyReplay> {
+        match self {
+            Self::H1(s) => s.take_early_body_for_replay().await,
+            Self::H2(s) => s.take_early_body_for_replay().await,
+            Self::Subrequest(_) | Self::Custom(_) => Ok(EarlyBodyReplay::NotRegistered),
         }
     }
 

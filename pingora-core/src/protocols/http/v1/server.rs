@@ -35,7 +35,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::body::{BodyReader, BodyWriter};
 use super::common::*;
 use super::header::HeaderWriter;
-use crate::protocols::http::{body_buffer::FixedBuffer, date, HttpTask, ReusableHttpStream};
+use crate::protocols::http::{
+    body_buffer::{EarlyBodyReplay, FixedBuffer, RequestBodyBuffer},
+    date, HttpTask, ReusableHttpStream,
+};
 use crate::protocols::{Digest, SocketAddr, Stream};
 use crate::utils::{BufRef, KVRef};
 
@@ -107,6 +110,9 @@ pub struct HttpSession {
     request_header: Option<Box<RequestHeader>>,
     /// An internal buffer that holds a copy of the request body up to a certain size
     retry_buffer: Option<FixedBuffer>,
+    /// Optional app-supplied buffer that captures the full request body for early
+    /// inspection / rewrite and replay to upstream. Parallel to `retry_buffer`.
+    early_body_buffer: Option<Box<dyn RequestBodyBuffer>>,
     /// Whether this session is an upgraded session. This flag is calculated when sending the
     /// response header to the client.
     upgraded: bool,
@@ -188,6 +194,7 @@ impl HttpSession {
             body_bytes_sent: 0,
             body_bytes_read: 0,
             retry_buffer: None,
+            early_body_buffer: None,
             upgraded: false,
             digest,
             min_send_rate: None,
@@ -540,15 +547,18 @@ impl HttpSession {
 
     /// Read the request body. `Ok(None)` when there is no (more) body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
-        let read = self.read_body().await?;
-        Ok(read.map(|b| {
-            let bytes = Bytes::copy_from_slice(self.get_body(&b));
-            self.body_bytes_read += bytes.len();
-            if let Some(buffer) = self.retry_buffer.as_mut() {
-                buffer.write_to_buffer(&bytes);
-            }
-            bytes
-        }))
+        let Some(b) = self.read_body().await? else {
+            return Ok(None);
+        };
+        let bytes = Bytes::copy_from_slice(self.get_body(&b));
+        self.body_bytes_read += bytes.len();
+        if let Some(buffer) = self.retry_buffer.as_mut() {
+            buffer.write_to_buffer(&bytes);
+        }
+        if let Some(eb) = self.early_body_buffer.as_mut() {
+            eb.write(&bytes).await?;
+        }
+        Ok(Some(bytes))
     }
 
     async fn do_read_body(&mut self) -> Result<Option<BufRef>> {
@@ -1131,6 +1141,22 @@ impl HttpSession {
                 b.get_buffer()
             }
         })
+    }
+
+    pub fn set_request_body_buffer(&mut self, buffer: Box<dyn RequestBodyBuffer>) {
+        self.early_body_buffer = Some(buffer);
+    }
+
+    /// Source the body to replay upstream from the registered early buffer. Does NOT
+    /// unregister the buffer, so the proxy retry loop can call this again.
+    pub async fn take_early_body_for_replay(&mut self) -> Result<EarlyBodyReplay> {
+        match self.early_body_buffer.as_mut() {
+            None => Ok(EarlyBodyReplay::NotRegistered),
+            Some(b) => match b.get().await? {
+                Some(body) => Ok(EarlyBodyReplay::Body(body)),
+                None => Ok(EarlyBodyReplay::Unavailable),
+            },
+        }
     }
 
     fn get_body(&self, buf_ref: &BufRef) -> &[u8] {
@@ -4285,5 +4311,39 @@ mod test_pipelining {
             .unwrap()
             .expect("pipelined request must parse");
         assert_eq!(b.req_header().uri.path(), "/two");
+    }
+
+    #[tokio::test]
+    async fn early_body_buffer_captures_and_replays() {
+        use crate::protocols::http::body_buffer::{EarlyBodyReplay, InMemoryRequestBodyBuffer};
+        init_log();
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\nabc";
+        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream.set_request_body_buffer(Box::new(InMemoryRequestBodyBuffer::new()));
+        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(res, b"abc".as_slice());
+        match http_stream.take_early_body_for_replay().await.unwrap() {
+            EarlyBodyReplay::Body(b) => assert_eq!(b, b"abc".as_slice()),
+            _ => panic!("expected captured body"),
+        }
+    }
+
+    #[tokio::test]
+    async fn early_body_buffer_not_registered() {
+        use crate::protocols::http::body_buffer::EarlyBodyReplay;
+        init_log();
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\nabc";
+        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        let _ = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert!(matches!(
+            http_stream.take_early_body_for_replay().await.unwrap(),
+            EarlyBodyReplay::NotRegistered
+        ));
     }
 }

@@ -15,6 +15,7 @@
 //! HTTP/1.x and HTTP/2 implementation APIs
 
 pub mod body_buffer;
+pub use body_buffer::{EarlyBodyReplay, InMemoryRequestBodyBuffer, RequestBodyBuffer};
 pub mod bridge;
 pub mod client;
 pub mod compression;

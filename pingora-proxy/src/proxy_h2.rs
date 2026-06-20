@@ -22,6 +22,7 @@ use http::{header::CONTENT_LENGTH, Method, StatusCode};
 use pingora_cache::CachePhase;
 use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
 use pingora_core::protocols::http::v2::{client::Http2Session, write_body};
+use pingora_core::protocols::http::EarlyBodyReplay;
 
 // add scheme and authority as required by h2 lib
 fn update_h2_scheme_authority(
@@ -390,17 +391,50 @@ where
 
         let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
 
-        // retry, send buffer if it exists
-        if let Some(buffer) = session.as_mut().get_retry_buffer() {
-            self.send_body_to2(
-                session,
-                Some(buffer),
-                downstream_state.is_done(),
-                client_body,
-                ctx,
-                write_timeout,
-            )
-            .await?;
+        // Early request body buffer (Edgion seam) — see proxy_h1 for rationale.
+        let early_replay = if session.as_mut().is_body_empty() {
+            EarlyBodyReplay::NotRegistered
+        } else {
+            session.as_mut().take_early_body_for_replay().await?
+        };
+        match early_replay {
+            EarlyBodyReplay::Body(body) => {
+                if !downstream_state.is_done() {
+                    return Error::e_explain(
+                        InternalError,
+                        "early request body buffer present but downstream body not fully drained",
+                    );
+                }
+                self.send_body_to2(
+                    session,
+                    Some(body),
+                    downstream_state.is_done(),
+                    client_body,
+                    ctx,
+                    write_timeout,
+                )
+                .await?;
+            }
+            EarlyBodyReplay::Unavailable => {
+                return Error::e_explain(
+                    InternalError,
+                    "early request body buffer produced no body",
+                );
+            }
+            EarlyBodyReplay::NotRegistered => {
+                // retry, send buffer if it exists
+                if let Some(buffer) = session.as_mut().get_retry_buffer() {
+                    self.send_body_to2(
+                        session,
+                        Some(buffer),
+                        downstream_state.is_done(),
+                        client_body,
+                        ctx,
+                        write_timeout,
+                    )
+                    .await?;
+                }
+            }
         }
 
         let mut response_state = ResponseStateMachine::new();

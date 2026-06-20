@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::task::ready;
 use std::time::Duration;
 
-use crate::protocols::http::body_buffer::FixedBuffer;
+use crate::protocols::http::body_buffer::{EarlyBodyReplay, FixedBuffer, RequestBodyBuffer};
 use crate::protocols::http::date::get_cached_date;
 use crate::protocols::http::v1::client::http_req_header_to_wire;
 use crate::protocols::http::HttpTask;
@@ -189,6 +189,8 @@ pub struct HttpSession {
     body_sent: usize,
     // buffered request body for retry logic
     retry_buffer: Option<FixedBuffer>,
+    // early body capture hook for upstream replay
+    early_body_buffer: Option<Box<dyn RequestBodyBuffer>>,
     // digest to record underlying connection info
     digest: Arc<Digest>,
     /// The write timeout which will be applied to writing response body.
@@ -235,6 +237,7 @@ impl HttpSession {
                 body_read: 0,
                 body_sent: 0,
                 retry_buffer: None,
+                early_body_buffer: None,
                 digest,
                 write_timeout: None,
                 total_drain_timeout: None,
@@ -269,6 +272,9 @@ impl HttpSession {
             self.body_read += data.len();
             if let Some(buffer) = self.retry_buffer.as_mut() {
                 buffer.write_to_buffer(data);
+            }
+            if let Some(eb) = self.early_body_buffer.as_mut() {
+                eb.write(data).await?;
             }
             let _ = self
                 .request_body_reader
@@ -635,6 +641,22 @@ impl HttpSession {
                 b.get_buffer()
             }
         })
+    }
+
+    pub fn set_request_body_buffer(&mut self, buffer: Box<dyn RequestBodyBuffer>) {
+        self.early_body_buffer = Some(buffer);
+    }
+
+    /// Source the body to replay upstream from the registered early buffer. Does NOT
+    /// unregister the buffer, so the proxy retry loop can call this again.
+    pub async fn take_early_body_for_replay(&mut self) -> Result<EarlyBodyReplay> {
+        match self.early_body_buffer.as_mut() {
+            None => Ok(EarlyBodyReplay::NotRegistered),
+            Some(b) => match b.get().await? {
+                Some(body) => Ok(EarlyBodyReplay::Body(body)),
+                None => Ok(EarlyBodyReplay::Unavailable),
+            },
+        }
     }
 
     /// `async fn idle() -> Result<Reason, Error>;`

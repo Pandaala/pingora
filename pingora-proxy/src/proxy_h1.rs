@@ -20,6 +20,7 @@ use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
 use pingora_cache::CachePhase;
 use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
+use pingora_core::protocols::http::EarlyBodyReplay;
 
 impl<SV, C> HttpProxy<SV, C>
 where
@@ -397,22 +398,62 @@ where
 
         let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
 
-        let buffer = session.as_ref().get_retry_buffer();
-
-        // retry, send buffer if it exists or body empty
-        if buffer.is_some() || session.as_mut().is_body_empty() {
-            let send_permit = tx
-                .reserve()
-                .await
-                .or_err(InternalError, "reserving body pipe")?;
-            self.send_body_to_pipe(
-                session,
-                buffer,
-                downstream_state.is_done(),
-                send_permit,
-                ctx,
-            )
-            .await?;
+        // Early request body buffer (Edgion seam): if a body is expected and a buffer
+        // was registered in request_filter, replay its body (original or rewritten).
+        // Empty bodies take the native path, which terminates the request correctly.
+        let early_replay = if session.as_mut().is_body_empty() {
+            EarlyBodyReplay::NotRegistered
+        } else {
+            session.as_mut().take_early_body_for_replay().await?
+        };
+        match early_replay {
+            EarlyBodyReplay::Body(body) => {
+                if !downstream_state.is_done() {
+                    return Error::e_explain(
+                        InternalError,
+                        "early request body buffer present but downstream body not fully drained",
+                    );
+                }
+                let send_permit = tx
+                    .reserve()
+                    .await
+                    .or_err(InternalError, "reserving body pipe")?;
+                self.send_body_to_pipe(
+                    session,
+                    Some(body),
+                    downstream_state.is_done(),
+                    send_permit,
+                    ctx,
+                )
+                .await?;
+            }
+            // Guard: a registered buffer that yields no body fails the request rather
+            // than silently sending an empty/short body to upstream.
+            EarlyBodyReplay::Unavailable => {
+                return Error::e_explain(
+                    InternalError,
+                    "early request body buffer produced no body",
+                );
+            }
+            // Native retry-buffer path, behavior-preserving.
+            EarlyBodyReplay::NotRegistered => {
+                let buffer = session.as_ref().get_retry_buffer();
+                // retry, send buffer if it exists or body empty
+                if buffer.is_some() || session.as_mut().is_body_empty() {
+                    let send_permit = tx
+                        .reserve()
+                        .await
+                        .or_err(InternalError, "reserving body pipe")?;
+                    self.send_body_to_pipe(
+                        session,
+                        buffer,
+                        downstream_state.is_done(),
+                        send_permit,
+                        ctx,
+                    )
+                    .await?;
+                }
+            }
         }
 
         let mut response_state = ResponseStateMachine::new();
