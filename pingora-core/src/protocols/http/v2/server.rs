@@ -29,7 +29,9 @@ use std::sync::Arc;
 use std::task::ready;
 use std::time::Duration;
 
-use crate::protocols::http::body_buffer::FixedBuffer;
+use crate::protocols::http::body_buffer::{
+    FixedBuffer, RegisteredRequestBodyBuffer, RequestBodyBuffer,
+};
 use crate::protocols::http::date::get_cached_date;
 use crate::protocols::http::v1::client::http_req_header_to_wire;
 use crate::protocols::http::HttpTask;
@@ -117,6 +119,19 @@ pub struct HttpSession {
     body_sent: usize,
     // buffered request body for retry logic
     retry_buffer: Option<FixedBuffer>,
+    // early body capture hook for upstream replay
+    early_body_buffer: Option<RegisteredRequestBodyBuffer>,
+    // Set right before awaiting an `early_body_buffer` capture/finish and cleared
+    // once the await returns Ok. A body-read future dropped mid-await
+    // (select!/timeout cancellation) leaves it set: the chunk was already
+    // consumed from the stream, so the buffered body is incomplete and any
+    // further body read or replay must fail closed.
+    early_body_capture_poisoned: bool,
+    // Set when `drain_request_body` discards a registered `early_body_buffer`.
+    // The body bytes are gone from both the stream and the buffer, so a later
+    // replay attempt must fail closed instead of silently forwarding a bodyless
+    // request upstream.
+    early_body_buffer_discarded: bool,
     // digest to record underlying connection info
     digest: Arc<Digest>,
     /// The write timeout which will be applied to writing response body.
@@ -163,6 +178,9 @@ impl HttpSession {
                 body_read: 0,
                 body_sent: 0,
                 retry_buffer: None,
+                early_body_buffer: None,
+                early_body_capture_poisoned: false,
+                early_body_buffer_discarded: false,
                 digest,
                 write_timeout: None,
                 total_drain_timeout: None,
@@ -188,6 +206,12 @@ impl HttpSession {
 
     /// Read request body bytes. `None` when there is no more body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
+        if self.early_body_capture_poisoned {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                "request body capture was cancelled mid-chunk; buffered body is incomplete",
+            );
+        }
         // TODO: timeout
         let data = self.request_body_reader.data().await.transpose().or_err(
             ErrorType::ReadError,
@@ -198,19 +222,47 @@ impl HttpSession {
             if let Some(buffer) = self.retry_buffer.as_mut() {
                 buffer.write_to_buffer(data);
             }
+            // Release flow control before the (cancellable) capture await: the
+            // bytes are already consumed from the stream either way, and doing
+            // it here keeps a cancelled capture from leaking this chunk's
+            // flow-control window.
             let _ = self
                 .request_body_reader
                 .flow_control()
                 .release_capacity(data.len());
+            if let Some(buffer) = self.early_body_buffer.as_mut() {
+                // Poison across the await: if this future is dropped mid-await
+                // the flag stays set and the session fails closed from then on.
+                self.early_body_capture_poisoned = true;
+                buffer.capture(data).await?;
+                self.early_body_capture_poisoned = false;
+            }
+            if self.request_body_reader.is_end_stream() {
+                if let Some(buffer) = self.early_body_buffer.as_mut() {
+                    self.early_body_capture_poisoned = true;
+                    buffer.finish_capture().await?;
+                    self.early_body_capture_poisoned = false;
+                }
+            }
+        } else if let Some(buffer) = self.early_body_buffer.as_mut() {
+            self.early_body_capture_poisoned = true;
+            buffer.finish_capture().await?;
+            self.early_body_capture_poisoned = false;
         }
         Ok(data)
     }
 
+    // A `RequestBodyBuffer::write` is async and cannot run in a poll context.
+    // Fail closed when capture/replay is registered instead of silently returning
+    // bytes that bypass the buffer.
     #[doc(hidden)]
     pub fn poll_read_body_bytes(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Bytes, h2::Error>>> {
+        if self.early_body_buffer.is_some() {
+            return Poll::Ready(Some(Err(h2::Reason::INTERNAL_ERROR.into())));
+        }
         let data = match ready!(self.request_body_reader.poll_data(cx)).transpose() {
             Ok(data) => data,
             Err(err) => return Poll::Ready(Some(Err(err))),
@@ -242,6 +294,12 @@ impl HttpSession {
     pub async fn drain_request_body(&mut self) -> Result<()> {
         if self.is_body_done() {
             return Ok(());
+        }
+        // Draining discards the remaining body — incompatible with capture-for-replay,
+        // so drop any early body buffer first and remember the discard so a later
+        // replay attempt fails closed (see the v1 counterpart for rationale).
+        if self.early_body_buffer.take().is_some() {
+            self.early_body_buffer_discarded = true;
         }
         match self.total_drain_timeout {
             Some(t) => match timeout(t, self.do_drain_request_body()).await {
@@ -514,13 +572,29 @@ impl HttpSession {
 
     /// Whether there is no more body to read
     pub fn is_body_done(&self) -> bool {
+        if self
+            .early_body_buffer
+            .as_ref()
+            .is_some_and(RegisteredRequestBodyBuffer::is_replaying)
+        {
+            return false;
+        }
         // Check no body in request
         // Also check we hit end of stream
         self.is_body_empty() || self.request_body_reader.is_end_stream()
     }
 
     /// Whether there is any body to read. true means there no body in request.
+    ///
+    /// While an early request body buffer is registered, the effective body is whatever
+    /// the buffer replays, which may be a non-empty rewrite of a zero-byte original
+    /// (e.g. HEADERS without END_STREAM followed by an empty END_STREAM DATA frame).
+    /// Report non-empty then, so upstream framing decisions (H2 END_STREAM on HEADERS)
+    /// keep the stream open until replay reaches EOF.
     pub fn is_body_empty(&self) -> bool {
+        if self.early_body_buffer.is_some() {
+            return false;
+        }
         self.body_read == 0
             && (self.request_body_reader.is_end_stream()
                 || self
@@ -552,6 +626,57 @@ impl HttpSession {
         })
     }
 
+    /// See `v1::server::HttpSession::set_request_body_buffer`. Fails closed if the
+    /// body has already started being read (would capture only the remainder).
+    pub fn set_request_body_buffer(&mut self, buffer: Box<dyn RequestBodyBuffer>) -> Result<()> {
+        if self.early_body_buffer.is_some() {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                "request body buffer is already registered",
+            );
+        }
+        if self.is_body_empty() {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                "request body buffer cannot be registered for an empty request body",
+            );
+        }
+        if self.body_read > 0 {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                "request body buffer must be registered before the body is read",
+            );
+        }
+        self.early_body_buffer = Some(RegisteredRequestBodyBuffer::new(buffer));
+        Ok(())
+    }
+
+    pub fn request_body_buffer_registered(&self) -> bool {
+        self.early_body_buffer.is_some()
+    }
+
+    /// Prepare the registered buffer as the active request-body source for one
+    /// upstream attempt. Returns `false` when no buffer was registered.
+    pub async fn begin_request_body_replay(&mut self) -> Result<bool> {
+        if self.early_body_capture_poisoned {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                "request body capture was cancelled mid-chunk; refusing to replay incomplete buffered body",
+            );
+        }
+        if self.early_body_buffer_discarded {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                "request body buffer was discarded by drain_request_body; the request body is gone and cannot be replayed",
+            );
+        }
+        let Some(registered) = self.early_body_buffer.as_mut() else {
+            return Ok(false);
+        };
+        registered.begin_replay().await?;
+        Ok(true)
+    }
+
     /// `async fn idle() -> Result<Reason, Error>;`
     /// This async fn will be pending forever until the client closes the stream/connection
     /// This function is used for watching client status so that the server is able to cancel
@@ -563,6 +688,11 @@ impl HttpSession {
     /// Similar to `read_body_bytes()` but will be pending after Ok(None) is returned,
     /// until the client closes the connection
     pub async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
+        if let Some(registered) = self.early_body_buffer.as_mut() {
+            if registered.is_replaying() {
+                return registered.next_chunk().await;
+            }
+        }
         if no_body_expected || self.is_body_done() {
             let reason = self.idle().await?;
             Error::e_explain(
@@ -946,6 +1076,379 @@ mod test {
 
         for handle in handles {
             // ensure no panics
+            assert!(handle.await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_early_body_buffer_captures_replays_and_rejects_late_set() {
+        let (client, server) = duplex(65536);
+        let mut handles = vec![];
+
+        handles.push(tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                connection.await.unwrap();
+            });
+            let mut h2 = h2.ready().await.unwrap();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://www.example.com/")
+                .body(())
+                .unwrap();
+            let (response, mut req_body) = h2.send_request(request, false).unwrap();
+            req_body.send_data("abc".into(), true).unwrap();
+            let (head, _body) = response.await.unwrap().into_parts();
+            assert_eq!(head.status, 200);
+        }));
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
+            handles.push(tokio::spawn(async move {
+                use crate::protocols::http::body_buffer::InMemoryRequestBodyBuffer;
+                http.set_request_body_buffer(Box::new(InMemoryRequestBodyBuffer::new()))
+                    .unwrap();
+                {
+                    let waker = futures::task::noop_waker();
+                    let mut poll_ctx = std::task::Context::from_waker(&waker);
+                    assert!(matches!(
+                        http.poll_read_body_bytes(&mut poll_ctx),
+                        Poll::Ready(Some(Err(_)))
+                    ));
+                }
+                let mut total = Vec::new();
+                while let Some(chunk) = http.read_body_bytes().await.unwrap() {
+                    total.extend_from_slice(&chunk);
+                }
+                assert_eq!(total, b"abc");
+                // Rewindable: every upstream attempt reads the same body in chunks.
+                for _ in 0..2 {
+                    assert!(http.begin_request_body_replay().await.unwrap());
+                    assert_eq!(
+                        http.read_body_or_idle(false).await.unwrap().unwrap(),
+                        b"abc".as_slice()
+                    );
+                    assert!(http.read_body_or_idle(false).await.unwrap().is_none());
+                }
+                // Registering after the body was read must fail closed.
+                assert!(http
+                    .set_request_body_buffer(Box::new(InMemoryRequestBodyBuffer::new()))
+                    .is_err());
+                let response_header = Box::new(ResponseHeader::build(200, None).unwrap());
+                http.write_response_header(response_header, true).unwrap();
+            }));
+        }
+
+        for handle in handles {
+            assert!(handle.await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_early_body_buffer_not_registered_h2() {
+        let (client, server) = duplex(65536);
+        let mut handles = vec![];
+
+        handles.push(tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                connection.await.unwrap();
+            });
+            let mut h2 = h2.ready().await.unwrap();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://www.example.com/")
+                .body(())
+                .unwrap();
+            let (response, mut req_body) = h2.send_request(request, false).unwrap();
+            req_body.send_data("abc".into(), true).unwrap();
+            let (head, _body) = response.await.unwrap().into_parts();
+            assert_eq!(head.status, 200);
+        }));
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
+            handles.push(tokio::spawn(async move {
+                while http.read_body_bytes().await.unwrap().is_some() {}
+                assert!(!http.begin_request_body_replay().await.unwrap());
+                let response_header = Box::new(ResponseHeader::build(200, None).unwrap());
+                http.write_response_header(response_header, true).unwrap();
+            }));
+        }
+
+        for handle in handles {
+            assert!(handle.await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_drain_discards_buffer_and_poisons_replay_h2() {
+        let (client, server) = duplex(65536);
+        let mut handles = vec![];
+
+        handles.push(tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                connection.await.unwrap();
+            });
+            let mut h2 = h2.ready().await.unwrap();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://www.example.com/")
+                .body(())
+                .unwrap();
+            let (response, mut req_body) = h2.send_request(request, false).unwrap();
+            req_body.send_data("abc".into(), true).unwrap();
+            let (head, _body) = response.await.unwrap().into_parts();
+            assert_eq!(head.status, 200);
+        }));
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
+            handles.push(tokio::spawn(async move {
+                use crate::protocols::http::body_buffer::InMemoryRequestBodyBuffer;
+                http.set_request_body_buffer(Box::new(InMemoryRequestBodyBuffer::new()))
+                    .unwrap();
+                http.drain_request_body().await.unwrap();
+                // The registered buffer was discarded with the body: replay must
+                // fail closed rather than report "no buffer registered" and let
+                // the proxy forward a request whose body is gone.
+                assert!(http.begin_request_body_replay().await.is_err());
+                let response_header = Box::new(ResponseHeader::build(200, None).unwrap());
+                http.write_response_header(response_header, true).unwrap();
+            }));
+        }
+
+        for handle in handles {
+            assert!(handle.await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_zero_payload_body_stays_non_empty_while_registered_h2() {
+        use crate::protocols::http::body_buffer::RequestBodyBuffer;
+
+        /// Ignores captured data and replays a fixed non-empty body, like an
+        /// app rewriting a zero-byte payload.
+        #[derive(Default)]
+        struct RewriteToNonEmptyBuffer {
+            offset: usize,
+        }
+
+        const REWRITTEN_BODY: &[u8] = b"rewritten";
+
+        #[async_trait::async_trait]
+        impl RequestBodyBuffer for RewriteToNonEmptyBuffer {
+            async fn write(&mut self, _data: &Bytes) -> Result<()> {
+                Ok(())
+            }
+
+            async fn finish(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            async fn rewind(&mut self) -> Result<()> {
+                self.offset = 0;
+                Ok(())
+            }
+
+            async fn next_chunk(&mut self, max_bytes: usize) -> Result<Option<Bytes>> {
+                if self.offset >= REWRITTEN_BODY.len() {
+                    return Ok(None);
+                }
+                let end = self
+                    .offset
+                    .saturating_add(max_bytes)
+                    .min(REWRITTEN_BODY.len());
+                Ok(Some(Bytes::from_static(&REWRITTEN_BODY[self.offset..end])))
+            }
+
+            fn consume(&mut self, bytes: usize) {
+                self.offset = self.offset.saturating_add(bytes);
+            }
+        }
+
+        let (client, server) = duplex(65536);
+        let mut handles = vec![];
+        // Sequencing: the client sends its empty END_STREAM DATA frame only
+        // after the server registered the buffer, so registration always sees
+        // a stream whose emptiness is still unknown.
+        let (registered_tx, registered_rx) = tokio::sync::oneshot::channel::<()>();
+
+        handles.push(tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                connection.await.unwrap();
+            });
+            let mut h2 = h2.ready().await.unwrap();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://www.example.com/")
+                .body(())
+                .unwrap();
+            let (response, mut req_body) = h2.send_request(request, false).unwrap(); // no EOS
+            registered_rx.await.unwrap();
+            // A zero-byte payload whose framing permitted a body.
+            req_body.send_data("".into(), true).unwrap();
+            let (head, _body) = response.await.unwrap().into_parts();
+            assert_eq!(head.status, 200);
+        }));
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        let mut registered_tx = Some(registered_tx);
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
+            let registered_tx = registered_tx.take().unwrap();
+            handles.push(tokio::spawn(async move {
+                http.set_request_body_buffer(Box::new(RewriteToNonEmptyBuffer::default()))
+                    .unwrap();
+                assert!(!http.is_body_empty());
+                registered_tx.send(()).unwrap();
+                // Drain: the client now ends the stream with an empty DATA
+                // frame, so zero bytes are captured.
+                while let Some(chunk) = http.read_body_bytes().await.unwrap() {
+                    assert!(chunk.is_empty());
+                }
+                // Zero bytes were captured and END_STREAM was received, but the
+                // registered buffer may rewrite the body: the emptiness
+                // decision proxy_h2 derives END_STREAM-on-HEADERS from must
+                // keep tracking the replay source instead of the original
+                // payload.
+                assert!(!http.is_body_empty());
+                assert!(http.begin_request_body_replay().await.unwrap());
+                assert!(!http.is_body_empty());
+                assert_eq!(
+                    http.read_body_or_idle(false).await.unwrap().unwrap(),
+                    REWRITTEN_BODY
+                );
+                assert!(http.read_body_or_idle(false).await.unwrap().is_none());
+                let response_header = Box::new(ResponseHeader::build(200, None).unwrap());
+                http.write_response_header(response_header, true).unwrap();
+            }));
+        }
+
+        for handle in handles {
+            assert!(handle.await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_capture_poisons_h2_session() {
+        use crate::protocols::http::body_buffer::RequestBodyBuffer;
+        use std::future::Future;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// A capture impl that flags entry into `write()` and then never
+        /// completes, opening a deterministic cancellation window after the
+        /// chunk has been consumed from the stream.
+        struct PendingCaptureBuffer {
+            entered: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl RequestBodyBuffer for PendingCaptureBuffer {
+            async fn write(&mut self, _data: &Bytes) -> Result<()> {
+                self.entered.store(true, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+                Ok(())
+            }
+
+            async fn finish(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            async fn rewind(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            async fn next_chunk(&mut self, _max_bytes: usize) -> Result<Option<Bytes>> {
+                Ok(None)
+            }
+
+            fn consume(&mut self, _bytes: usize) {}
+        }
+
+        let (client, server) = duplex(65536);
+        let mut handles = vec![];
+
+        handles.push(tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let mut h2 = h2.ready().await.unwrap();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://www.example.com/")
+                .body(())
+                .unwrap();
+            let (response, mut req_body) = h2.send_request(request, false).unwrap();
+            req_body.send_data("abc".into(), true).unwrap();
+            // The poisoned server session errors out instead of responding.
+            assert!(response.await.is_err());
+        }));
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
+            handles.push(tokio::spawn(async move {
+                let entered = Arc::new(AtomicBool::new(false));
+                http.set_request_body_buffer(Box::new(PendingCaptureBuffer {
+                    entered: entered.clone(),
+                }))
+                .unwrap();
+                // Manually poll read_body_bytes until it has consumed the chunk
+                // and suspended inside the buffer's write(), then drop the
+                // future — modeling a losing select!/timeout branch cancelling
+                // the read mid-capture.
+                {
+                    let mut fut = Box::pin(http.read_body_bytes());
+                    let waker = futures::task::noop_waker();
+                    loop {
+                        // Scope the Context to a single poll: it is not Send and
+                        // must not live across the yield await below.
+                        let pending = {
+                            let mut poll_ctx = std::task::Context::from_waker(&waker);
+                            fut.as_mut().poll(&mut poll_ctx).is_pending()
+                        };
+                        assert!(pending);
+                        if entered.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }
+                // The chunk is gone from both the app's view and the buffer:
+                // the session must fail closed on any further read or replay.
+                assert!(http.read_body_bytes().await.is_err());
+                assert!(http.begin_request_body_replay().await.is_err());
+            }));
+        }
+
+        for handle in handles {
             assert!(handle.await.is_ok());
         }
     }

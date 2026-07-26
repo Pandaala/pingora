@@ -81,6 +81,10 @@ where
             }
         }
 
+        if let Err(e) = session.as_mut().begin_request_body_replay().await {
+            return (false, true, Some(e));
+        }
+
         session.upstream_compression.request_filter(&req);
 
         debug!("Sending header to upstream {:?}", req);
@@ -305,8 +309,8 @@ where
         let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
 
         let buffer = session.as_ref().get_retry_buffer();
-
-        // retry, send buffer if it exists or body empty
+        // Native retry-buffer path. Registered app buffers are replayed through
+        // `read_body_or_idle()` below, one bounded chunk at a time.
         if buffer.is_some() || session.as_mut().is_body_empty() {
             let send_permit = tx
                 .reserve()

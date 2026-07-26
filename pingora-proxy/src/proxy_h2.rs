@@ -121,6 +121,10 @@ where
             }
         }
 
+        if let Err(e) = session.as_mut().begin_request_body_replay().await {
+            return (false, Some(e));
+        }
+
         // Remove H1 `Host` header, save it in order to add to :authority
         // We do this because certain H2 servers expect request not to have a host header.
         // The `Host` is removed after the upstream filters above for 2 reasons
@@ -299,7 +303,8 @@ where
 
         let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
 
-        // retry, send buffer if it exists
+        // Native retry-buffer path. Registered app buffers are replayed through
+        // `read_body_or_idle()` below, one bounded chunk at a time.
         if let Some(buffer) = session.as_mut().get_retry_buffer() {
             self.send_body_to2(
                 session,
