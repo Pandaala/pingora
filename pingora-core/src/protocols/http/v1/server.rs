@@ -3149,14 +3149,23 @@ mod test_early_body_buffer {
         buf: BytesMut,
         body: Option<Bytes>,
         offset: usize,
+        chunk_cap: usize,
     }
 
     impl YieldingBuffer {
         fn new() -> Self {
+            Self::with_chunk_cap(usize::MAX)
+        }
+
+        /// Cap each replay chunk at `chunk_cap` bytes so a small test body
+        /// still replays in multiple chunks, like a large body against the
+        /// real 64 KiB replay chunk size.
+        fn with_chunk_cap(chunk_cap: usize) -> Self {
             YieldingBuffer {
                 buf: BytesMut::new(),
                 body: None,
                 offset: 0,
+                chunk_cap,
             }
         }
     }
@@ -3188,7 +3197,10 @@ mod test_early_body_buffer {
             if self.offset >= body.len() {
                 return Ok(None);
             }
-            let end = self.offset.saturating_add(max_bytes).min(body.len());
+            let end = self
+                .offset
+                .saturating_add(max_bytes.min(self.chunk_cap))
+                .min(body.len());
             Ok(Some(body.slice(self.offset..end)))
         }
 
@@ -3257,6 +3269,58 @@ mod test_early_body_buffer {
                 .unwrap()
                 .is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn rewind_from_mid_replay_re_serves_full_body() {
+        init_log();
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nContent-Length: 6\r\n\r\nabcdef";
+        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        // 2-byte replay chunks: the 6-byte body replays in multiple chunks,
+        // like a large body against the real 64 KiB replay chunk size.
+        http_stream
+            .set_request_body_buffer(Box::new(YieldingBuffer::with_chunk_cap(2)))
+            .unwrap();
+        assert_eq!(
+            http_stream.read_body_bytes().await.unwrap().unwrap(),
+            b"abcdef".as_slice()
+        );
+
+        // Attempt 1 fails mid-replay: one chunk was delivered (its commit
+        // still pending) when the retry rewinds from the Replaying state.
+        assert!(http_stream.begin_request_body_replay().await.unwrap());
+        assert_eq!(
+            http_stream.read_body_or_idle(false).await.unwrap().unwrap(),
+            b"ab".as_slice()
+        );
+        assert!(http_stream.begin_request_body_replay().await.unwrap());
+        let mut replayed = Vec::new();
+        while let Some(chunk) = http_stream.read_body_or_idle(false).await.unwrap() {
+            replayed.extend_from_slice(&chunk);
+        }
+        assert_eq!(replayed, b"abcdef");
+
+        // Attempt 2 fails with a read in flight: the read is cancelled
+        // mid-poll (losing select! branch) before the retry rewinds from the
+        // Replaying state.
+        assert!(http_stream.begin_request_body_replay().await.unwrap());
+        assert_eq!(
+            http_stream.read_body_or_idle(false).await.unwrap().unwrap(),
+            b"ab".as_slice()
+        );
+        {
+            let mut fut = tokio_test::task::spawn(http_stream.read_body_or_idle(false));
+            assert!(fut.poll().is_pending());
+        }
+        assert!(http_stream.begin_request_body_replay().await.unwrap());
+        let mut replayed = Vec::new();
+        while let Some(chunk) = http_stream.read_body_or_idle(false).await.unwrap() {
+            replayed.extend_from_slice(&chunk);
+        }
+        assert_eq!(replayed, b"abcdef");
     }
 
     #[tokio::test]

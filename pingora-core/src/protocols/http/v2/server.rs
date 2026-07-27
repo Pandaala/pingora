@@ -1300,6 +1300,142 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_early_body_buffer_rewind_from_mid_replay_h2() {
+        use crate::protocols::http::body_buffer::RequestBodyBuffer;
+        use async_trait::async_trait;
+        use bytes::BytesMut;
+
+        /// Like a disk-spill impl: awaits (yields) inside next_chunk, opening
+        /// a cancellation window mid-replay. 2-byte replay chunks so a small
+        /// test body still replays in multiple chunks, like a large body
+        /// against the real 64 KiB replay chunk size.
+        struct SmallChunkYieldingBuffer {
+            buf: BytesMut,
+            body: Option<Bytes>,
+            offset: usize,
+        }
+
+        #[async_trait]
+        impl RequestBodyBuffer for SmallChunkYieldingBuffer {
+            async fn write(&mut self, data: &Bytes) -> Result<()> {
+                self.buf.extend_from_slice(data);
+                Ok(())
+            }
+
+            async fn finish(&mut self) -> Result<()> {
+                if self.body.is_none() {
+                    self.body = Some(self.buf.split().freeze());
+                }
+                Ok(())
+            }
+
+            async fn rewind(&mut self) -> Result<()> {
+                self.offset = 0;
+                Ok(())
+            }
+
+            async fn next_chunk(&mut self, max_bytes: usize) -> Result<Option<Bytes>> {
+                tokio::task::yield_now().await;
+                let Some(body) = self.body.as_ref() else {
+                    return Ok(None);
+                };
+                if self.offset >= body.len() {
+                    return Ok(None);
+                }
+                let end = self.offset.saturating_add(max_bytes.min(2)).min(body.len());
+                Ok(Some(body.slice(self.offset..end)))
+            }
+
+            fn consume(&mut self, bytes: usize) {
+                self.offset = self.offset.saturating_add(bytes);
+            }
+        }
+
+        let (client, server) = duplex(65536);
+        let mut handles = vec![];
+
+        handles.push(tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                connection.await.unwrap();
+            });
+            let mut h2 = h2.ready().await.unwrap();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://www.example.com/")
+                .body(())
+                .unwrap();
+            let (response, mut req_body) = h2.send_request(request, false).unwrap();
+            req_body.send_data("abcdef".into(), true).unwrap();
+            let (head, _body) = response.await.unwrap().into_parts();
+            assert_eq!(head.status, 200);
+        }));
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
+            handles.push(tokio::spawn(async move {
+                http.set_request_body_buffer(Box::new(SmallChunkYieldingBuffer {
+                    buf: BytesMut::new(),
+                    body: None,
+                    offset: 0,
+                }))
+                .unwrap();
+                let mut total = Vec::new();
+                while let Some(chunk) = http.read_body_bytes().await.unwrap() {
+                    total.extend_from_slice(&chunk);
+                }
+                assert_eq!(total, b"abcdef");
+
+                // Attempt 1 fails mid-replay: one chunk was delivered (its
+                // commit still pending) when the retry rewinds from the
+                // Replaying state.
+                assert!(http.begin_request_body_replay().await.unwrap());
+                assert_eq!(
+                    http.read_body_or_idle(false).await.unwrap().unwrap(),
+                    b"ab".as_slice()
+                );
+                assert!(http.begin_request_body_replay().await.unwrap());
+                let mut replayed = Vec::new();
+                while let Some(chunk) = http.read_body_or_idle(false).await.unwrap() {
+                    replayed.extend_from_slice(&chunk);
+                }
+                assert_eq!(replayed, b"abcdef");
+
+                // Attempt 2 fails with a read in flight: the read is
+                // cancelled mid-poll (losing select! branch) before the retry
+                // rewinds from the Replaying state.
+                assert!(http.begin_request_body_replay().await.unwrap());
+                assert_eq!(
+                    http.read_body_or_idle(false).await.unwrap().unwrap(),
+                    b"ab".as_slice()
+                );
+                {
+                    let mut fut = tokio_test::task::spawn(http.read_body_or_idle(false));
+                    assert!(fut.poll().is_pending());
+                }
+                assert!(http.begin_request_body_replay().await.unwrap());
+                let mut replayed = Vec::new();
+                while let Some(chunk) = http.read_body_or_idle(false).await.unwrap() {
+                    replayed.extend_from_slice(&chunk);
+                }
+                assert_eq!(replayed, b"abcdef");
+
+                let response_header = Box::new(ResponseHeader::build(200, None).unwrap());
+                http.write_response_header(response_header, true).unwrap();
+            }));
+        }
+
+        for handle in handles {
+            assert!(handle.await.is_ok());
+        }
+    }
+
+    #[tokio::test]
     async fn test_drain_discards_buffer_and_poisons_replay_h2() {
         let (client, server) = duplex(65536);
         let mut handles = vec![];
