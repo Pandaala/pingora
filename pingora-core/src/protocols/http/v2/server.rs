@@ -132,6 +132,12 @@ pub struct HttpSession {
     // replay attempt must fail closed instead of silently forwarding a bodyless
     // request upstream.
     early_body_buffer_discarded: bool,
+    // Set when the session drops a fully replayed `early_body_buffer` after the
+    // response was committed downstream (no further retry is possible then).
+    // A later replay attempt indicates a broken retry decision upstream of this
+    // session and must fail closed instead of silently forwarding a bodyless
+    // request.
+    early_body_buffer_released: bool,
     // digest to record underlying connection info
     digest: Arc<Digest>,
     /// The write timeout which will be applied to writing response body.
@@ -181,6 +187,7 @@ impl HttpSession {
                 early_body_buffer: None,
                 early_body_capture_poisoned: false,
                 early_body_buffer_discarded: false,
+                early_body_buffer_released: false,
                 digest,
                 write_timeout: None,
                 total_drain_timeout: None,
@@ -209,7 +216,7 @@ impl HttpSession {
         if self.early_body_capture_poisoned {
             return Error::e_explain(
                 ErrorType::InternalError,
-                "request body capture was cancelled mid-chunk; buffered body is incomplete",
+                "request body capture failed or was cancelled mid-chunk; buffered body is incomplete",
             );
         }
         // TODO: timeout
@@ -385,7 +392,32 @@ impl HttpSession {
         self.response_written = Some(header);
         self.send_response_body = Some(body_writer);
         self.ended = self.ended || end;
+        // Committing the response ends any possibility of an upstream retry; a
+        // fully replayed body buffer is dead weight for the rest of the response
+        // (which may be long-lived, e.g. SSE / gRPC streaming).
+        self.maybe_release_early_body_buffer();
         Ok(())
+    }
+
+    /// Drop the registered early body buffer once it can no longer be needed:
+    /// replay reached EOF AND the response header was committed downstream. Both
+    /// conditions are required — before the response commits, a retry may still
+    /// rewind and replay the buffer; before replay EOF, the current attempt is
+    /// still reading it. Called from both places where either condition becomes
+    /// true. The `early_body_buffer_released` flag makes any later replay
+    /// attempt fail closed (see `begin_request_body_replay`). Unlike HTTP/1,
+    /// `response_written` here is only ever a non-informational header (1xx are
+    /// not sent on the h2 path), so its presence alone means committed.
+    fn maybe_release_early_body_buffer(&mut self) {
+        if self.response_written.is_some()
+            && self
+                .early_body_buffer
+                .as_ref()
+                .is_some_and(RegisteredRequestBodyBuffer::is_replay_done)
+        {
+            self.early_body_buffer = None;
+            self.early_body_buffer_released = true;
+        }
     }
 
     /// Write response body to the client. See [Self::write_response_header] for how to use `end`.
@@ -627,12 +659,21 @@ impl HttpSession {
     }
 
     /// See `v1::server::HttpSession::set_request_body_buffer`. Fails closed if the
-    /// body has already started being read (would capture only the remainder).
+    /// body has already started being read (would capture only the remainder) and
+    /// for CONNECT requests, whose "body" is a bidirectional tunnel stream.
     pub fn set_request_body_buffer(&mut self, buffer: Box<dyn RequestBodyBuffer>) -> Result<()> {
         if self.early_body_buffer.is_some() {
             return Error::e_explain(
                 ErrorType::InternalError,
                 "request body buffer is already registered",
+            );
+        }
+        // Extended CONNECT (RFC 8441) also uses :method = CONNECT, so this single
+        // check covers both plain and extended CONNECT tunnels.
+        if self.request_header.method == http::Method::CONNECT {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                "request body buffer cannot be registered for a CONNECT request",
             );
         }
         if self.is_body_empty() {
@@ -655,19 +696,34 @@ impl HttpSession {
         self.early_body_buffer.is_some()
     }
 
+    /// Whether a registered request body buffer is currently replaying, i.e.
+    /// `read_body_or_idle` serves buffered chunks instead of reading the client
+    /// stream, so its errors originate in the buffer, not the client.
+    pub fn request_body_buffer_replaying(&self) -> bool {
+        self.early_body_buffer
+            .as_ref()
+            .is_some_and(RegisteredRequestBodyBuffer::is_replaying)
+    }
+
     /// Prepare the registered buffer as the active request-body source for one
     /// upstream attempt. Returns `false` when no buffer was registered.
     pub async fn begin_request_body_replay(&mut self) -> Result<bool> {
         if self.early_body_capture_poisoned {
             return Error::e_explain(
                 ErrorType::InternalError,
-                "request body capture was cancelled mid-chunk; refusing to replay incomplete buffered body",
+                "request body capture failed or was cancelled mid-chunk; refusing to replay incomplete buffered body",
             );
         }
         if self.early_body_buffer_discarded {
             return Error::e_explain(
                 ErrorType::InternalError,
                 "request body buffer was discarded by drain_request_body; the request body is gone and cannot be replayed",
+            );
+        }
+        if self.early_body_buffer_released {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                "request body buffer was released after the response was committed downstream; no further replay is possible",
             );
         }
         let Some(registered) = self.early_body_buffer.as_mut() else {
@@ -690,7 +746,14 @@ impl HttpSession {
     pub async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
         if let Some(registered) = self.early_body_buffer.as_mut() {
             if registered.is_replaying() {
-                return registered.next_chunk().await;
+                let chunk = registered.next_chunk().await?;
+                if chunk.is_none() {
+                    // Replay EOF. If the response was already committed downstream
+                    // (upstream responded before replay finished), the buffer can
+                    // never be needed again — drop it now.
+                    self.maybe_release_early_body_buffer();
+                }
+                return Ok(chunk);
             }
         }
         if no_body_expected || self.is_body_done() {
@@ -1150,6 +1213,51 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_early_body_buffer_rejected_for_connect_h2() {
+        let (client, server) = duplex(65536);
+        let mut handles = vec![];
+
+        handles.push(tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                connection.await.unwrap();
+            });
+            let mut h2 = h2.ready().await.unwrap();
+            // Plain CONNECT: authority-form URI, no END_STREAM (the stream is a tunnel)
+            let request = Request::builder()
+                .method(Method::CONNECT)
+                .uri("www.example.com:443")
+                .body(())
+                .unwrap();
+            let (response, _req_body) = h2.send_request(request, false).unwrap();
+            let (head, _body) = response.await.unwrap().into_parts();
+            assert_eq!(head.status, 200);
+        }));
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
+            handles.push(tokio::spawn(async move {
+                use crate::protocols::http::body_buffer::InMemoryRequestBodyBuffer;
+                // The tunnel stream must never be captured: registration fails closed.
+                assert!(http
+                    .set_request_body_buffer(Box::new(InMemoryRequestBodyBuffer::new()))
+                    .is_err());
+                let response_header = Box::new(ResponseHeader::build(200, None).unwrap());
+                http.write_response_header(response_header, true).unwrap();
+            }));
+        }
+
+        for handle in handles {
+            assert!(handle.await.is_ok());
+        }
+    }
+
+    #[tokio::test]
     async fn test_early_body_buffer_not_registered_h2() {
         let (client, server) = duplex(65536);
         let mut handles = vec![];
@@ -1231,6 +1339,173 @@ mod test {
                 assert!(http.begin_request_body_replay().await.is_err());
                 let response_header = Box::new(ResponseHeader::build(200, None).unwrap());
                 http.write_response_header(response_header, true).unwrap();
+            }));
+        }
+
+        for handle in handles {
+            assert!(handle.await.is_ok());
+        }
+    }
+
+    /// Delegates to `InMemoryRequestBodyBuffer` and reports its own drop, so
+    /// tests can pin down exactly when the session releases the buffer.
+    struct DropProbeBuffer {
+        inner: crate::protocols::http::body_buffer::InMemoryRequestBodyBuffer,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl DropProbeBuffer {
+        fn new() -> (Self, Arc<std::sync::atomic::AtomicBool>) {
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            (
+                DropProbeBuffer {
+                    inner: crate::protocols::http::body_buffer::InMemoryRequestBodyBuffer::new(),
+                    dropped: dropped.clone(),
+                },
+                dropped,
+            )
+        }
+    }
+
+    impl Drop for DropProbeBuffer {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::protocols::http::body_buffer::RequestBodyBuffer for DropProbeBuffer {
+        async fn write(&mut self, data: &Bytes) -> Result<()> {
+            self.inner.write(data).await
+        }
+
+        async fn finish(&mut self) -> Result<()> {
+            self.inner.finish().await
+        }
+
+        async fn rewind(&mut self) -> Result<()> {
+            self.inner.rewind().await
+        }
+
+        async fn next_chunk(&mut self, max_bytes: usize) -> Result<Option<Bytes>> {
+            self.inner.next_chunk(max_bytes).await
+        }
+
+        fn consume(&mut self, bytes: usize) {
+            self.inner.consume(bytes)
+        }
+    }
+
+    fn probe_dropped(flag: &Arc<std::sync::atomic::AtomicBool>) -> bool {
+        flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn test_buffer_released_when_response_commits_after_replay_h2() {
+        let (client, server) = duplex(65536);
+        let mut handles = vec![];
+
+        handles.push(tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                connection.await.unwrap();
+            });
+            let mut h2 = h2.ready().await.unwrap();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://www.example.com/")
+                .body(())
+                .unwrap();
+            let (response, mut req_body) = h2.send_request(request, false).unwrap();
+            req_body.send_data("abc".into(), true).unwrap();
+            let (head, _body) = response.await.unwrap().into_parts();
+            assert_eq!(head.status, 200);
+        }));
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
+            handles.push(tokio::spawn(async move {
+                let (probe, dropped) = DropProbeBuffer::new();
+                http.set_request_body_buffer(Box::new(probe)).unwrap();
+                while http.read_body_bytes().await.unwrap().is_some() {}
+                assert!(http.begin_request_body_replay().await.unwrap());
+                assert_eq!(
+                    http.read_body_or_idle(false).await.unwrap().unwrap(),
+                    b"abc".as_slice()
+                );
+                assert!(http.read_body_or_idle(false).await.unwrap().is_none());
+                // Replay is done but no response committed yet: a retry could
+                // still rewind and replay, so the buffer must survive.
+                assert!(!probe_dropped(&dropped));
+                let response_header = Box::new(ResponseHeader::build(200, None).unwrap());
+                http.write_response_header(response_header, true).unwrap();
+                // Committing the response releases the buffer immediately.
+                assert!(probe_dropped(&dropped));
+                assert!(!http.request_body_buffer_registered());
+                // A replay attempt after release must fail closed, not silently
+                // proxy a bodyless request.
+                assert!(http.begin_request_body_replay().await.is_err());
+            }));
+        }
+
+        for handle in handles {
+            assert!(handle.await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_buffer_released_at_replay_eof_when_response_committed_first_h2() {
+        let (client, server) = duplex(65536);
+        let mut handles = vec![];
+
+        handles.push(tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                connection.await.unwrap();
+            });
+            let mut h2 = h2.ready().await.unwrap();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://www.example.com/")
+                .body(())
+                .unwrap();
+            let (response, mut req_body) = h2.send_request(request, false).unwrap();
+            req_body.send_data("abc".into(), true).unwrap();
+            let (head, _body) = response.await.unwrap().into_parts();
+            assert_eq!(head.status, 200);
+        }));
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
+            handles.push(tokio::spawn(async move {
+                let (probe, dropped) = DropProbeBuffer::new();
+                http.set_request_body_buffer(Box::new(probe)).unwrap();
+                while http.read_body_bytes().await.unwrap().is_some() {}
+                assert!(http.begin_request_body_replay().await.unwrap());
+                assert_eq!(
+                    http.read_body_or_idle(false).await.unwrap().unwrap(),
+                    b"abc".as_slice()
+                );
+                // Early upstream response: the header commits downstream while
+                // replay is still in flight — the buffer must survive until
+                // replay EOF.
+                let response_header = Box::new(ResponseHeader::build(200, None).unwrap());
+                http.write_response_header(response_header, true).unwrap();
+                assert!(!probe_dropped(&dropped));
+                assert!(http.read_body_or_idle(false).await.unwrap().is_none());
+                assert!(probe_dropped(&dropped));
+                assert!(http.begin_request_body_replay().await.is_err());
             }));
         }
 

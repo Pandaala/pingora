@@ -387,6 +387,13 @@ where
                     let body = match body {
                         Ok(b) => b,
                         Err(e) => {
+                            if session.downstream_session.request_body_buffer_replaying() {
+                                // The error came from the registered request body buffer
+                                // (replay path), not the client connection: a gateway-local
+                                // failure that must not be booked as a client abort nor
+                                // swallowed as an ignorable downstream error during caching.
+                                return Err(e.into_in());
+                            }
                             let wait_for_cache_fill = (!serve_from_cache.is_on() && support_cache_partial_read)
                                 || serve_from_cache.is_miss();
                             if wait_for_cache_fill {

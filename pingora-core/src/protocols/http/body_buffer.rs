@@ -50,6 +50,10 @@ impl RegisteredRequestBodyBuffer {
         self.state == RequestBodyBufferState::Replaying
     }
 
+    pub(crate) fn is_replay_done(&self) -> bool {
+        self.state == RequestBodyBufferState::ReplayDone
+    }
+
     pub(crate) async fn capture(&mut self, data: &Bytes) -> Result<()> {
         if self.state != RequestBodyBufferState::Capturing {
             return Error::e_explain(
@@ -193,6 +197,10 @@ impl FixedBuffer {
 /// - **Register before reading.** The buffer must be set before any body byte is read;
 ///   registering after a partial read is rejected (`set_request_body_buffer` fails
 ///   closed) so a truncated body can never be replayed.
+/// - **Tunnel-carrying requests are rejected.** Registration fails closed for HTTP/1.1
+///   upgrade requests and HTTP/2 CONNECT (plain or extended, e.g. WebSocket over H2):
+///   their "body" is a bidirectional tunnel stream, not a request body, so capturing
+///   until EOF would swallow the tunnel until a read timeout fires.
 /// - **Registration is a commitment.** There is no un-register: once set, the app must
 ///   fully read the body (through the capturing reads above) before proxying (a
 ///   registered-but-undrained body fails the request rather than streaming natively).
@@ -208,6 +216,14 @@ impl FixedBuffer {
 ///   drain via `read_request_body` / `read_body_bytes`.
 /// - Request trailers (HTTP/1.1 chunked / HTTP/2) are not captured or replayed, matching
 ///   the native retry buffer.
+/// - **The buffer is dropped as soon as it can no longer be needed.** Once replay has
+///   reached EOF and a non-informational response header has been committed downstream
+///   (in either order), no further upstream retry can legitimately happen, so the session
+///   drops the buffer right then instead of holding it for the rest of the response
+///   (which may be long-lived, e.g. SSE). Implementations holding large resources (temp
+///   file, fd) should release them in `Drop`. After this release a pathological replay
+///   attempt fails the request deterministically. If the response never commits (the
+///   request errors out first), the buffer is dropped with the session.
 /// - **Downstream close/reset is not observed while replaying.** While the buffer is in
 ///   the replay state, `read_body_or_idle` serves chunks from the buffer and does not
 ///   watch the downstream socket (HTTP/1) or stream (HTTP/2). A client that disconnects
@@ -229,6 +245,17 @@ pub trait RequestBodyBuffer: Send + Sync {
     /// further capture, read, or replay is attempted and the request fails
     /// closed. Impls therefore never observe another call after a cancelled
     /// `write`; they only need to remain safe to drop.
+    ///
+    /// Errors: returning `Err` poisons the session the same way — the chunk was
+    /// already consumed from the transport, so no further capture, read, drain,
+    /// or replay is attempted and the request fails closed. On HTTP/1, whenever
+    /// body bytes remain unread, the end-of-request keepalive drain also fails,
+    /// so the downstream connection is closed and reuse is forfeited (on HTTP/2
+    /// the poison is per-stream and the request's stream fails). Impls that
+    /// want a graceful over-limit response (e.g. 413) must not enforce a size
+    /// cap by returning `Err` here; instead the application should count bytes
+    /// and stop reading at the cap outside `write()`, keeping the session
+    /// healthy.
     async fn write(&mut self, data: &Bytes) -> Result<()>;
 
     /// Finalize capture after downstream EOF. Implementations that spill to disk
@@ -241,6 +268,9 @@ pub trait RequestBodyBuffer: Send + Sync {
     /// must not corrupt the captured body. [`InMemoryRequestBodyBuffer`] is
     /// idempotent because it freezes the accumulation buffer only on the first
     /// call (guarded by `body.is_none()`).
+    ///
+    /// Errors: like [`Self::write`], returning `Err` poisons the session and
+    /// fails the request closed.
     async fn finish(&mut self) -> Result<()>;
 
     /// Reset replay to the beginning. Called before every upstream attempt, so a
@@ -274,6 +304,24 @@ pub trait RequestBodyBuffer: Send + Sync {
     /// begins only after that filter runs, so the rewritten body's final length
     /// must already be known there — the rewrite decision cannot be deferred to
     /// `next_chunk`.
+    ///
+    /// Because rewrite is allowed, the proxy cannot cross-check the replayed
+    /// total length against the captured total length. Implementations that
+    /// replay the captured body verbatim (no rewrite) should enforce that
+    /// invariant themselves: record the total captured length at
+    /// [`Self::finish`] and return an error — not `None` — when replay reaches
+    /// EOF short of it. Otherwise truncation in the backing storage (a short
+    /// write during capture, a read boundary bug, a spill file truncated
+    /// externally) under-delivers against the request's `Content-Length` and
+    /// surfaces only as an upstream hang or reset far from its cause, instead
+    /// of an attributable gateway-local error.
+    ///
+    /// Errors: a returned error fails the request and the proxy classifies it
+    /// as an internal (gateway-local) error — not a client or upstream failure.
+    /// Implementations should still attach a distinctive `ErrorType` / context
+    /// (e.g. for a disk read failure in a spill-to-disk impl) so the application
+    /// can attribute storage failures in its own logging regardless of the
+    /// error-source tag.
     async fn next_chunk(&mut self, max_bytes: usize) -> Result<Option<Bytes>>;
 
     /// Advance the replay cursor past `bytes` bytes previously returned by
@@ -435,6 +483,10 @@ mod early_buffer_tests {
         b.finish_capture().await.unwrap();
         b.begin_replay().await.unwrap();
         assert!(b.next_chunk().await.is_err());
+        // A replay error leaves the state as Replaying: the proxy pump relies
+        // on this to attribute the surfaced error to the buffer (internal)
+        // rather than the client connection (downstream).
+        assert!(b.is_replaying());
     }
 
     /// A peek impl that awaits (yields) before reading at the cursor, like a

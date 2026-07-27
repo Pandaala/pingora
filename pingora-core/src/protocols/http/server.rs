@@ -627,6 +627,18 @@ impl Session {
         }
     }
 
+    /// Whether a registered request body buffer is currently replaying. While
+    /// true, `read_body_or_idle` serves buffered chunks instead of reading the
+    /// client, so its errors are gateway-local (buffer impl or invariant), not
+    /// client failures.
+    pub fn request_body_buffer_replaying(&self) -> bool {
+        match self {
+            Self::H1(s) => s.request_body_buffer_replaying(),
+            Self::H2(s) => s.request_body_buffer_replaying(),
+            Self::Subrequest(_) | Self::Custom(_) => false,
+        }
+    }
+
     /// Prepare a registered early body buffer as the body source for the next
     /// upstream attempt. Returns `false` when no buffer is registered.
     pub async fn begin_request_body_replay(&mut self) -> Result<bool> {
