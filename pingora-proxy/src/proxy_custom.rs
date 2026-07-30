@@ -82,6 +82,16 @@ where
     {
         let mut req = session.req_header().clone();
 
+        if session.as_ref().request_body_buffer_registered() {
+            return (
+                false,
+                Some(Error::explain(
+                    InternalError,
+                    "early request body replay not supported for custom upstreams",
+                )),
+            );
+        }
+
         if session.cache.enabled() {
             pingora_cache::filters::upstream::request_filter(
                 &mut req,

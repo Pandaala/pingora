@@ -81,6 +81,10 @@ where
             }
         }
 
+        if let Err(e) = session.as_mut().begin_request_body_replay().await {
+            return (false, true, Some(e));
+        }
+
         session.upstream_compression.request_filter(&req);
 
         debug!("Sending header to upstream {:?}", req);
@@ -305,8 +309,8 @@ where
         let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
 
         let buffer = session.as_ref().get_retry_buffer();
-
-        // retry, send buffer if it exists or body empty
+        // Native retry-buffer path. Registered app buffers are replayed through
+        // `read_body_or_idle()` below, one bounded chunk at a time.
         if buffer.is_some() || session.as_mut().is_body_empty() {
             let send_permit = tx
                 .reserve()
@@ -383,6 +387,13 @@ where
                     let body = match body {
                         Ok(b) => b,
                         Err(e) => {
+                            if session.downstream_session.request_body_buffer_replaying() {
+                                // The error came from the registered request body buffer
+                                // (replay path), not the client connection: a gateway-local
+                                // failure that must not be booked as a client abort nor
+                                // swallowed as an ignorable downstream error during caching.
+                                return Err(e.into_in());
+                            }
                             let wait_for_cache_fill = (!serve_from_cache.is_on() && support_cache_partial_read)
                                 || serve_from_cache.is_miss();
                             if wait_for_cache_fill {

@@ -14,6 +14,7 @@
 
 //! HTTP server session APIs
 
+use super::body_buffer::RequestBodyBuffer;
 use super::custom::server::Session as SessionCustom;
 use super::error_resp;
 use super::subrequest::server::HttpSession as SessionSubrequest;
@@ -25,7 +26,7 @@ use crate::protocols::{Digest, SocketAddr, Stream};
 use bytes::Bytes;
 use http::HeaderValue;
 use http::{header::AsHeaderName, HeaderMap};
-use pingora_error::{Error, Result};
+use pingora_error::{Error, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::time::Duration;
 
@@ -561,6 +562,10 @@ impl Session {
     }
 
     /// Whether there is no request body
+    ///
+    /// While an early request body buffer is registered this reports non-empty
+    /// regardless of the original payload size: the effective body is whatever the
+    /// buffer replays, possibly a non-empty rewrite of a zero-byte original.
     pub fn is_body_empty(&mut self) -> bool {
         match self {
             Self::H1(s) => s.is_body_empty(),
@@ -594,6 +599,69 @@ impl Session {
             Self::H2(s) => s.get_retry_buffer(),
             Self::Subrequest(s) => s.get_retry_buffer(),
             Self::Custom(s) => s.get_retry_buffer(),
+        }
+    }
+
+    /// Register an app-supplied request body buffer (opt-in). Supported on the H1/H2
+    /// data plane only, and fails closed otherwise: silently succeeding on a
+    /// subrequest/custom session would let the app drain the body believing it will
+    /// be replayed, then forward the request bodyless. Also fails closed if the body
+    /// has already started being read (see the H1/H2 impls).
+    pub fn set_request_body_buffer(&mut self, buffer: Box<dyn RequestBodyBuffer>) -> Result<()> {
+        match self {
+            Self::H1(s) => s.set_request_body_buffer(buffer),
+            Self::H2(s) => s.set_request_body_buffer(buffer),
+            Self::Subrequest(_) | Self::Custom(_) => Error::e_explain(
+                ErrorType::InternalError,
+                "early request body buffering is not supported for subrequest/custom sessions",
+            ),
+        }
+    }
+
+    /// Register an already-finalized replay source for an empty downstream
+    /// request. Supported only on the H1/H2 data plane.
+    pub fn set_bodyless_request_replay_buffer(
+        &mut self,
+        buffer: Box<dyn RequestBodyBuffer>,
+    ) -> Result<()> {
+        match self {
+            Self::H1(s) => s.set_bodyless_request_replay_buffer(buffer),
+            Self::H2(s) => s.set_bodyless_request_replay_buffer(buffer),
+            Self::Subrequest(_) | Self::Custom(_) => Error::e_explain(
+                ErrorType::InternalError,
+                "request body replay buffering is not supported for subrequest/custom sessions",
+            ),
+        }
+    }
+
+    /// Whether an app-supplied request body buffer is registered.
+    pub fn request_body_buffer_registered(&self) -> bool {
+        match self {
+            Self::H1(s) => s.request_body_buffer_registered(),
+            Self::H2(s) => s.request_body_buffer_registered(),
+            Self::Subrequest(_) | Self::Custom(_) => false,
+        }
+    }
+
+    /// Whether a registered request body buffer is currently replaying. While
+    /// true, `read_body_or_idle` serves buffered chunks instead of reading the
+    /// client, so its errors are gateway-local (buffer impl or invariant), not
+    /// client failures.
+    pub fn request_body_buffer_replaying(&self) -> bool {
+        match self {
+            Self::H1(s) => s.request_body_buffer_replaying(),
+            Self::H2(s) => s.request_body_buffer_replaying(),
+            Self::Subrequest(_) | Self::Custom(_) => false,
+        }
+    }
+
+    /// Prepare a registered early body buffer as the body source for the next
+    /// upstream attempt. Returns `false` when no buffer is registered.
+    pub async fn begin_request_body_replay(&mut self) -> Result<bool> {
+        match self {
+            Self::H1(s) => s.begin_request_body_replay().await,
+            Self::H2(s) => s.begin_request_body_replay().await,
+            Self::Subrequest(_) | Self::Custom(_) => Ok(false),
         }
     }
 
