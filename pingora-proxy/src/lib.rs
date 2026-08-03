@@ -91,10 +91,13 @@ use subrequest::{BodyMode, Ctx as SubrequestCtx};
 
 pub use proxy_cache::range_filter::{range_header_filter, MultiRangeInfo, RangeType};
 pub use proxy_purge::PurgeStatus;
-pub use proxy_trait::{FailToProxy, ProxyHttp};
+pub use proxy_trait::{FailToProxy, ProxyHttp, RequestBodyAction, UpstreamRequestBodyDisposition};
 
 pub mod prelude {
-    pub use crate::{http_proxy, http_proxy_service, ProxyHttp, Session};
+    pub use crate::{
+        http_proxy, http_proxy_service, ProxyHttp, RequestBodyAction, Session,
+        UpstreamRequestBodyDisposition,
+    };
 }
 
 pub type ProcessCustomSession<SV, C> = Arc<
@@ -346,17 +349,29 @@ where
                         (server_reused, error)
                     }
                 };
-                (
-                    server_reused,
-                    error.map(|e| {
-                        self.inner
-                            .error_while_proxy(&peer, session, e, ctx, client_reused)
-                    }),
-                )
+                let error = match error {
+                    Some(e) => {
+                        let mut e =
+                            self.inner
+                                .error_while_proxy(&peer, session, e, ctx, client_reused);
+                        // Sampled AFTER `error_while_proxy` returns, so an
+                        // application that flips the predicate from inside
+                        // that hook is honored for this very error.
+                        if !self.inner.request_retry_allowed(session, ctx) {
+                            e.retry = false.into();
+                        }
+                        Some(e)
+                    }
+                    None => None,
+                };
+                (server_reused, error)
             }
             Err(mut e) => {
                 e.as_up();
-                let new_err = self.inner.fail_to_connect(session, &peer, ctx, e);
+                let mut new_err = self.inner.fail_to_connect(session, &peer, ctx, e);
+                if !self.inner.request_retry_allowed(session, ctx) {
+                    new_err.retry = false.into();
+                }
                 (false, Some(new_err.into_up()))
             }
         }
@@ -466,6 +481,11 @@ pub struct Session {
     upstream_body_bytes_received: usize,
     /// Upstream write pending time. Set by proxy layer (HTTP/1.x only).
     upstream_write_pending_time: Duration,
+    /// Latch so that `ProxyHttp::request_trailer_filter` fires at most once
+    /// per downstream request. Without it a retry attempt (whose replayed EOF
+    /// also has `data == None` while the trailer fact stays true) would
+    /// re-fire the hook.
+    pub(crate) request_trailer_filter_fired: bool,
     /// Flag that is set when the shutdown process has begun.
     shutdown_flag: Arc<AtomicBool>,
 }
@@ -488,6 +508,7 @@ impl Session {
             downstream_modules_ctx: downstream_modules.build_ctx(),
             upstream_body_bytes_received: 0,
             upstream_write_pending_time: Duration::ZERO,
+            request_trailer_filter_fired: false,
             shutdown_flag,
         }
     }
@@ -874,8 +895,11 @@ where
             server_reuse = reuse;
 
             match e {
-                Some(error) => {
-                    let retry = error.retry();
+                Some(mut error) => {
+                    if final_response_committed(session.response_written()) {
+                        error.retry = false.into();
+                    }
+                    let retry = error.retry() && self.inner.request_retry_allowed(&session, &ctx);
                     proxy_error = Some(error);
                     if !retry {
                         break;
@@ -1393,5 +1417,50 @@ where
 
         proxy.handle_init_modules();
         Service::new(name, proxy)
+    }
+}
+
+/// Whether a final downstream response has been committed, which forbids any
+/// further upstream retry: the client has already received bytes from this
+/// attempt, and a retry would concatenate two upstream responses into one
+/// downstream body.
+///
+/// A 1xx informational response is not final — the H1 downstream session can
+/// store one in `response_written()` — except 101, which switches protocols
+/// and is final. The H2 session never stores a 1xx, so the informational
+/// check is inert there.
+fn final_response_committed(resp: Option<&ResponseHeader>) -> bool {
+    resp.is_some_and(|r| {
+        !r.status.is_informational() || r.status == http::StatusCode::SWITCHING_PROTOCOLS
+    })
+}
+
+#[cfg(test)]
+mod retry_guard_tests {
+    use super::*;
+
+    fn resp(code: u16) -> ResponseHeader {
+        ResponseHeader::build(code, None).unwrap()
+    }
+
+    #[test]
+    fn no_committed_response_permits_retry() {
+        assert!(!final_response_committed(None));
+    }
+
+    #[test]
+    fn retry_guard_ignores_1xx_but_not_101() {
+        // H1 can store a 1xx informational response in response_written();
+        // it is not final and must not block a retry.
+        assert!(!final_response_committed(Some(&resp(100))));
+        assert!(!final_response_committed(Some(&resp(103))));
+        // 101 is a final response despite being 1xx.
+        assert!(final_response_committed(Some(&resp(101))));
+    }
+
+    #[test]
+    fn final_statuses_forbid_retry() {
+        assert!(final_response_committed(Some(&resp(200))));
+        assert!(final_response_committed(Some(&resp(502))));
     }
 }

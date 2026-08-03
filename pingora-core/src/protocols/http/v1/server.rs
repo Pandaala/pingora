@@ -52,6 +52,14 @@ pub struct HttpSession {
     preread_body: Option<BufRef>,
     /// A state machine to track how to read the request body
     body_reader: BodyReader,
+    /// Snapshot of whether the request framing ended at the header section,
+    /// taken once when the body reader is initialized for the current request
+    /// and cleared when the next request starts on a keepalive connection.
+    /// Snapshotting matters because the live parser state moves: a chunked
+    /// request with an empty body only reports "empty" once its terminal
+    /// chunk has been parsed, which would flip this transport fact from
+    /// false to true mid-request (and again for a retry attempt).
+    request_headers_end_stream: Option<bool>,
     /// A state machine to track how to write the response body
     body_writer: BodyWriter,
     /// An internal buffer to buf multiple body writes to reduce the underlying syscalls
@@ -130,6 +138,7 @@ impl HttpSession {
             raw_header: None,
             preread_body: None,
             body_reader: BodyReader::new(false),
+            request_headers_end_stream: None,
             body_writer: BodyWriter::new(),
             body_write_buf: BytesMut::new(),
             keepalive_timeout: KeepaliveStatus::Off,
@@ -303,6 +312,9 @@ impl HttpSession {
                         self.request_header = Some(request_header);
 
                         self.body_reader.reinit();
+                        // A new request on this (keepalive) connection gets its
+                        // own transport facts.
+                        self.request_headers_end_stream = None;
                         self.response_written = None;
                         self.respect_keepalive();
 
@@ -582,6 +594,40 @@ impl HttpSession {
         self.body_reader.body_empty()
     }
 
+    /// Whether the request ended with actual trailer fields.
+    ///
+    /// This is meaningful after the request body reader reaches EOF. A
+    /// `Trailer` declaration header alone does not affect this result.
+    pub fn request_trailers_present(&mut self) -> bool {
+        self.init_body_reader();
+        self.body_reader.trailers_present()
+    }
+
+    /// Whether request framing ended at the header section.
+    ///
+    /// This is a transport fact, snapshotted once when the body reader is
+    /// initialized for the current request and stable for the rest of it
+    /// (including across retry attempts): reading the live parser state
+    /// instead would flip a chunked-but-empty request from false to true once
+    /// its terminal chunk was parsed.
+    ///
+    /// On H1 the framing is declarative, so `Content-Length: 0` (and the
+    /// absence of both `Content-Length` and `Transfer-Encoding`) counts as
+    /// ended-at-headers. This intentionally differs from H2, where only an
+    /// END_STREAM flag on the HEADERS frame counts and a `Content-Length: 0`
+    /// request may still legitimately send DATA frames -- a protocol-inherent
+    /// asymmetry, not an inconsistency.
+    ///
+    /// Unlike [`Self::is_body_empty`] it deliberately ignores a registered
+    /// early request body buffer -- that buffer is an application artifact
+    /// which rewrites the effective body for upstream framing, and must not
+    /// rewrite what the client actually put on the wire.
+    pub fn request_headers_end_stream(&mut self) -> bool {
+        self.init_body_reader();
+        // `init_body_reader()` above always establishes the snapshot.
+        self.request_headers_end_stream.unwrap_or(false)
+    }
+
     /// Write the response header to the client.
     /// This function can be called more than once to send 1xx informational headers excluding 101.
     pub async fn write_response_header(&mut self, mut header: Box<ResponseHeader>) -> Result<()> {
@@ -730,6 +776,13 @@ impl HttpSession {
     /// Return the response header if it is already sent.
     pub fn response_written(&self) -> Option<&ResponseHeader> {
         self.response_written.as_deref()
+    }
+
+    /// Whether the response body writer has already been finished, i.e. the
+    /// full framed body (including a chunked terminator, if any) was handed to
+    /// the writer. `false` while a response is still being streamed.
+    pub fn response_body_finished(&self) -> bool {
+        self.body_writer.finished()
     }
 
     /// `Some(true)` if the this is a successful upgrade
@@ -1012,6 +1065,14 @@ impl HttpSession {
                         self.body_reader.init_content_length(0, preread_body);
                     }
                 }
+            }
+
+            // Snapshot the headers-end-stream transport fact exactly once per
+            // request, while the body reader still reflects only the framing
+            // declared by the header section. Reading it later would observe
+            // parser progress instead (see the field's doc).
+            if self.request_headers_end_stream.is_none() {
+                self.request_headers_end_stream = Some(self.body_reader.body_empty());
             }
         }
     }
@@ -1658,6 +1719,102 @@ mod tests_stream {
         assert_eq!(Version::HTTP_11, http_stream.req_header().version);
 
         assert_eq!(b"pingora.org", http_stream.get_header_bytes("Host"));
+    }
+
+    #[tokio::test]
+    async fn headers_end_stream_is_a_stable_snapshot() {
+        init_log();
+        // A chunked request with an EMPTY body: framing did not end at the
+        // header section, and reading the body to completion must not change
+        // that fact (the live parser state would say "empty" afterwards).
+        let input1 = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let input2 = b"0\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(&input1[..])
+            .read(&input2[..])
+            .read(&input1[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert!(!http_stream.request_headers_end_stream());
+        assert!(http_stream.read_body_bytes().await.unwrap().is_none());
+        assert!(http_stream.is_body_done());
+        // `is_body_empty()` now reports true; the transport fact must not.
+        assert!(http_stream.is_body_empty());
+        assert!(
+            !http_stream.request_headers_end_stream(),
+            "the headers-end-stream fact must not flip once the body is read"
+        );
+
+        // The next request on this keepalive connection re-snapshots.
+        http_stream.read_request().await.unwrap();
+        assert!(!http_stream.request_headers_end_stream());
+    }
+
+    /// Read the request body to EOF and return it as one string.
+    async fn drain_h1_request_body(session: &mut HttpSession) -> String {
+        let mut body = String::new();
+        while let Some(chunk) = session.read_body_bytes().await.unwrap() {
+            body.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        body
+    }
+
+    /// `BodyReader::reinit()` must clear `trailers_present`, because the reader
+    /// is REUSED for the next request on a keepalive connection. Without that
+    /// line the second request inherits the first one's trailer fact, and both
+    /// proxy pumps drive `request_trailer_filter` off it: a plain request
+    /// pipelined behind a trailer-bearing one would fire the trailer hook it
+    /// never had.
+    #[tokio::test]
+    async fn trailer_fact_is_cleared_across_a_keepalive_request() {
+        init_log();
+        let headers = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nTransfer-Encoding: chunked\r\n\r\n";
+        // Request 1 ends with a real trailer field; request 2 does not.
+        let body_with_trailers = b"5\r\nhello\r\n0\r\nx-checksum: ok\r\n\r\n";
+        let body_without_trailers = b"5\r\nhello\r\n0\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(&headers[..])
+            .read(&body_with_trailers[..])
+            .read(&headers[..])
+            .read(&body_without_trailers[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        http_stream.read_request().await.unwrap();
+        assert_eq!(
+            drain_h1_request_body(&mut http_stream).await,
+            "hello",
+            "request 1 body"
+        );
+        assert!(http_stream.request_trailers_present());
+
+        http_stream.read_request().await.unwrap();
+        assert!(
+            !http_stream.request_trailers_present(),
+            "a new request must not inherit the previous request's trailer fact"
+        );
+        assert_eq!(
+            drain_h1_request_body(&mut http_stream).await,
+            "hello",
+            "request 2 body"
+        );
+        assert!(
+            !http_stream.request_trailers_present(),
+            "this request ended with no trailer fields"
+        );
+    }
+
+    #[tokio::test]
+    async fn headers_end_stream_true_for_content_length_zero() {
+        init_log();
+        // H1 framing is declarative: `Content-Length: 0` ends the request at
+        // the header section (unlike H2, where END_STREAM is the only signal).
+        let input = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 0\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert!(http_stream.request_headers_end_stream());
     }
 
     #[tokio::test]
@@ -3522,6 +3679,34 @@ mod test_early_body_buffer {
             .await
             .unwrap();
         assert_eq!(http_stream.keepalive_timeout, KeepaliveStatus::Off);
+    }
+
+    #[tokio::test]
+    async fn headers_end_stream_fact_ignores_early_body_buffer() {
+        init_log();
+        // A bodyless request: no Content-Length, no Transfer-Encoding, so the
+        // request framing ended at the header section.
+        let input = b"GET / HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert!(http_stream.request_headers_end_stream());
+
+        // Registering an early body buffer makes `is_body_empty()` report
+        // non-empty, because the buffer replays a rewritten, non-empty body
+        // upstream. That is an application artifact: the transport fact of
+        // what the client sent must not move with it.
+        let mut buffer = InMemoryRequestBodyBuffer::new();
+        buffer
+            .write(&Bytes::from_static(b"injected"))
+            .await
+            .unwrap();
+        buffer.finish().await.unwrap();
+        http_stream
+            .set_bodyless_request_replay_buffer(Box::new(buffer))
+            .unwrap();
+        assert!(!http_stream.is_body_empty());
+        assert!(http_stream.request_headers_end_stream());
     }
 
     #[tokio::test]

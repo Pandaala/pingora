@@ -21,7 +21,7 @@ use pingora_core::{
     ImmutStr,
 };
 use proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
-use proxy_common::{DownstreamStateMachine, ResponseStateMachine};
+use proxy_common::{no_downstream_body_to_read, DownstreamStateMachine, ResponseStateMachine};
 use tokio::sync::oneshot;
 
 use super::*;
@@ -111,6 +111,23 @@ where
             }
         }
 
+        // The custom pump has no upstream-framing rewrite of its own (the
+        // connector owns framing), so it cannot honor a non-ordinary
+        // disposition. Fail closed instead of silently proxying with the
+        // wrong contract -- same rationale as the terminate path below.
+        let body_disposition = self.inner.upstream_request_body_disposition(session, ctx);
+        if body_disposition != UpstreamRequestBodyDisposition::Ordinary {
+            return (
+                false,
+                Some(
+                    Error::explain(
+                        InternalError,
+                        "a non-ordinary upstream request body disposition is not supported on custom connector sessions",
+                    ),
+                ),
+            );
+        }
+
         session.upstream_compression.request_filter(&req);
         let body_empty = session.as_mut().is_body_empty();
 
@@ -131,7 +148,9 @@ where
 
         let (tx, rx) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
 
-        session.as_mut().enable_retry_buffering();
+        if self.inner.request_retry_allowed(session, ctx) {
+            session.as_mut().enable_retry_buffering();
+        }
 
         // Custom message logic
 
@@ -292,7 +311,10 @@ where
     {
         let mut cancel_downstream_reader_tx = Some(cancel_downstream_reader_tx);
 
-        let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
+        // Must agree with the `is_body_empty()` the upstream end-of-stream was
+        // derived from in `proxy_to_custom_upstream`; see
+        // `no_downstream_body_to_read`.
+        let mut downstream_state = DownstreamStateMachine::new(no_downstream_body_to_read(session));
 
         // retry, send buffer if it exists
         if let Some(buffer) = session.as_mut().get_retry_buffer() {
@@ -684,14 +706,39 @@ where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
+        // `data == None` IS the end of the downstream body, whatever the caller
+        // computed from `is_body_done()`. Mirrors `proxy_h1::send_body_to_pipe`
+        // and `proxy_h2::send_body_to2`.
+        //
+        // Load-bearing here rather than defensive: this pump's downstream is a
+        // `SessionCustom`, whose `is_body_done()` is IMPLEMENTED BY THE USER
+        // (`protocols/http/custom/server.rs`). An implementation that reports
+        // `false` after its reader reached EOF would otherwise invoke the
+        // application hooks with `(None, end_of_stream = false)` -- violating
+        // their documented contract -- never deliver the single `(None, true)`
+        // event, and return `Ok(false)` forever, so the duplex loop would spin
+        // on an already-finished read side at 100% CPU.
+        let end_of_body = end_of_body || data.is_none();
+
         session
             .downstream_modules_ctx
             .request_body_filter(&mut data, end_of_body)
             .await?;
 
-        self.inner
-            .request_body_filter(session, &mut data, end_of_body, ctx)
-            .await?;
+        if self
+            .inner
+            .request_body_filter_action(session, &mut data, end_of_body, ctx)
+            .await?
+            == RequestBodyAction::Terminate
+        {
+            // The custom pump has its own join structure and implements no
+            // terminate propagation; fail closed instead of diverging
+            // silently.
+            return Error::e_explain(
+                InternalError,
+                "request-body terminate is not supported on custom connector sessions",
+            );
+        }
 
         if session.was_upgraded() {
             client_body.upgrade_body_writer();

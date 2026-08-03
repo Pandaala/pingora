@@ -21,6 +21,68 @@ use pingora_cache::{
 use proxy_cache::range_filter::{self};
 use std::time::Duration;
 
+/// The action selected by an application request-body hook.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestBodyAction {
+    /// Continue proxying the current request-body event.
+    Continue,
+    /// Stop proxying this request after the application completed or aborted
+    /// the downstream response.
+    ///
+    /// H1 truncation caveat: terminating while large unread request bytes are
+    /// still in flight closes the downstream connection with data pending, so
+    /// the OS may send a RST. A client that is not reading the response
+    /// concurrently with its upload may then never see the response the
+    /// application wrote. This is a known limitation and matches the existing
+    /// `close_on_response_before_downstream_finish` semantics.
+    ///
+    /// Upstream cost caveat: these hooks run only after the upstream request
+    /// headers have been written, so a terminate always costs the upstream
+    /// attempt that was already started. On an H1 upstream it also costs the
+    /// CONNECTION: the request body was cut short, so the connection is no
+    /// longer in a well-defined state and cannot be returned to the pool. (On
+    /// an H2 upstream only the stream is lost, via RST_STREAM.) An application
+    /// that can reach its decision from the request headers alone should
+    /// reject in [`ProxyHttp::request_filter`] instead, which costs nothing
+    /// upstream.
+    Terminate,
+}
+
+/// How the proxy should frame the request body sent to an upstream.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UpstreamRequestBodyDisposition {
+    /// Preserve Pingora's ordinary request-body framing behavior.
+    #[default]
+    Ordinary,
+    /// The application guarantees that no upstream request body will follow.
+    ///
+    /// The proxy acts on the guarantee irreversibly, before a single body byte
+    /// is read: an H2 upstream request is closed with END_STREAM on its HEADERS
+    /// frame (or on an empty DATA frame), and an H1 upstream request loses both
+    /// `Content-Length` and `Transfer-Encoding`.
+    ///
+    /// Selecting this on a request whose downstream body then DOES carry bytes
+    /// is a contract violation and fails the request with an
+    /// [`InternalError`](pingora_error::ErrorType::InternalError), which the
+    /// default [`ProxyHttp::fail_to_proxy`] turns into a 500. The proxy fails
+    /// closed rather than forward the request without its body: the upstream
+    /// would otherwise act on a request whose client-supplied body was silently
+    /// removed while the client is told it succeeded, and no proxy can judge
+    /// that substitution safe.
+    ///
+    /// A request with no body at all is unaffected: it is coerced back to
+    /// [`Self::Ordinary`] before the pump runs (see
+    /// [`ProxyHttp::upstream_request_body_disposition`]) and proxies normally.
+    /// An application that is not certain whether a body will arrive must
+    /// select [`Self::Ordinary`] (or [`Self::Streamed`]) instead; an
+    /// application that wants to DROP a body it knows about must remove it in
+    /// [`ProxyHttp::request_body_filter_action`], which runs before this check.
+    Bodyless,
+    /// The body is streamed and its final length is not known when headers
+    /// are sent.
+    Streamed,
+}
+
 /// The interface to control the HTTP proxy
 ///
 /// The methods in [ProxyHttp] are filters/callbacks which will be performed on all requests at their
@@ -122,6 +184,145 @@ pub trait ProxyHttp {
         Self::CTX: Send + Sync,
     {
         Ok(())
+    }
+
+    /// Handle one request-body event and decide whether proxying should
+    /// continue.
+    ///
+    /// Before returning [`RequestBodyAction::Terminate`] the application must
+    /// have finished the downstream response itself — either by writing a
+    /// local reply, or by observing an already-committed response and
+    /// abandoning. Pingora never writes a response on the terminate path; a
+    /// terminate with nothing written leaves the client with a bare connection
+    /// close, and Pingora logs a warning when it detects that.
+    ///
+    /// On custom-connector sessions terminate is unsupported: the pump fails
+    /// closed with an [`InternalError`](pingora_error::ErrorType::InternalError)
+    /// instead.
+    ///
+    /// The default preserves source compatibility by invoking
+    /// [`Self::request_body_filter`] and returning
+    /// [`RequestBodyAction::Continue`].
+    async fn request_body_filter_action(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<RequestBodyAction>
+    where
+        Self::CTX: Send + Sync,
+    {
+        self.request_body_filter(session, body, end_of_stream, ctx)
+            .await?;
+        Ok(RequestBodyAction::Continue)
+    }
+
+    /// Handle the presence of actual downstream request trailer fields.
+    ///
+    /// The hook runs after the trailer-presence fact is established and
+    /// before a trailer-free synthetic request-body EOF could be delivered.
+    /// Pingora does not expose or forward the trailer fields.
+    ///
+    /// It fires AT MOST ONCE per downstream request, on the attempt that
+    /// observes the transport EOF. Retry attempts replay the same EOF and do
+    /// not re-fire it.
+    ///
+    /// It never fires on custom-connector sessions: the trailer-presence fact
+    /// is `None` there.
+    ///
+    /// It also fires only when the PUMP owns the request-body read, and only
+    /// when the pump actually observes the transport EOF. Two shapes skip it:
+    /// - The application consumed the downstream body itself before proxying
+    ///   started, without registering a replay buffer, so the pump has nothing
+    ///   to read and never sees the EOF. An inspection policy that depends on
+    ///   this hook must therefore not pre-read the request body.
+    /// - The pump abandoned the downstream read as futile: the upstream
+    ///   response completed while the client never ended a request body it had
+    ///   declared empty (`Content-Length: 0` without END_STREAM on H2). The
+    ///   pump then synthesizes the single
+    ///   [`Self::request_body_filter_action`] end-of-stream event, but the
+    ///   trailer-presence fact was never established, so a request that would
+    ///   have sent TRAILERS later yields no trailer event.
+    ///
+    /// The [`RequestBodyAction::Terminate`] contract is the same as for
+    /// [`Self::request_body_filter_action`]: the application must have
+    /// finished the downstream response before returning it.
+    async fn request_trailer_filter(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<RequestBodyAction>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(RequestBodyAction::Continue)
+    }
+
+    /// Select the upstream request-body framing contract.
+    ///
+    /// Queried once per upstream attempt, before the upstream request
+    /// headers are written. Sync on purpose: `ProxyHttp` is an
+    /// `#[async_trait]`, so async methods are boxed per call while sync
+    /// defaults monomorphize and inline away.
+    ///
+    /// Several request shapes override the returned value. On each of them a
+    /// non-`Ordinary` disposition is logged at debug level and coerced back to
+    /// [`UpstreamRequestBodyDisposition::Ordinary`]:
+    /// - An upgrade request (`Upgrade:` header) or a CONNECT request: the
+    ///   framing is fixed by the tunnel protocol. The check looks at the union
+    ///   of the downstream request and the (already filtered) upstream
+    ///   request, so synthesizing a tunnel in
+    ///   [`Self::upstream_request_filter`] is covered too.
+    /// - A request with no body at all: re-framing it (e.g. as
+    ///   `Transfer-Encoding: chunked`) would put a body terminator on a pooled
+    ///   upstream connection that the origin may ignore, which desynchronises
+    ///   every later request on it.
+    /// - An upstream request still versioned below HTTP/1.1, which has no
+    ///   chunked framing.
+    ///
+    /// On custom-connector sessions the connector owns framing, so a
+    /// non-`Ordinary` disposition fails the request closed with an
+    /// [`InternalError`](pingora_error::ErrorType::InternalError). Returning
+    /// [`UpstreamRequestBodyDisposition::Bodyless`] for a request that then
+    /// does carry a downstream body fails closed the same way; see that
+    /// variant's documentation.
+    fn upstream_request_body_disposition(
+        &self,
+        _session: &Session,
+        _ctx: &Self::CTX,
+    ) -> UpstreamRequestBodyDisposition {
+        UpstreamRequestBodyDisposition::Ordinary
+    }
+
+    /// Whether this request may make another upstream proxy attempt.
+    ///
+    /// Queried live at every retry decision point and never cached, so an
+    /// application may flip from `true` to `false` mid-request. The
+    /// application must keep the predicate monotonic (once `false`, never
+    /// `true` again). Returning `false` also suppresses native request-body
+    /// retry buffering.
+    ///
+    /// Sampling points, in order:
+    /// 1. before the upstream request body is pumped, to decide whether to
+    ///    enable native retry buffering;
+    /// 2. after [`Self::error_while_proxy`] returns (and after
+    ///    [`Self::fail_to_connect`] on the connect path), so a predicate the
+    ///    application flips from inside those hooks is honored for that very
+    ///    error;
+    /// 3. once more in the retry loop, alongside the error's own retry
+    ///    classification.
+    ///
+    /// Interaction with `Session::retry_buffer_truncated()`: returning `false`
+    /// skips the retry-buffer allocation entirely, so nothing is ever
+    /// buffered and nothing can be reported as truncated —
+    /// `retry_buffer_truncated()` stays `false` ("nothing was truncated")
+    /// even though the request body is not replayable at all. An application
+    /// that overrides [`Self::error_while_proxy`] and keys its retry decision
+    /// on that flag must therefore consult this predicate as well; the flag
+    /// alone cannot distinguish "fully buffered" from "never buffered".
+    fn request_retry_allowed(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
+        true
     }
 
     /// This filter decides if the request is cacheable and what cache backend to use
@@ -602,4 +803,96 @@ pub trait ProxyHttp {
 pub struct FailToProxy {
     pub error_code: u16,
     pub can_reuse_downstream: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DefaultsOnly;
+
+    #[async_trait]
+    impl ProxyHttp for DefaultsOnly {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("upstream_peer is not used by trait-default unit tests")
+        }
+    }
+
+    #[test]
+    fn disposition_defaults_to_ordinary() {
+        let io = tokio_test::io::Builder::new().build();
+        let session = Session::new_h1(Box::new(io));
+        assert_eq!(
+            DefaultsOnly.upstream_request_body_disposition(&session, &()),
+            UpstreamRequestBodyDisposition::Ordinary
+        );
+    }
+
+    #[test]
+    fn retry_allowed_defaults_to_true() {
+        let io = tokio_test::io::Builder::new().build();
+        let session = Session::new_h1(Box::new(io));
+        assert!(DefaultsOnly.request_retry_allowed(&session, &()));
+    }
+
+    struct LegacyBodyFilter;
+
+    #[async_trait]
+    impl ProxyHttp for LegacyBodyFilter {
+        type CTX = bool;
+
+        fn new_ctx(&self) -> Self::CTX {
+            false
+        }
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("upstream_peer is not used by this body-hook unit test")
+        }
+
+        async fn request_body_filter(
+            &self,
+            _session: &mut Session,
+            _body: &mut Option<Bytes>,
+            _end_of_stream: bool,
+            ctx: &mut Self::CTX,
+        ) -> Result<()> {
+            *ctx = true;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn action_hook_defaults_to_legacy_body_filter_and_continue() {
+        let io = tokio_test::io::Builder::new().build();
+        let mut session = Session::new_h1(Box::new(io));
+        let mut body = Some(Bytes::from_static(b"body"));
+        let mut ctx = false;
+        let app = LegacyBodyFilter;
+
+        let action = app
+            .request_body_filter_action(&mut session, &mut body, false, &mut ctx)
+            .await
+            .unwrap();
+
+        assert!(ctx, "the legacy request_body_filter must have run");
+        assert_eq!(action, RequestBodyAction::Continue);
+
+        let trailer_action = app
+            .request_trailer_filter(&mut session, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(trailer_action, RequestBodyAction::Continue);
+    }
 }

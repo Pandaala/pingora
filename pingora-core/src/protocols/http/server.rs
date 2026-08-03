@@ -575,6 +575,41 @@ impl Session {
         }
     }
 
+    /// Whether the downstream transport ended the request on its initial
+    /// headers. Unsupported session types return `None`.
+    pub fn request_headers_end_stream(&mut self) -> Option<bool> {
+        match self {
+            Self::H1(s) => Some(s.request_headers_end_stream()),
+            Self::H2(s) => Some(s.request_headers_end_stream()),
+            Self::Subrequest(_) | Self::Custom(_) => None,
+        }
+    }
+
+    /// Whether the downstream request contained actual trailer fields.
+    ///
+    /// This is meaningful after a body read reports EOF. Unsupported session
+    /// types return `None`.
+    pub fn request_trailers_present(&mut self) -> Option<bool> {
+        match self {
+            Self::H1(s) => Some(s.request_trailers_present()),
+            Self::H2(s) => Some(s.request_trailers_present()),
+            Self::Subrequest(_) | Self::Custom(_) => None,
+        }
+    }
+
+    /// Whether the downstream response body writer has already been finished.
+    ///
+    /// `Some(false)` means a response is committed but still unfinished, so
+    /// [`Self::finish_body`] still has work to do. Unsupported session types
+    /// return `None`.
+    pub fn response_body_finished(&self) -> Option<bool> {
+        match self {
+            Self::H1(s) => Some(s.response_body_finished()),
+            Self::H2(s) => Some(s.response_body_finished()),
+            Self::Subrequest(_) | Self::Custom(_) => None,
+        }
+    }
+
     pub fn retry_buffer_truncated(&self) -> bool {
         match self {
             Self::H1(s) => s.retry_buffer_truncated(),

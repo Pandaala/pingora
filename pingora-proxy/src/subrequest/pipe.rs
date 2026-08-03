@@ -25,7 +25,9 @@
 //! and the ProxyHttp trait filters are not run on the HttpTasks from the main session
 //! (the only relevant one being the request body filter).
 
-use crate::proxy_common::{DownstreamStateMachine, ResponseStateMachine};
+use crate::proxy_common::{
+    no_downstream_body_to_read, DownstreamStateMachine, ResponseStateMachine,
+};
 use crate::subrequest::*;
 use crate::{PreparedSubrequest, Session};
 use bytes::Bytes;
@@ -178,7 +180,13 @@ where
         let preset_body = maybe_preset_body.expect("checked above");
         (preset_body.is_body_empty(), Some(preset_body.into_reader()))
     } else {
-        (session.as_mut().is_body_done(), None)
+        // The pre-tightening meaning of `is_body_done()`. This pipe has neither
+        // a bodyless prelude nor a futile-read guard, and `no_body_input` also
+        // decides whether the subrequest keeps its body headers, so the strict
+        // transport fact would make an H2 `Content-Length: 0` request without
+        // END_STREAM park forever on a read that can never yield. See
+        // `no_downstream_body_to_read`.
+        (no_downstream_body_to_read(session), None)
     };
     let mut downstream_state = DownstreamStateMachine::new(no_body_input);
 

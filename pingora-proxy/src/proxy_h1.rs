@@ -21,6 +21,59 @@ use crate::proxy_common::*;
 use pingora_cache::CachePhase;
 use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
 
+fn apply_upstream_body_disposition(
+    request: &mut RequestHeader,
+    disposition: UpstreamRequestBodyDisposition,
+) -> Result<()> {
+    match disposition {
+        UpstreamRequestBodyDisposition::Ordinary => {}
+        UpstreamRequestBodyDisposition::Bodyless => {
+            request.remove_header(&header::CONTENT_LENGTH);
+            request.remove_header(&header::TRANSFER_ENCODING);
+        }
+        UpstreamRequestBodyDisposition::Streamed => {
+            // An H1 request with neither Content-Length nor
+            // Transfer-Encoding is a zero-length body, so removal alone
+            // would be a correctness bug.
+            let transfer_encoding =
+                streamed_transfer_encoding(request.headers.get_all(&header::TRANSFER_ENCODING));
+            request.remove_header(&header::CONTENT_LENGTH);
+            request.remove_header(&header::TRANSFER_ENCODING);
+            request.insert_header(header::TRANSFER_ENCODING, transfer_encoding)?;
+        }
+    }
+    Ok(())
+}
+
+/// Build the `Transfer-Encoding` value for a `Streamed` upstream request.
+///
+/// Any content coding the client applied (`Transfer-Encoding: gzip, chunked`)
+/// still describes the bytes the proxy is about to forward, so dropping it
+/// while keeping the coded bytes would corrupt the message. Only the
+/// `chunked` token is re-derived: it is re-appended last, as RFC 9112 §6.1
+/// requires.
+fn streamed_transfer_encoding<'a>(
+    values: impl IntoIterator<Item = &'a http::HeaderValue>,
+) -> String {
+    let mut codings: Vec<&str> = Vec::new();
+    for value in values {
+        // A non-ASCII Transfer-Encoding value is malformed; there is no
+        // coding to preserve from it.
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for token in value.split(',') {
+            let token = token.trim();
+            if token.is_empty() || token.eq_ignore_ascii_case("chunked") {
+                continue;
+            }
+            codings.push(token);
+        }
+    }
+    codings.push("chunked");
+    codings.join(", ")
+}
+
 impl<SV, C> HttpProxy<SV, C>
 where
     C: custom::Connector,
@@ -81,7 +134,23 @@ where
             }
         }
 
+        // The disposition is resolved AFTER `begin_request_body_replay()`,
+        // because a registered replay buffer changes the "does this request
+        // have a body" fact the coercion below depends on.
         if let Err(e) = session.as_mut().begin_request_body_replay().await {
+            return (false, true, Some(e));
+        }
+
+        // Facts are collected inside `safe_upstream_disposition`, and only
+        // when `disposition` is non-`Ordinary` -- see its doc comment for why
+        // that is sound.
+        let disposition = self.inner.upstream_request_body_disposition(session, ctx);
+        // Only the H1 pump can end up sending a request below HTTP/1.1, which
+        // has no chunked framing at all.
+        let upstream_below_http11 = matches!(req.version, Version::HTTP_09 | Version::HTTP_10);
+        let body_disposition =
+            safe_upstream_disposition(disposition, session, &req, upstream_below_http11);
+        if let Err(e) = apply_upstream_body_disposition(&mut req, body_disposition) {
             return (false, true, Some(e));
         }
 
@@ -104,19 +173,54 @@ where
         let (tx_upstream, rx_upstream) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
         let (tx_downstream, rx_downstream) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
 
-        session.as_mut().enable_retry_buffering();
+        if self.inner.request_retry_allowed(session, ctx) {
+            session.as_mut().enable_retry_buffering();
+        }
 
         // start bi-directional streaming
-        let ret = tokio::try_join!(
-            self.proxy_handle_downstream(
+        let ret = {
+            let downstream = self.proxy_handle_downstream(
                 session,
                 tx_downstream,
                 rx_upstream,
                 ctx,
-                &mut downstream_custom_message_writer
-            ),
-            self.proxy_handle_upstream(client_session, tx_upstream, rx_downstream),
-        );
+                &mut downstream_custom_message_writer,
+                body_disposition,
+            );
+            let upstream = self.proxy_handle_upstream(client_session, tx_upstream, rx_downstream);
+            tokio::pin!(downstream);
+            tokio::pin!(upstream);
+
+            tokio::select! {
+                // Deterministic preference for the typed terminate outcome: when a
+                // downstream `Ok(Terminate)` (the application already wrote the
+                // response) and an upstream `Err` become ready in the same poll,
+                // random branch order would non-deterministically pick the generic
+                // error path instead. Non-terminate orderings are unchanged because
+                // the `Complete` arm still awaits the sibling.
+                biased;
+
+                downstream_result = &mut downstream => {
+                    match downstream_result {
+                        Ok(DownstreamRequestOutcome::Terminate) => {
+                            // Dropping the sibling future immediately stops both upstream
+                            // response reads and request-body writes.
+                            None
+                        }
+                        Ok(DownstreamRequestOutcome::Complete(reuse)) => {
+                            Some(upstream.await.map(|upstream| (DownstreamRequestOutcome::Complete(reuse), upstream)))
+                        }
+                        Err(e) => Some(Err(e)),
+                    }
+                }
+                upstream_result = &mut upstream => {
+                    Some(match upstream_result {
+                        Ok(upstream) => downstream.await.map(|downstream| (downstream, upstream)),
+                        Err(e) => Err(e),
+                    })
+                }
+            }
+        };
 
         if let Some(custom_session) = session.downstream_session.as_custom_mut() {
             if let Some(downstream_custom_message_writer) = downstream_custom_message_writer {
@@ -131,8 +235,14 @@ where
         }
 
         match ret {
-            Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, true, None),
-            Err(e) => (false, false, Some(e)),
+            None | Some(Ok((DownstreamRequestOutcome::Terminate, _))) => {
+                release_cache_on_terminate(session);
+                (false, false, None)
+            }
+            Some(Ok((DownstreamRequestOutcome::Complete(downstream_can_reuse), _upstream))) => {
+                (downstream_can_reuse, true, None)
+            }
+            Some(Err(e)) => (false, false, Some(e)),
         }
     }
 
@@ -280,7 +390,8 @@ where
         mut rx: mpsc::Receiver<HttpTask>,
         ctx: &mut SV::CTX,
         downstream_custom_message_writer: &mut Option<Box<dyn CustomMessageWrite>>,
-    ) -> Result<bool>
+        body_disposition: UpstreamRequestBodyDisposition,
+    ) -> Result<DownstreamRequestOutcome>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
@@ -311,19 +422,36 @@ where
         let buffer = session.as_ref().get_retry_buffer();
         // Native retry-buffer path. Registered app buffers are replayed through
         // `read_body_or_idle()` below, one bounded chunk at a time.
-        if buffer.is_some() || session.as_mut().is_body_empty() {
+        //
+        // The bodyless prelude fires one immediate `(None, end)` body event. It
+        // must therefore require the transport fact (`is_body_done()`) and not
+        // just `is_body_empty()`, which still infers emptiness from
+        // `Content-Length: 0`: an H2 downstream request declaring `Content-Length: 0`
+        // without END_STREAM is not bodyless (design 4.3), so the loop below reads
+        // on to the real EOS and would deliver a SECOND end-of-stream event to
+        // `request_body_filter`. Requiring both facts delivers exactly one.
+        if buffer.is_some() || (session.as_mut().is_body_empty() && session.as_mut().is_body_done())
+        {
             let send_permit = tx
                 .reserve()
                 .await
                 .or_err(InternalError, "reserving body pipe")?;
-            self.send_body_to_pipe(
-                session,
-                buffer,
-                downstream_state.is_done(),
-                send_permit,
-                ctx,
-            )
-            .await?;
+            let outcome = self
+                .send_body_to_pipe(
+                    session,
+                    buffer,
+                    downstream_state.is_done(),
+                    Some(send_permit),
+                    ctx,
+                    body_disposition,
+                )
+                .await?;
+            if outcome == DownstreamRequestOutcome::Terminate {
+                session.set_keepalive(None);
+                finish_terminated_response(session).await;
+                restore_custom_message_reader(session, downstream_custom_message_reader);
+                return Ok(outcome);
+            }
         }
 
         let mut response_state = ResponseStateMachine::new();
@@ -355,6 +483,25 @@ where
             || downstream_custom_read && !downstream_state.is_errored()
             || downstream_custom_write
         {
+            if downstream_body_read_is_futile(session, &downstream_state, &response_state) {
+                // Abandoning the read must not cost the application its single
+                // end-of-stream event (invariant B): run the hooks with
+                // `(None, end_of_stream = true)` exactly once, with NO permit
+                // so nothing reaches the upstream -- the upstream exchange is
+                // already complete and owes no further request framing.
+                let outcome = self
+                    .send_body_to_pipe(session, None, true, None, ctx, body_disposition)
+                    .await?;
+                if outcome == DownstreamRequestOutcome::Terminate {
+                    session.set_keepalive(None);
+                    finish_terminated_response(session).await;
+                    restore_custom_message_reader(session, downstream_custom_message_reader.take());
+                    return Ok(outcome);
+                }
+                downstream_state.maybe_finished(true);
+                continue;
+            }
+
             // reserve tx capacity ahead to avoid deadlock, see below
 
             let send_permit = tx
@@ -420,14 +567,24 @@ where
                     }
                     // TODO: consider just drain this if serve_from_cache is set
                     let is_body_done = session.is_body_done();
-                    let request_done = self.send_body_to_pipe(
+                    let outcome = self.send_body_to_pipe(
                         session,
                         body,
                         is_body_done,
-                        send_permit.unwrap(), // safe because we checked is_ok()
+                        Some(send_permit.unwrap()), // safe because we checked is_ok()
                         ctx,
+                        body_disposition,
                     )
                     .await?;
+                    if outcome == DownstreamRequestOutcome::Terminate {
+                        session.set_keepalive(None);
+                        finish_terminated_response(session).await;
+                        restore_custom_message_reader(session, downstream_custom_message_reader.take());
+                        return Ok(outcome);
+                    }
+                    let DownstreamRequestOutcome::Complete(request_done) = outcome else {
+                        unreachable!("terminal request-body outcome returned above");
+                    };
                     downstream_state.maybe_finished(request_done);
                 },
 
@@ -588,13 +745,7 @@ where
             }
         }
 
-        if let Some(custom_session) = session.downstream_session.as_custom_mut() {
-            if let Some(downstream_custom_message_reader) = downstream_custom_message_reader {
-                custom_session
-                    .restore_custom_message_reader(downstream_custom_message_reader)
-                    .expect("downstream restore_custom_message_reader should be empty");
-            }
-        }
+        restore_custom_message_reader(session, downstream_custom_message_reader);
 
         let mut reuse_downstream = !downstream_state.is_errored();
         if reuse_downstream {
@@ -608,7 +759,7 @@ where
                 }
             }
         }
-        Ok(reuse_downstream)
+        Ok(DownstreamRequestOutcome::Complete(reuse_downstream))
     }
 
     async fn h1_response_filter(
@@ -772,9 +923,10 @@ where
         session: &mut Session,
         mut data: Option<Bytes>,
         end_of_body: bool,
-        tx: mpsc::Permit<'_, HttpTask>,
+        tx: Option<mpsc::Permit<'_, HttpTask>>,
         ctx: &mut SV::CTX,
-    ) -> Result<bool>
+        body_disposition: UpstreamRequestBodyDisposition,
+    ) -> Result<DownstreamRequestOutcome>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
@@ -784,6 +936,30 @@ where
         // affected by the request_body_filter
         let end_of_body = end_of_body || data.is_none();
 
+        if data.is_none()
+            && !session.request_trailer_filter_fired
+            && session
+                .downstream_session
+                .request_trailers_present()
+                .unwrap_or(false)
+        {
+            let action = self.inner.request_trailer_filter(session, ctx).await?;
+            // At most once per downstream request: a retry attempt replays the
+            // same EOF (`data == None`) while the trailer fact stays true, and
+            // the hook's contract is a single invocation.
+            //
+            // Latched only AFTER the hook returns: the pinned downstream
+            // future can be dropped mid-hook (the `select!` upstream-error
+            // arm) and the request then retried, and latching first would
+            // suppress the hook forever -- zero completed invocations for a
+            // trailer-bearing request.
+            session.request_trailer_filter_fired = true;
+            if action == RequestBodyAction::Terminate {
+                warn_terminate_without_response(session, "request_trailer_filter");
+                return Ok(DownstreamRequestOutcome::Terminate);
+            }
+        }
+
         session
             .downstream_modules_ctx
             .request_body_filter(&mut data, end_of_body)
@@ -791,9 +967,15 @@ where
 
         // TODO: request body filter to have info about upgraded status?
         // (can also check session.was_upgraded())
-        self.inner
-            .request_body_filter(session, &mut data, end_of_body, ctx)
-            .await?;
+        if self
+            .inner
+            .request_body_filter_action(session, &mut data, end_of_body, ctx)
+            .await?
+            == RequestBodyAction::Terminate
+        {
+            warn_terminate_without_response(session, "request_body_filter_action");
+            return Ok(DownstreamRequestOutcome::Terminate);
+        }
 
         // the flag to signal to upstream
         let upstream_end_of_body = end_of_body || data.is_none();
@@ -803,7 +985,7 @@ where
          * Don't write 0 bytes to the network since it will be
          * treated as the terminating chunk */
         if !upstream_end_of_body && data.as_ref().is_some_and(|d| d.is_empty()) {
-            return Ok(false);
+            return Ok(DownstreamRequestOutcome::Complete(false));
         }
 
         debug!(
@@ -811,14 +993,30 @@ where
             data.as_ref().map_or(-1, |d| d.len() as isize)
         );
 
-        // upgraded body needs to be marked
-        if session.was_upgraded() {
-            tx.send(HttpTask::UpgradedBody(data, upstream_end_of_body));
-        } else {
-            tx.send(HttpTask::Body(data, upstream_end_of_body));
+        // Fail closed on a `Bodyless` declaration the downstream body has just
+        // disproved. Checked here -- after the request-body filters, before
+        // anything is handed to the upstream writer -- because the upstream
+        // request no longer carries `Content-Length` or `Transfer-Encoding`, so
+        // its zero-length body writer would swallow these bytes and the client
+        // would be told the request succeeded. See
+        // `bodyless_contract_violation`.
+        if violates_bodyless_contract(body_disposition, data.as_ref()) {
+            return Err(bodyless_contract_violation());
         }
 
-        Ok(end_of_body)
+        // No permit means this event is application-only: the upstream
+        // exchange is already finished and must not be written to. See the
+        // futile-read branch in `proxy_handle_downstream`.
+        if let Some(tx) = tx {
+            // upgraded body needs to be marked
+            if session.was_upgraded() {
+                tx.send(HttpTask::UpgradedBody(data, upstream_end_of_body));
+            } else {
+                tx.send(HttpTask::Body(data, upstream_end_of_body));
+            }
+        }
+
+        Ok(DownstreamRequestOutcome::Complete(end_of_body))
     }
 }
 
@@ -904,5 +1102,99 @@ pub(crate) async fn send_body_to1(
         }
     } else {
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_with_framing() -> RequestHeader {
+        let mut request = RequestHeader::build("POST", b"/", None).unwrap();
+        request.insert_header(header::CONTENT_LENGTH, "12").unwrap();
+        request
+            .insert_header(header::TRANSFER_ENCODING, "gzip")
+            .unwrap();
+        request
+    }
+
+    #[test]
+    fn streamed_disposition_uses_h1_chunked_framing() {
+        let mut request = request_with_framing();
+        apply_upstream_body_disposition(&mut request, UpstreamRequestBodyDisposition::Streamed)
+            .unwrap();
+
+        assert!(request.headers.get(header::CONTENT_LENGTH).is_none());
+        // `gzip` is a content coding applied to the bytes being forwarded and
+        // must survive the re-framing; only `chunked` is re-derived.
+        assert_eq!(
+            request.headers.get(header::TRANSFER_ENCODING).unwrap(),
+            "gzip, chunked"
+        );
+    }
+
+    #[test]
+    fn streamed_disposition_preserves_non_chunked_transfer_codings() {
+        // Already `gzip, chunked`: must round-trip unchanged, not collapse to
+        // bare `chunked` (which would erase the gzip coding while the body
+        // bytes stay gzip-coded).
+        let mut request = RequestHeader::build("POST", b"/", None).unwrap();
+        request
+            .insert_header(header::TRANSFER_ENCODING, "gzip, chunked")
+            .unwrap();
+        apply_upstream_body_disposition(&mut request, UpstreamRequestBodyDisposition::Streamed)
+            .unwrap();
+        assert_eq!(
+            request.headers.get(header::TRANSFER_ENCODING).unwrap(),
+            "gzip, chunked"
+        );
+
+        // Multiple header lines, mixed case, and a redundant `chunked`.
+        let mut request = RequestHeader::build("POST", b"/", None).unwrap();
+        request
+            .append_header(header::TRANSFER_ENCODING, "deflate")
+            .unwrap();
+        request
+            .append_header(header::TRANSFER_ENCODING, "gzip, Chunked")
+            .unwrap();
+        apply_upstream_body_disposition(&mut request, UpstreamRequestBodyDisposition::Streamed)
+            .unwrap();
+        assert_eq!(
+            request.headers.get(header::TRANSFER_ENCODING).unwrap(),
+            "deflate, gzip, chunked"
+        );
+
+        // Nothing to preserve: bare `chunked`.
+        let mut request = RequestHeader::build("POST", b"/", None).unwrap();
+        request.insert_header(header::CONTENT_LENGTH, "12").unwrap();
+        apply_upstream_body_disposition(&mut request, UpstreamRequestBodyDisposition::Streamed)
+            .unwrap();
+        assert_eq!(
+            request.headers.get(header::TRANSFER_ENCODING).unwrap(),
+            "chunked"
+        );
+    }
+
+    #[test]
+    fn bodyless_disposition_removes_request_framing() {
+        let mut request = request_with_framing();
+        apply_upstream_body_disposition(&mut request, UpstreamRequestBodyDisposition::Bodyless)
+            .unwrap();
+
+        assert!(request.headers.get(header::CONTENT_LENGTH).is_none());
+        assert!(request.headers.get(header::TRANSFER_ENCODING).is_none());
+    }
+
+    #[test]
+    fn ordinary_disposition_preserves_request_framing() {
+        let mut request = request_with_framing();
+        apply_upstream_body_disposition(&mut request, UpstreamRequestBodyDisposition::Ordinary)
+            .unwrap();
+
+        assert_eq!(request.headers.get(header::CONTENT_LENGTH).unwrap(), "12");
+        assert_eq!(
+            request.headers.get(header::TRANSFER_ENCODING).unwrap(),
+            "gzip"
+        );
     }
 }

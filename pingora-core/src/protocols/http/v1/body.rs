@@ -149,6 +149,7 @@ pub struct BodyReader {
     rewind_buf_len: usize,
     upstream: bool,
     body_buf_overread: Option<BytesMut>,
+    trailers_present: bool,
 }
 
 impl BodyReader {
@@ -160,6 +161,7 @@ impl BodyReader {
             rewind_buf_len: 0,
             upstream,
             body_buf_overread: None,
+            trailers_present: false,
         }
     }
 
@@ -169,6 +171,7 @@ impl BodyReader {
 
     pub fn reinit(&mut self) {
         self.body_state = PS::ToStart;
+        self.trailers_present = false;
     }
 
     fn prepare_buf(&mut self, buf_to_rewind: &[u8]) {
@@ -255,6 +258,10 @@ impl BodyReader {
 
     pub fn body_empty(&self) -> bool {
         self.body_state == PS::Complete(0)
+    }
+
+    pub fn trailers_present(&self) -> bool {
+        self.trailers_present
     }
 
     fn finish_body_buf(&mut self, end_of_body: usize, total_read: usize) {
@@ -722,12 +729,13 @@ impl BodyReader {
 
                             start += next_parse_index;
                         }
-                        TrailersEndParseState::Complete(end_idx) => {
+                        TrailersEndParseState::Complete(end_idx, trailers_present) => {
                             trace!(
                                 "Parsing chunk end for buf {:?}, finished at {end_idx}",
                                 String::from_utf8_lossy(buf).escape_default(),
                             );
 
+                            self.trailers_present = trailers_present;
                             self.finish_body_buf(start + end_idx, n);
                             return Ok(None);
                         }
@@ -795,7 +803,10 @@ impl BodyReader {
                         String::from_utf8_lossy(buf).escape_default(),
                     );
                     *body_state = PS::Complete(read);
-                    Ok(TrailersEndParseState::Complete(next_parse_index))
+                    Ok(TrailersEndParseState::Complete(
+                        next_parse_index,
+                        trailers_read > 0,
+                    ))
                 } else {
                     // either we read the end of one trailer and another one follows,
                     // or trailer end CRLF sequence so far is valid but we need more bytes
@@ -890,8 +901,8 @@ impl BodyReader {
 }
 
 pub enum TrailersEndParseState {
-    NotEnd(usize),   // start of bytes after CR or LF bytes
-    Complete(usize), // index of message completion
+    NotEnd(usize),         // start of bytes after CR or LF bytes
+    Complete(usize, bool), // index of message completion, whether fields were present
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1923,6 +1934,7 @@ mod tests {
         assert_eq!(res, None);
         assert_eq!(body_reader.body_state, ParseState::Complete(3));
         assert_eq!(body_reader.get_body_overread(), Some(&b"abc"[..]));
+        assert!(!body_reader.trailers_present());
     }
 
     #[tokio::test]
@@ -1995,6 +2007,7 @@ mod tests {
         assert_eq!(res, None);
         assert_eq!(body_reader.body_state, ParseState::Complete(3));
         assert_eq!(body_reader.get_body_overread(), None);
+        assert!(body_reader.trailers_present());
     }
 
     #[tokio::test]
@@ -2025,6 +2038,7 @@ mod tests {
         assert_eq!(res, None);
         assert_eq!(body_reader.body_state, ParseState::Complete(1));
         assert_eq!(body_reader.get_body_overread(), None);
+        assert!(body_reader.trailers_present());
     }
 
     #[tokio::test]

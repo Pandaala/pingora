@@ -102,10 +102,56 @@ impl Future for Idle<'_> {
     }
 }
 
+/// Whether an `h2` error observed *after* the request body already reached EOF
+/// is a benign way for the client to end the stream rather than a read failure.
+///
+/// The request is complete at this point, so none of these mean the bytes we
+/// read are suspect:
+/// - GOAWAY with `NO_ERROR`: graceful connection shutdown.
+/// - RST_STREAM with `NO_ERROR`: RFC 9113 §8.1's "stop sending the request
+///   body without breaking the response" signal, sent by a client that has
+///   already finished its body.
+/// - RST_STREAM with `CANCEL`: the client no longer wants the response (a
+///   browser navigating away is the common case). Surfacing it as a read error
+///   would fail the request AND -- because both proxy pumps convert it with
+///   `into_down()` -- close and re-dial an otherwise healthy pooled upstream
+///   connection, once per client cancel. The upstream request has already been
+///   sent by the time this runs, so nothing is saved by failing hard here; a
+///   later write to the cancelled stream still fails and is classified on its
+///   own merits.
+///
+/// Mirrors the client-side classification in
+/// [`crate::protocols::http::v2::client::Http2Session::read_trailers`].
+fn benign_post_eof_stream_end(e: &h2::Error) -> bool {
+    (e.is_go_away() || e.is_reset())
+        && e.is_remote()
+        && matches!(
+            e.reason(),
+            Some(h2::Reason::NO_ERROR) | Some(h2::Reason::CANCEL)
+        )
+}
+
+/// The non-zero `content-length` a message declares, if any.
+///
+/// `0` is deliberately mapped to `None`: on HTTP/2 `content-length: 0` promises
+/// zero DATA payload bytes but says nothing about END_STREAM, so a request that
+/// declares it may still legitimately close its stream later (design 4.3). Were
+/// it treated as "fully received" the moment the message is created, every such
+/// request would be classified as complete before the transport ever said so,
+/// which is exactly the distinction the rest of this module preserves.
+pub(crate) fn declared_body_length(headers: &http::HeaderMap) -> Option<usize> {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|len| *len > 0)
+}
+
 /// HTTP/2 server session
 pub struct HttpSession {
     request_header: RequestHeader,
     request_body_reader: RecvStream,
+    request_headers_end_stream: bool,
     send_response: SendResponse<Bytes>,
     send_response_body: Option<SendStream<Bytes>>,
     // Remember what has been written
@@ -138,6 +184,36 @@ pub struct HttpSession {
     // session and must fail closed instead of silently forwarding a bodyless
     // request.
     early_body_buffer_released: bool,
+    // Whether actual request trailer fields were received. Set once the
+    // request body reader reaches EOF and its trailers are polled.
+    request_trailers_present: bool,
+    // Latched once the TRANSPORT said the request body ended: END_STREAM on the
+    // HEADERS frame, or `RecvStream::is_end_stream()` observed at any body poll.
+    //
+    // It is latched rather than recomputed because `h2` destroys the fact: a
+    // RST_STREAM received after END_STREAM overwrites the stream state with
+    // `Closed(Cause::Error(..))`, after which `is_end_stream()` reports `false`
+    // again while the END_STREAM-bearing DATA frame is still queued for
+    // delivery. Recomputing would therefore be non-monotonic -- a fact the
+    // peer can retract -- and every consumer of "is the request body done"
+    // would follow it back to `false`.
+    request_body_eof: bool,
+    // Source (iii) of the same end-of-body proof: a declared `content-length`
+    // that has been fully received. Stored as the declared length (only when
+    // non-zero, see `request_body_length_satisfied`) and compared against
+    // `body_read`.
+    //
+    // This is the source that covers the NATURAL wire ordering: a peer that
+    // flushes DATA(END_STREAM) and then RST_STREAM before we ever poll destroys
+    // the `is_end_stream()` evidence before we can latch it, so sources (i) and
+    // (ii) never fire and only the byte count can still prove the body is
+    // whole.
+    request_body_declared_len: Option<usize>,
+    // Whether `trailers()` has already been awaited for this request. The
+    // post-EOF branch of `read_body_bytes()` can be reached more than once
+    // (e.g. an idling pump keeps polling); re-awaiting would report `None`
+    // the second time and clear an already-established trailer fact.
+    trailers_polled: bool,
     // digest to record underlying connection info
     digest: Arc<Digest>,
     /// The write timeout which will be applied to writing response body.
@@ -174,9 +250,12 @@ impl HttpSession {
 
         Ok(res.map(|(req, send_response)| {
             let (request_header, request_body_reader) = req.into_parts();
+            let request_headers_end_stream = request_body_reader.is_end_stream();
+            let request_body_declared_len = declared_body_length(&request_header.headers);
             HttpSession {
                 request_header: request_header.into(),
                 request_body_reader,
+                request_headers_end_stream,
                 send_response,
                 send_response_body: None,
                 response_written: None,
@@ -188,6 +267,10 @@ impl HttpSession {
                 early_body_capture_poisoned: false,
                 early_body_buffer_discarded: false,
                 early_body_buffer_released: false,
+                request_trailers_present: false,
+                request_body_eof: request_headers_end_stream,
+                request_body_declared_len,
+                trailers_polled: false,
                 digest,
                 write_timeout: None,
                 total_drain_timeout: None,
@@ -211,6 +294,39 @@ impl HttpSession {
         &mut self.request_header
     }
 
+    /// Whether the request body is provably complete, from ANY source the peer
+    /// cannot retract.
+    ///
+    /// This is the guard on treating a stream end as benign rather than as a
+    /// truncated read, and it is deliberately broader than
+    /// [`Self::is_body_done`]:
+    /// - (i) END_STREAM on the HEADERS frame and (ii) `is_end_stream()` observed
+    ///   at a body poll are both latched into `request_body_eof`;
+    /// - (iii) a declared, non-zero `content-length` whose bytes have all been
+    ///   read is computed here.
+    ///
+    /// Source (iii) is what covers the natural wire ordering -- peer writes
+    /// DATA(END_STREAM) then RST_STREAM, and we poll only afterwards -- in which
+    /// `h2` hands over the final chunk with the END_STREAM evidence already
+    /// overwritten by the reset, so (i) and (ii) can never fire.
+    ///
+    /// RESIDUAL GAP, deliberate and load-bearing: a request that declares NO
+    /// `content-length` (or declares `content-length: 0`) and whose peer resets
+    /// the stream before we poll the final DATA frame has no surviving proof
+    /// that its body is whole, so the reset still surfaces as a read error. That
+    /// is the correct failure direction -- the alternative would be to guess,
+    /// and a wrong guess forwards a TRUNCATED request body upstream as if it
+    /// were complete. Do NOT "fix" this by dropping the guard and classifying
+    /// every benign-looking reset as EOF; the negative-direction tests
+    /// (`test_mid_body_reset_is_still_a_read_error`) exist to keep that from
+    /// happening quietly.
+    fn request_body_complete(&self) -> bool {
+        self.request_body_eof
+            || self
+                .request_body_declared_len
+                .is_some_and(|len| self.body_read >= len)
+    }
+
     /// Read request body bytes. `None` when there is no more body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
         if self.early_body_capture_poisoned {
@@ -220,10 +336,24 @@ impl HttpSession {
             );
         }
         // TODO: timeout
-        let data = self.request_body_reader.data().await.transpose().or_err(
-            ErrorType::ReadError,
-            "while reading downstream request body",
-        )?;
+        let data = match self.request_body_reader.data().await.transpose() {
+            Ok(data) => data,
+            Err(e) => {
+                // Once the request body is complete, a client ending the
+                // stream is not a read failure -- see
+                // `benign_post_eof_stream_end`. h2 surfaces the RST_STREAM
+                // here rather than from `trailers()` when it arrives before
+                // the EOF is polled, so the classification belongs on both.
+                if self.request_body_complete() && benign_post_eof_stream_end(&e) {
+                    None
+                } else {
+                    return Err(e).or_err(
+                        ErrorType::ReadError,
+                        "while reading downstream request body",
+                    );
+                }
+            }
+        };
         if let Some(data) = data.as_ref() {
             self.body_read += data.len();
             if let Some(buffer) = self.retry_buffer.as_mut() {
@@ -245,16 +375,39 @@ impl HttpSession {
                 self.early_body_capture_poisoned = false;
             }
             if self.request_body_reader.is_end_stream() {
+                self.request_body_eof = true;
                 if let Some(buffer) = self.early_body_buffer.as_mut() {
                     self.early_body_capture_poisoned = true;
                     buffer.finish_capture().await?;
                     self.early_body_capture_poisoned = false;
                 }
             }
-        } else if let Some(buffer) = self.early_body_buffer.as_mut() {
-            self.early_body_capture_poisoned = true;
-            buffer.finish_capture().await?;
-            self.early_body_capture_poisoned = false;
+        } else {
+            self.request_body_eof = true;
+            // Establish the trailer fact exactly once: it is never cleared
+            // again within this request.
+            if !self.trailers_polled {
+                self.trailers_polled = true;
+                let trailers = match self.request_body_reader.trailers().await {
+                    Ok(trailers) => trailers,
+                    Err(e) => {
+                        if benign_post_eof_stream_end(&e) {
+                            None
+                        } else {
+                            return Err(e).or_err(
+                                ErrorType::ReadError,
+                                "while reading downstream request trailers",
+                            );
+                        }
+                    }
+                };
+                self.request_trailers_present = trailers.is_some_and(|fields| !fields.is_empty());
+            }
+            if let Some(buffer) = self.early_body_buffer.as_mut() {
+                self.early_body_capture_poisoned = true;
+                buffer.finish_capture().await?;
+                self.early_body_capture_poisoned = false;
+            }
         }
         Ok(data)
     }
@@ -280,9 +433,16 @@ impl HttpSession {
             self.request_body_reader
                 .flow_control()
                 .release_capacity(data.len())?;
+            // Latch source (ii) here as well: this poll consumes the same
+            // evidence `read_body_bytes` does, and a later reset would
+            // otherwise destroy it (see `request_body_eof`).
+            if self.request_body_reader.is_end_stream() {
+                self.request_body_eof = true;
+            }
             return Poll::Ready(Some(Ok(data)));
         }
 
+        self.request_body_eof = true;
         Poll::Ready(None)
     }
 
@@ -299,7 +459,13 @@ impl HttpSession {
     /// Drain the request body. `Ok(())` when there is no (more) body to read.
     // NOTE for h2 it may be worth allowing cancellation of the stream via reset.
     pub async fn drain_request_body(&mut self) -> Result<()> {
-        if self.is_body_done() {
+        // `is_body_empty()` is checked here (and deliberately NOT in
+        // `is_body_done()`, which must stay the pure transport fact): a
+        // request declaring `Content-Length: 0` promises zero DATA bytes, so
+        // there is nothing to drain even if END_STREAM has not arrived yet.
+        // Without this bound, and with `total_drain_timeout` defaulting to
+        // `None`, draining such a request would await forever.
+        if self.is_body_done() || self.is_body_empty() {
             return Ok(());
         }
         // Draining discards the remaining body — incompatible with capture-for-replay,
@@ -603,6 +769,20 @@ impl HttpSession {
     }
 
     /// Whether there is no more body to read
+    ///
+    /// Reports the LATCHED transport fact (`request_body_eof`, sources (i) and
+    /// (ii)) rather than the live `is_end_stream()`, so that a peer resetting a
+    /// stream it already ended cannot flip this back to `false`. The live value
+    /// is still consulted so that an END_STREAM which arrived without us polling
+    /// is picked up immediately.
+    ///
+    /// Deliberately does NOT consult source (iii) (`content-length` satisfied,
+    /// see [`Self::request_body_complete`]): the callers of this function stop
+    /// reading the request body once it returns `true`, and an H2 request may
+    /// legally send TRAILERS after a complete, `content-length`-declared body.
+    /// Ending the read there would silently drop those trailers and skip the
+    /// trailer hook. Source (iii) exists to classify a stream END, which is a
+    /// strictly later event, so nothing is lost by the narrower rule here.
     pub fn is_body_done(&self) -> bool {
         if self
             .early_body_buffer
@@ -611,9 +791,7 @@ impl HttpSession {
         {
             return false;
         }
-        // Check no body in request
-        // Also check we hit end of stream
-        self.is_body_empty() || self.request_body_reader.is_end_stream()
+        self.request_body_eof || self.request_body_reader.is_end_stream()
     }
 
     /// Whether there is any body to read. true means there no body in request.
@@ -623,17 +801,43 @@ impl HttpSession {
     /// (e.g. HEADERS without END_STREAM followed by an empty END_STREAM DATA frame).
     /// Report non-empty then, so upstream framing decisions (H2 END_STREAM on HEADERS)
     /// keep the stream open until replay reaches EOF.
+    ///
+    /// Like [`Self::is_body_done`] this reads the LATCHED end-of-stream fact,
+    /// never the live `is_end_stream()`: a bodyless request (END_STREAM on
+    /// HEADERS, e.g. a plain `GET`) whose client then resets the stream must not
+    /// stop reporting itself as bodyless. A retractable answer here defeats the
+    /// anti-smuggling coercion in `pingora-proxy`'s `safe_disposition`, which
+    /// keys on "this request has no body at all".
     pub fn is_body_empty(&self) -> bool {
         if self.early_body_buffer.is_some() {
             return false;
         }
         self.body_read == 0
-            && (self.request_body_reader.is_end_stream()
+            && (self.request_body_eof
+                || self.request_body_reader.is_end_stream()
                 || self
                     .request_header
                     .headers
                     .get(header::CONTENT_LENGTH)
                     .is_some_and(|cl| cl.as_bytes() == b"0"))
+    }
+
+    /// Whether the initial HEADERS frame carried END_STREAM.
+    pub fn request_headers_end_stream(&self) -> bool {
+        self.request_headers_end_stream
+    }
+
+    /// Whether actual request trailer fields were received.
+    ///
+    /// This is meaningful after `read_body_bytes()` returns EOF.
+    pub fn request_trailers_present(&self) -> bool {
+        self.request_trailers_present
+    }
+
+    /// Whether the response body writer has already been ended (END_STREAM
+    /// sent). `false` while a response is still being streamed.
+    pub fn response_body_finished(&self) -> bool {
+        self.ended
     }
 
     pub fn retry_buffer_truncated(&self) -> bool {
@@ -743,7 +947,7 @@ impl HttpSession {
         // its empty DATA + END_STREAM, trailers, or content-length-violating
         // DATA would never be observed, and dropping the `RecvStream` at
         // request end could send RST_STREAM(CANCEL) to the client.
-        if !self.request_body_reader.is_end_stream() {
+        if !self.is_body_done() {
             return Error::e_explain(
                 ErrorType::InternalError,
                 "request body replay buffer requires the downstream request stream to have ended",
@@ -864,7 +1068,7 @@ mod test {
     use super::*;
     use bytes::Bytes;
     use h2::frame::{Frame, Settings};
-    use http::{HeaderValue, Method, Request};
+    use http::{HeaderValue, Method, Request, StatusCode};
     use tokio::io::{duplex, AsyncWriteExt, DuplexStream};
     use tokio_stream::StreamExt;
 
@@ -1108,7 +1312,8 @@ mod test {
                 // 1. Check body related methods
                 http.enable_retry_buffering();
                 assert!(http.is_body_empty());
-                assert!(http.is_body_done());
+                assert!(!http.request_headers_end_stream());
+                assert!(!http.is_body_done());
                 let retry_body = http.get_retry_buffer();
                 assert!(retry_body.is_none());
 
@@ -1121,8 +1326,9 @@ mod test {
                 http.write_body(server_body.into(), false).await.unwrap();
                 assert_eq!(http.body_bytes_sent(), 16);
 
-                // 3. Waiting for the reset from the client
-                assert!(http.read_body_or_idle(http.is_body_done()).await.is_err());
+                // 3. The client drops the response stream after sending its request EOS,
+                // so this test observes the resulting reset.
+                assert!(http.read_body_or_idle(false).await.is_err());
             }));
         }
 
@@ -1139,11 +1345,16 @@ mod test {
         let server_body = "test server body";
 
         let mut handles = vec![];
+        // Keeps the client's response stream alive until the server has made
+        // its observation: dropping it earlier puts a RST_STREAM on the wire
+        // and the read under test would race that reset instead of observing
+        // the empty END_STREAM DATA frame this test is named for.
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
         handles.push(tokio::spawn(async move {
             let (h2, connection) = h2::client::handshake(client).await.unwrap();
             tokio::spawn(async move {
-                connection.await.unwrap();
+                let _ = connection.await;
             });
 
             let mut h2 = h2.ready().await.unwrap();
@@ -1163,15 +1374,18 @@ mod test {
             assert_eq!(data, server_body);
 
             req_body.send_data("".into(), true).unwrap(); // set EOS after read the resp body
+            let _ = done_rx.await;
         }));
 
         let mut connection = handshake(Box::new(server), None).await.unwrap();
         let digest = Arc::new(Digest::default());
 
+        let mut done_tx = Some(done_tx);
         while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
             .await
             .unwrap()
         {
+            let done_tx = done_tx.take().expect("exactly one stream");
             handles.push(tokio::spawn(async move {
                 let req = http.req_header();
                 assert_eq!(req.method, Method::POST);
@@ -1179,6 +1393,7 @@ mod test {
 
                 // 1. Check body related methods
                 http.enable_retry_buffering();
+                assert!(!http.request_headers_end_stream());
                 assert!(!http.is_body_empty());
                 assert!(!http.is_body_done());
                 let retry_body = http.get_retry_buffer();
@@ -1193,8 +1408,24 @@ mod test {
                 http.write_body(server_body.into(), false).await.unwrap();
                 assert_eq!(http.body_bytes_sent(), 16);
 
-                // 3. Waiting for the client to close stream.
-                http.read_body_or_idle(http.is_body_done()).await.unwrap();
+                // 3. The client's end of stream arrives as an EMPTY DATA frame
+                // carrying END_STREAM -- the shape this test is named for. `h2`
+                // hands that over as a zero-length chunk (NOT as `None`), and
+                // the request must be reported as done and still empty
+                // afterwards.
+                let chunk = http
+                    .read_body_or_idle(false)
+                    .await
+                    .expect("an empty END_STREAM DATA frame is a clean end of body");
+                assert_eq!(
+                    chunk.as_deref(),
+                    Some(&b""[..]),
+                    "the empty END_STREAM DATA frame is delivered as a zero-length chunk"
+                );
+                assert!(http.is_body_done());
+                assert!(http.is_body_empty());
+                assert_eq!(http.body_bytes_read(), 0);
+                let _ = done_tx.send(());
             }));
         }
 
@@ -1270,6 +1501,293 @@ mod test {
 
         for handle in handles {
             assert!(handle.await.is_ok());
+        }
+    }
+
+    /// Trailers after a COMPLETE, `content-length`-declared body.
+    ///
+    /// The declared length is what pins the P1 split: source (iii) of
+    /// `request_body_complete()` is satisfied the moment the seventh byte
+    /// arrives, and folding that source into `is_body_done()` would make the
+    /// assertion below it (`!is_body_done()` after the payload) fail. That is
+    /// not a style preference -- both proxy pumps stop reading the downstream
+    /// body when `is_body_done()` reports `true`, so folding (iii) in would
+    /// silently drop these trailer fields and skip `request_trailer_filter`.
+    #[tokio::test]
+    async fn test_request_trailer_presence_is_transport_observed() {
+        let (client, server) = duplex(65536);
+
+        let client = tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                connection.await.unwrap();
+            });
+
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://www.example.com/")
+                .header("trailer", "x-checksum")
+                .header("content-length", "7")
+                .body(())
+                .unwrap();
+            let (response, mut body) = h2
+                .ready()
+                .await
+                .unwrap()
+                .send_request(request, false)
+                .unwrap();
+            body.send_data("payload".into(), false).unwrap();
+            let mut trailers = HeaderMap::new();
+            trailers.insert("x-checksum", HeaderValue::from_static("ok"));
+            body.send_trailers(trailers).unwrap();
+            assert_eq!(response.await.unwrap().status(), StatusCode::NO_CONTENT);
+        });
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+        let mut handlers = Vec::new();
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
+            handlers.push(tokio::spawn(async move {
+                assert!(!http.request_headers_end_stream());
+                let data = http.read_body_bytes().await.unwrap().unwrap();
+                assert_eq!(data, "payload");
+                // The declared `content-length` is now fully received, but the
+                // TRANSPORT has not ended: the trailers are still to come.
+                // `is_body_done()` must report the transport, or the pumps stop
+                // reading here and the trailers below are never observed.
+                assert!(
+                    !http.is_body_done(),
+                    "a satisfied content-length must not end the read before the trailers"
+                );
+                assert!(http.read_body_bytes().await.unwrap().is_none());
+                assert!(http.is_body_done());
+                assert!(http.request_trailers_present());
+
+                let response =
+                    Box::new(ResponseHeader::build(StatusCode::NO_CONTENT, None).unwrap());
+                http.write_response_header(response, true).unwrap();
+            }));
+        }
+        client.await.unwrap();
+        for handler in handlers {
+            handler.await.unwrap();
+        }
+    }
+
+    /// A client that finishes its request body and THEN cancels the stream
+    /// (dropping the response is what a browser navigating away does, and it
+    /// puts RST_STREAM CANCEL on the wire) must not turn the already-complete
+    /// request into a read error. The unclassified trailer poll used to make
+    /// it one: both proxy pumps convert it with `into_down()`, which fails the
+    /// request with a spurious 400 AND closes and re-dials an otherwise
+    /// healthy pooled upstream connection, once per client cancel.
+    #[tokio::test]
+    async fn test_client_cancel_after_body_eof_is_not_a_read_error() {
+        let (client, server) = duplex(65536);
+        let (body_read_tx, body_read_rx) = tokio::sync::oneshot::channel::<()>();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let client = tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://www.example.com/")
+                .body(())
+                .unwrap();
+            let (response, mut body) = h2
+                .ready()
+                .await
+                .unwrap()
+                .send_request(request, false)
+                .unwrap();
+            // A complete request body, END_STREAM included.
+            body.send_data("payload".into(), true).unwrap();
+
+            // Only cancel once the server has the body, so the cancel is
+            // unambiguously post-EOF rather than a torn upload.
+            body_read_rx.await.unwrap();
+            drop(response);
+            drop(body);
+            // Let the connection task put the RST_STREAM on the wire.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancelled_tx.send(()).unwrap();
+            // Keep the connection open until the server side has made its
+            // observation, so the test never races the connection teardown.
+            let _ = done_rx.await;
+        });
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+        let mut handlers = Vec::new();
+        let mut signals = Some((body_read_tx, cancelled_rx, done_tx));
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
+            let (body_read_tx, cancelled_rx, done_tx) = signals.take().expect("exactly one stream");
+            handlers.push(tokio::spawn(async move {
+                let data = http.read_body_bytes().await.unwrap().unwrap();
+                assert_eq!(data, "payload");
+                assert!(http.is_body_done());
+
+                body_read_tx.send(()).unwrap();
+                cancelled_rx.await.unwrap();
+
+                // The EOF read (which polls trailers) must stay Ok: the
+                // request was received in full and the client's cancel says
+                // nothing about the bytes we already have.
+                assert!(
+                    http.read_body_bytes().await.unwrap().is_none(),
+                    "a post-EOF client cancel must not surface as a read error"
+                );
+                assert!(!http.request_trailers_present());
+                let _ = done_tx.send(());
+            }));
+        }
+        client.await.unwrap();
+        for handler in handlers {
+            handler.await.unwrap();
+        }
+    }
+
+    /// Drive a client that sends `declared` as its `content-length`, puts
+    /// `payload` on the wire (with END_STREAM iff `end_stream`) and then cancels
+    /// the stream -- all BEFORE the server reads anything.
+    ///
+    /// This is the natural wire ordering, and it is the one the latch exists
+    /// for: no oneshot forces the reset to happen after the reader observed EOF,
+    /// so by the time the server polls, `h2` has already overwritten the stream
+    /// state and `RecvStream::is_end_stream()` reports `false` even though the
+    /// END_STREAM-bearing DATA frame is still queued for delivery.
+    ///
+    /// The sleep between the write and the cancel is required, not cosmetic:
+    /// `h2`'s `send_reset` CLEARS the stream's pending send queue, so cancelling
+    /// immediately would drop the DATA frame the test is about.
+    async fn cancel_after_write_client(
+        client: DuplexStream,
+        declared: &'static str,
+        payload: &'static str,
+        end_stream: bool,
+    ) {
+        let (h2, connection) = h2::client::handshake(client).await.unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://www.example.com/")
+            .header("content-length", declared)
+            .body(())
+            .unwrap();
+        let (response, mut body) = h2
+            .ready()
+            .await
+            .unwrap()
+            .send_request(request, false)
+            .unwrap();
+        body.send_data(payload.into(), end_stream).unwrap();
+        // Let the connection task flush the DATA frame before the cancel
+        // discards whatever is still queued.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(response);
+        drop(body);
+        // Keep the connection alive long enough for the reset to be written and
+        // for the server to make its observation.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    /// A complete request body followed by a client cancel, in the NATURAL wire
+    /// ordering: both frames land before the server polls, so the END_STREAM
+    /// evidence is destroyed before it can be latched and only the declared
+    /// `content-length` can still prove the body whole.
+    ///
+    /// Without that source the read fails, and both proxy pumps convert it with
+    /// `into_down()`: a spurious 400 for a request the proxy received in full,
+    /// plus a closed and re-dialled upstream connection, once per client cancel.
+    #[tokio::test]
+    async fn test_complete_body_then_reset_before_any_read_is_a_clean_eof() {
+        let (client, server) = duplex(65536);
+        let client = tokio::spawn(cancel_after_write_client(client, "7", "payload", true));
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+        let mut handlers = Vec::new();
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
+            handlers.push(tokio::spawn(async move {
+                // Nothing is read until both the DATA and the RST_STREAM have
+                // been processed by the connection above.
+                tokio::time::sleep(Duration::from_millis(600)).await;
+
+                let data = http.read_body_bytes().await.unwrap().unwrap();
+                assert_eq!(data, "payload");
+                // The precondition this test exists for: the reset already
+                // destroyed the END_STREAM evidence. If this ever fails the
+                // test has silently degenerated into the easy ordering.
+                assert!(
+                    !http.request_body_reader.is_end_stream(),
+                    "the client cancel must already have overwritten the stream state"
+                );
+
+                assert!(
+                    http.read_body_bytes().await.unwrap().is_none(),
+                    "a fully received content-length body must read as a clean EOF \
+                     even when the client cancelled before we polled"
+                );
+                assert!(http.is_body_done());
+                assert_eq!(http.body_bytes_read(), 7);
+            }));
+        }
+        client.await.unwrap();
+        for handler in handlers {
+            handler.await.unwrap();
+        }
+    }
+
+    /// The mirror image, and the security-relevant half: the same cancel after a
+    /// PARTIAL body must stay a read error. Classifying it as a clean EOF would
+    /// let the pumps forward a truncated request body upstream as if the client
+    /// had sent it in full.
+    #[tokio::test]
+    async fn test_mid_body_reset_is_still_a_read_error() {
+        let (client, server) = duplex(65536);
+        // 20 declared, 4 delivered: the body is provably incomplete.
+        let client = tokio::spawn(cancel_after_write_client(client, "20", "payl", false));
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+        let mut handlers = Vec::new();
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
+            handlers.push(tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+
+                let data = http.read_body_bytes().await.unwrap().unwrap();
+                assert_eq!(data, "payl");
+                assert!(!http.is_body_done());
+
+                let err = http
+                    .read_body_bytes()
+                    .await
+                    .expect_err("a truncated request body must not read as a clean EOF");
+                assert_eq!(err.etype(), &ErrorType::ReadError);
+                assert!(!http.is_body_done());
+            }));
+        }
+        client.await.unwrap();
+        for handler in handlers {
+            handler.await.unwrap();
         }
     }
 
@@ -1535,6 +2053,58 @@ mod test {
                 }
                 assert_eq!(replayed, b"abcdef");
 
+                let response_header = Box::new(ResponseHeader::build(200, None).unwrap());
+                http.write_response_header(response_header, true).unwrap();
+            }));
+        }
+
+        for handle in handles {
+            assert!(handle.await.is_ok());
+        }
+    }
+
+    /// `Content-Length: 0` without END_STREAM on HEADERS: `is_body_done()` is
+    /// false (the transport fact), but the request promises zero DATA bytes,
+    /// so draining must return immediately instead of awaiting an EOS that
+    /// the client only sends later (or never).
+    #[tokio::test]
+    async fn test_drain_returns_immediately_for_cl0_without_end_stream() {
+        let (client, server) = duplex(65536);
+        let mut handles = vec![];
+
+        handles.push(tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                connection.await.unwrap();
+            });
+            let mut h2 = h2.ready().await.unwrap();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://www.example.com/")
+                .header("content-length", "0")
+                .body(())
+                .unwrap();
+            // No END_STREAM on HEADERS, and this client never sends one.
+            let (response, _req_body) = h2.send_request(request, false).unwrap();
+            let (head, _body) = response.await.unwrap().into_parts();
+            assert_eq!(head.status, 200);
+        }));
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
+            handles.push(tokio::spawn(async move {
+                assert!(!http.is_body_done());
+                assert!(http.is_body_empty());
+                // No total_drain_timeout is set: an unbounded drain would hang here.
+                timeout(Duration::from_secs(5), http.drain_request_body())
+                    .await
+                    .expect("drain of a CL:0 request must not await the transport EOS")
+                    .unwrap();
                 let response_header = Box::new(ResponseHeader::build(200, None).unwrap());
                 http.write_response_header(response_header, true).unwrap();
             }));

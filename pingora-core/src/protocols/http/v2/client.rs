@@ -57,6 +57,49 @@ pub struct Http2Session {
     ended: bool,
     // Total DATA payload bytes received from upstream response
     body_recv: usize,
+    // Latched once the TRANSPORT said the response body ended: END_STREAM on
+    // the response HEADERS frame, or `RecvStream::is_end_stream()` observed at
+    // any body poll.
+    //
+    // It is latched rather than recomputed because `h2` destroys the fact: a
+    // RST_STREAM received after END_STREAM overwrites the stream state with
+    // `Closed(Cause::Error(..))`, after which `RecvStream::is_end_stream()`
+    // reports `false` and the two situations are indistinguishable.
+    response_body_eof: bool,
+    // Source (iii) of the same end-of-body proof: the non-zero `content-length`
+    // the response declared, compared against `body_recv`. This is the source
+    // that covers the NATURAL wire ordering -- upstream writes DATA(END_STREAM)
+    // then RST_STREAM, and we poll only afterwards -- in which the END_STREAM
+    // evidence is already overwritten by the time the final chunk is handed
+    // over, so the two latched sources can never fire. See
+    // [`Http2Session::response_body_complete`].
+    response_body_declared_len: Option<usize>,
+}
+
+/// Whether an `h2` error observed *after* the response body already reached
+/// EOF is a benign way for the peer to end the stream rather than a read
+/// failure.
+///
+/// The response is complete at this point, so neither of these means the bytes
+/// we read are suspect:
+/// - GOAWAY with `NO_ERROR`: graceful connection shutdown.
+/// - RST_STREAM with `NO_ERROR`: RFC 9113 §8.1's "a server MAY request that
+///   the client abort transmission of a request without error by sending a
+///   RST_STREAM with an error code of NO_ERROR after sending a complete
+///   response".
+///
+/// Mirrors the server-side classification in
+/// [`crate::protocols::http::v2::server`]. Deliberately narrower than the
+/// server's: `CANCEL` is *not* accepted here. A downstream client cancelling a
+/// response it no longer wants is routine; an upstream server cancelling a
+/// response it already sent in full is not, and the existing trailer
+/// classification this reuses has only ever accepted `NO_ERROR`.
+///
+/// The caller MUST have proven the EOF first. Without that guard this
+/// predicate would map a mid-body reset -- a truncated response -- onto a
+/// clean end of body and hand the truncation to the downstream client.
+fn benign_post_eof_stream_end(e: &h2::Error) -> bool {
+    (e.is_go_away() || e.is_reset()) && e.is_remote() && e.reason() == Some(Reason::NO_ERROR)
 }
 
 impl Drop for Http2Session {
@@ -79,7 +122,36 @@ impl Http2Session {
             conn,
             ended: false,
             body_recv: 0,
+            response_body_eof: false,
+            response_body_declared_len: None,
         }
+    }
+
+    /// Whether the response body is provably complete, from ANY source the peer
+    /// cannot retract: END_STREAM on HEADERS, `is_end_stream()` observed at a
+    /// body poll (both latched into `response_body_eof`), or a declared,
+    /// non-zero `content-length` whose bytes have all been received.
+    ///
+    /// This is the guard on treating a stream end as a clean end of body rather
+    /// than as a truncated response.
+    ///
+    /// RESIDUAL GAP, deliberate and load-bearing: a response that declares no
+    /// USABLE `content-length` -- either none at all (the shape gRPC and every
+    /// chunked-style H2 stream use) or `content-length: 0`, which
+    /// [`super::server::declared_body_length`] maps to `None` because on H2 it
+    /// says nothing about END_STREAM -- and whose peer resets the stream before
+    /// we poll the final DATA frame has no surviving proof that its body is
+    /// whole, so the reset still surfaces as a read error. That is the correct
+    /// failure direction -- guessing wrong hands a TRUNCATED response to the
+    /// downstream client as if it were complete. Do NOT "fix" this by dropping
+    /// the guard; the negative-direction test
+    /// (`h2_response_body_no_error_reset_before_eos_is_an_error`) exists to keep
+    /// that from happening quietly.
+    fn response_body_complete(&self) -> bool {
+        self.response_body_eof
+            || self
+                .response_body_declared_len
+                .is_some_and(|len| self.body_recv >= len)
     }
 
     fn sanitize_request_header(req: &mut RequestHeader) -> Result<()> {
@@ -132,6 +204,12 @@ impl Http2Session {
     }
 
     /// Write a request body chunk
+    ///
+    /// A peer that sends RFC 9113 §8.1's RST_STREAM(NO_ERROR) while this is in
+    /// flight makes the write fail. That is deliberately *not* softened into a
+    /// graceful "stop uploading" here -- see the TODO in [`Self::read_trailers`]
+    /// for why the reason behind a failed h2 write cannot be established from
+    /// the write half alone.
     pub async fn write_request_body(&mut self, data: Bytes, end: bool) -> Result<()> {
         if self.ended {
             warn!("Try to write request body after end of stream, dropping the extra data");
@@ -191,7 +269,11 @@ impl Http2Session {
             None => resp_fut.await,
         };
         let (resp, body_reader) = res.map_err(handle_read_header_error)?.into_parts();
+        self.response_body_declared_len = super::server::declared_body_length(&resp.headers);
         self.response_header = Some(resp.into());
+        // END_STREAM on the HEADERS frame: the response body is complete (and
+        // empty) before a single body read happens.
+        self.response_body_eof = body_reader.is_end_stream();
         self.response_body_reader = Some(body_reader);
 
         Ok(())
@@ -220,7 +302,9 @@ impl Http2Session {
         };
 
         let (resp, body_reader) = res.into_parts();
+        self.response_body_declared_len = super::server::declared_body_length(&resp.headers);
         self.response_header = Some(resp.into());
+        self.response_body_eof = body_reader.is_end_stream();
         self.response_body_reader = Some(body_reader);
 
         Poll::Ready(Ok(()))
@@ -230,6 +314,9 @@ impl Http2Session {
     ///
     /// `None` means, no more body to read
     pub async fn read_response_body(&mut self) -> Result<Option<Bytes>> {
+        // Read before the mutable borrow of the reader below; the value cannot
+        // change while this call is in flight.
+        let body_complete = self.response_body_complete();
         let Some(body_reader) = self.response_body_reader.as_mut() else {
             // req is not sent or response is already read
             // TODO: warn
@@ -243,16 +330,30 @@ impl Http2Session {
                 .map_err(|_| Error::explain(ReadTimedout, "while reading h2 response body"))?,
             None => fut.await,
         };
-        let body = res
-            .transpose()
-            .or_err(ReadError, "while read h2 response body")
-            .map_err(|mut e| {
+        let body = match res.transpose() {
+            Ok(body) => body,
+            // Only reachable once `response_body_eof` is latched, i.e. the
+            // response body is provably complete. `h2` still surfaces the
+            // peer's RST_STREAM/GOAWAY here because a reset received after
+            // END_STREAM overwrites the stream state, so the *next* read of an
+            // already-finished body fails instead of reporting a clean EOF.
+            // Reporting the end of body is what the peer's `NO_ERROR` means;
+            // failing would cost the exchange a complete response it already
+            // holds. See `benign_post_eof_stream_end` for why the guard is not
+            // optional.
+            Err(e) if body_complete && benign_post_eof_stream_end(&e) => {
+                debug!("h2 stream ended with NO_ERROR after response body EOF: {e}");
+                None
+            }
+            Err(e) => {
                 // cannot use handle_err() because of borrow checker
+                let mut e = Error::because(ReadError, "while read h2 response body", e);
                 if self.conn.ping_timedout() {
                     e.etype = PING_TIMEDOUT;
                 }
-                e
-            })?;
+                return Err(e);
+            }
+        };
 
         if let Some(data) = body.as_ref() {
             body_reader
@@ -260,6 +361,17 @@ impl Http2Session {
                 .release_capacity(data.len())
                 .or_err(ReadError, "while releasing h2 response body capacity")?;
             self.body_recv = self.body_recv.saturating_add(data.len());
+            // Latch at the earliest moment the transport can still prove it:
+            // right after the DATA frame that carried END_STREAM was handed
+            // over, while nothing is buffered behind it.
+            if body_reader.is_end_stream() {
+                self.response_body_eof = true;
+            }
+        } else {
+            // `data()` yielding `None` means `h2` had either observed
+            // END_STREAM or already queued the trailers frame; either way the
+            // body is complete.
+            self.response_body_eof = true;
         }
 
         Ok(body)
@@ -283,30 +395,47 @@ impl Http2Session {
 
         if let Some(data) = data {
             body_reader.flow_control().release_capacity(data.len())?;
+            if body_reader.is_end_stream() {
+                self.response_body_eof = true;
+            }
             return Poll::Ready(Some(Ok(data)));
         }
 
+        self.response_body_eof = true;
         Poll::Ready(None)
     }
 
     /// Whether the response has ended
+    ///
+    /// Reports the LATCHED transport fact so that a peer resetting a stream it
+    /// already ended cannot flip this back to `false`; the live
+    /// `is_end_stream()` is still consulted so that an END_STREAM which arrived
+    /// without us polling is picked up immediately.
+    ///
+    /// Deliberately does NOT consult the `content-length` source of
+    /// [`Self::response_body_complete`]: an H2 response may legally send
+    /// TRAILERS after a complete, `content-length`-declared body, and this
+    /// function's callers stop reading the response once it reports `true`.
     pub fn response_finished(&self) -> bool {
         // if response_body_reader doesn't exist, the response is not even read yet
         self.response_body_reader
             .as_ref()
-            .is_some_and(|reader| reader.is_end_stream())
+            .is_some_and(|reader| self.response_body_eof || reader.is_end_stream())
     }
 
     /// Check whether stream finished with error.
     /// Like `response_finished`, but also attempts to poll the h2 stream for errors that may have
     /// caused the stream to terminate, and returns them as `H2Error`s.
     pub fn check_response_end_or_error(&mut self) -> Result<bool> {
+        // Same latched fact as `response_finished()`, read before the mutable
+        // borrow of the reader below.
+        let ended = self.response_body_eof;
         let Some(reader) = self.response_body_reader.as_mut() else {
             // response is not even read
             return Ok(false);
         };
 
-        if !reader.is_end_stream() {
+        if !ended && !reader.is_end_stream() {
             return Ok(false);
         }
 
@@ -326,6 +455,14 @@ impl Http2Session {
         match tokio::task::unconstrained(reader.data()).now_or_never() {
             Some(None) => Ok(true),
             Some(Some(Ok(_))) => Error::e_explain(H2Error, "unexpected data after end stream"),
+            // The response body already ended (that is what `ended` records),
+            // so a peer ending the stream benignly on top of it is not an
+            // error: `h2` only surfaces it here because the reset overwrote the
+            // stream state that would otherwise have reported a clean EOF.
+            Some(Some(Err(e))) if ended && benign_post_eof_stream_end(&e) => {
+                debug!("h2 stream ended benignly after response body EOF: {e}");
+                Ok(true)
+            }
             Some(Some(Err(e))) => Error::e_because(H2Error, "while checking end stream", e),
             None => {
                 // RecvStream data() should be ready to poll after the stream ends,
@@ -353,24 +490,37 @@ impl Http2Session {
         };
         match res {
             Ok(t) => Ok(t),
-            Err(e) => {
-                // GOAWAY with no error: this is graceful shutdown, continue as if no trailer
-                // RESET_STREAM with no error: https://datatracker.ietf.org/doc/html/rfc9113#section-8.1:
-                // this is to signal client to stop uploading request without breaking the response.
-                // TODO: should actually stop uploading
-                // TODO: should we try reading again?
-                // TODO: handle this when reading headers and body as well
-                // https://github.com/hyperium/h2/issues/741
-
-                if (e.is_go_away() || e.is_reset())
-                    && e.is_remote()
-                    && e.reason() == Some(Reason::NO_ERROR)
-                {
-                    Ok(None)
-                } else {
-                    Err(e)
-                }
-            }
+            // GOAWAY with no error: this is graceful shutdown, continue as if no trailer
+            // RESET_STREAM with no error: https://datatracker.ietf.org/doc/html/rfc9113#section-8.1:
+            // this is to signal client to stop uploading request without breaking the response.
+            //
+            // The `response_body_eof` guard used to be an unwritten contract
+            // on the caller (both in-tree callers only reach this after
+            // `read_response_body()` returned `Ok(None)`, which is exactly the
+            // proof the latch records). Making it explicit keeps a caller that
+            // skips or aborts the body read from turning a broken stream into
+            // "no trailers".
+            //
+            // TODO: should actually stop uploading. Do NOT "fix" this by
+            // classifying the failure at the write site: `h2` reports a write
+            // to a reset stream as `UserError::InactiveStreamId`, and
+            // `SendStream::poll_capacity` as a bare `Ready(None)` -- neither
+            // carries a reason or an initiator. The only reason source there,
+            // `SendStream::poll_reset`, collapses `Closed(Cause::Error(Reset))`
+            // and `Closed(Cause::Error(GoAway))` into one bare `Reason`, so
+            // RFC 9113 §8.1's RST_STREAM(NO_ERROR) (response complete, safe to
+            // stop uploading) is indistinguishable there from a
+            // GOAWAY(NO_ERROR) whose `last_stream_id` excluded this stream
+            // (never processed, MUST be retried, no response will ever come).
+            // Stopping the upload is only sound once a complete response is in
+            // hand, and pingora-proxy's h2 upload pump cannot see that: it
+            // writes to a `SendStream` detached via
+            // `take_request_body_writer()` while the response half is read
+            // concurrently in the other arm of its `select!`.
+            // TODO: should we try reading again?
+            // https://github.com/hyperium/h2/issues/741 (still open, docs-only)
+            Err(e) if self.response_body_complete() && benign_post_eof_stream_end(&e) => Ok(None),
+            Err(e) => Err(e),
         }
         .or_err(ReadError, "while reading h2 trailers")
     }
@@ -687,5 +837,260 @@ mod tests_h2 {
         }
         assert_eq!(total, 3);
         assert_eq!(h2s.body_bytes_received(), 3);
+    }
+
+    /// Build an [`Http2Session`] over `client_io` and start its connection task.
+    async fn client_session(client_io: tokio::io::DuplexStream) -> Http2Session {
+        let (send_req, connection) = h2::client::handshake(client_io).await.unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::watch::channel(false);
+        let ping_timeout = Arc::new(AtomicBool::new(false));
+        tokio::spawn(async move {
+            let _ = connection.await;
+            let _ = closed_tx.send(true);
+        });
+        let conn_ref = crate::connectors::http::v2::ConnectionRef::new(
+            send_req.clone(),
+            closed_rx,
+            ping_timeout,
+            0,
+            1,
+            Digest::default(),
+        );
+        Http2Session::new(send_req, conn_ref)
+    }
+
+    /// Send request HEADERS *without* END_STREAM and read the response header.
+    ///
+    /// Leaving the request stream open is what makes these tests reproduce the
+    /// RFC 9113 §8.1 shape at all: once this side has sent END_STREAM, an
+    /// inbound RST_STREAM finds the stream in `Closed(Cause::EndStream)` and h2
+    /// leaves the state alone, so no read ever fails.
+    async fn send_open_request(h2s: &mut Http2Session) {
+        let mut req = RequestHeader::build("POST", b"/", None).unwrap();
+        req.insert_header(http::header::HOST, "example.com")
+            .unwrap();
+        h2s.write_request_header(Box::new(req), false).unwrap();
+        h2s.read_response_header().await.unwrap();
+    }
+
+    /// Block until this side has processed the peer's RST_STREAM.
+    ///
+    /// The reset overwrites the stream state, which flips the RAW
+    /// `RecvStream::is_end_stream()` back to `false`. That raw value is exactly
+    /// what the session no longer exposes (`response_finished()` is latched, and
+    /// staying `true` across a reset is the point of the latch), so this reaches
+    /// into the private reader: waiting on the fact rather than on a sleep is
+    /// what keeps these tests from passing for the wrong reason when the reset
+    /// has not landed yet.
+    async fn await_reset_processed(h2s: &Http2Session) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while raw_receiver_ended(h2s) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("peer RST_STREAM was never processed");
+    }
+
+    /// The un-latched `h2` view of the receive half, for tests that need to
+    /// observe the state the latch exists to preserve.
+    fn raw_receiver_ended(h2s: &Http2Session) -> bool {
+        h2s.response_body_reader
+            .as_ref()
+            .is_some_and(|r| r.is_end_stream())
+    }
+
+    /// A complete response followed by RFC 9113 §8.1's RST_STREAM(NO_ERROR)
+    /// -- the upstream asking us to stop uploading a request it no longer
+    /// needs -- must read as a clean end of body, not as a `ReadError`. The
+    /// response is already in hand; failing it would discard a complete
+    /// response over a protocol-sanctioned signal.
+    #[tokio::test]
+    async fn h2_response_body_no_error_reset_after_eos_is_end_of_body() {
+        let (client_io, server_io) = duplex(65536);
+        let (reset_tx, reset_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_io).await.unwrap();
+            let (_req, mut send_resp) = conn.accept().await.unwrap().unwrap();
+            let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
+            let mut send_stream = send_resp.send_response(resp, false).unwrap();
+            // A complete response body, END_STREAM included.
+            send_stream.send_data(Bytes::from("hello"), true).unwrap();
+
+            // Drive the connection until the client has the whole body, so the
+            // reset is unambiguously post-EOF.
+            tokio::select! {
+                _ = async { while conn.accept().await.is_some() {} } => {}
+                _ = reset_rx => {}
+            }
+            send_stream.send_reset(Reason::NO_ERROR);
+            while conn.accept().await.is_some() {}
+        });
+
+        let mut h2s = client_session(client_io).await;
+        send_open_request(&mut h2s).await;
+
+        assert_eq!(h2s.read_response_body().await.unwrap().unwrap(), "hello");
+        assert!(h2s.response_finished());
+
+        reset_tx.send(()).unwrap();
+        await_reset_processed(&h2s).await;
+
+        assert!(
+            h2s.read_response_body()
+                .await
+                .expect("a post-EOF NO_ERROR reset must not surface as a read error")
+                .is_none(),
+            "the response body already ended"
+        );
+        assert_eq!(h2s.body_bytes_received(), 5);
+    }
+
+    /// The same shape in the NATURAL wire ordering: the upstream flushes the
+    /// complete response AND the RST_STREAM before this side polls the body at
+    /// all. No oneshot forces the reset to happen after the reader observed EOF,
+    /// which is what makes this the case real traffic produces -- and the case
+    /// in which `h2` has already overwritten the stream state, so END_STREAM can
+    /// never be latched and only the declared `content-length` still proves the
+    /// body whole.
+    ///
+    /// The sleep before the reset is required, not cosmetic: `h2`'s
+    /// `send_reset` CLEARS the stream's pending send queue, so resetting
+    /// immediately would drop the DATA frame this test is about.
+    #[tokio::test]
+    async fn h2_response_body_reset_before_any_read_is_end_of_body() {
+        let (client_io, server_io) = duplex(65536);
+
+        tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_io).await.unwrap();
+            let (_req, mut send_resp) = conn.accept().await.unwrap().unwrap();
+            let resp = Response::builder()
+                .status(StatusCode::OK)
+                .header("content-length", "5")
+                .body(())
+                .unwrap();
+            let mut send_stream = send_resp.send_response(resp, false).unwrap();
+            send_stream.send_data(Bytes::from("hello"), true).unwrap();
+
+            // Drive the connection long enough to flush the DATA frame, then
+            // reset without waiting for the peer to have read anything.
+            tokio::select! {
+                _ = async { while conn.accept().await.is_some() {} } => {}
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+            }
+            send_stream.send_reset(Reason::NO_ERROR);
+            while conn.accept().await.is_some() {}
+        });
+
+        let mut h2s = client_session(client_io).await;
+        send_open_request(&mut h2s).await;
+        // Nothing is read until both frames have been processed.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        assert_eq!(h2s.read_response_body().await.unwrap().unwrap(), "hello");
+        // The precondition this test exists for: the reset already destroyed
+        // the END_STREAM evidence. If this ever fails, the test has silently
+        // degenerated into the easy ordering covered by the test above.
+        assert!(
+            !raw_receiver_ended(&h2s),
+            "the peer reset must already have overwritten the stream state"
+        );
+
+        assert!(
+            h2s.read_response_body()
+                .await
+                .expect(
+                    "a fully received content-length body must read as a clean EOF even when \
+                     the peer reset before we polled"
+                )
+                .is_none(),
+            "the response body already ended"
+        );
+        assert_eq!(h2s.body_bytes_received(), 5);
+    }
+
+    /// The mirror image: the same RST_STREAM(NO_ERROR) arriving *before*
+    /// END_STREAM means the response body was truncated. Reporting it as a
+    /// clean end of body would hand the truncation to the downstream client,
+    /// so it must stay an error.
+    #[tokio::test]
+    async fn h2_response_body_no_error_reset_before_eos_is_an_error() {
+        let (client_io, server_io) = duplex(65536);
+        let (reset_tx, reset_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_io).await.unwrap();
+            let (_req, mut send_resp) = conn.accept().await.unwrap().unwrap();
+            let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
+            let mut send_stream = send_resp.send_response(resp, false).unwrap();
+            // A partial body: no END_STREAM, then the stream is reset.
+            send_stream.send_data(Bytes::from("hel"), false).unwrap();
+
+            // Reset only once the client holds the partial body, so the test
+            // exercises the body read rather than the header read.
+            tokio::select! {
+                _ = async { while conn.accept().await.is_some() {} } => {}
+                _ = reset_rx => {}
+            }
+            send_stream.send_reset(Reason::NO_ERROR);
+            while conn.accept().await.is_some() {}
+        });
+
+        let mut h2s = client_session(client_io).await;
+        send_open_request(&mut h2s).await;
+
+        assert_eq!(h2s.read_response_body().await.unwrap().unwrap(), "hel");
+        assert!(!h2s.response_finished());
+        reset_tx.send(()).unwrap();
+
+        // Blocks until the reset lands, so no sleep is needed to make this
+        // deterministic: the receive half is still open until then.
+        let err = h2s
+            .read_response_body()
+            .await
+            .expect_err("a truncated response body must not read as a clean EOF");
+        assert_eq!(err.etype(), &ReadError);
+    }
+
+    /// The pre-existing trailer classification keeps working now that it is
+    /// guarded by the same end-of-body proof: the guard must not be so strict
+    /// that it re-breaks the case it was written for.
+    #[tokio::test]
+    async fn h2_trailers_no_error_reset_after_eos_is_benign() {
+        let (client_io, server_io) = duplex(65536);
+        let (reset_tx, reset_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_io).await.unwrap();
+            let (_req, mut send_resp) = conn.accept().await.unwrap().unwrap();
+            let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
+            let mut send_stream = send_resp.send_response(resp, false).unwrap();
+            send_stream.send_data(Bytes::from("hello"), true).unwrap();
+
+            tokio::select! {
+                _ = async { while conn.accept().await.is_some() {} } => {}
+                _ = reset_rx => {}
+            }
+            send_stream.send_reset(Reason::NO_ERROR);
+            while conn.accept().await.is_some() {}
+        });
+
+        let mut h2s = client_session(client_io).await;
+        send_open_request(&mut h2s).await;
+
+        assert_eq!(h2s.read_response_body().await.unwrap().unwrap(), "hello");
+        // Reach the end of body before the reset lands, which is the ordering
+        // the trailer read has always relied on.
+        assert!(h2s.read_response_body().await.unwrap().is_none());
+
+        reset_tx.send(()).unwrap();
+        await_reset_processed(&h2s).await;
+
+        assert!(h2s
+            .read_trailers()
+            .await
+            .expect("a post-EOF NO_ERROR reset must not surface as a trailer read error")
+            .is_none());
     }
 }
