@@ -27,7 +27,7 @@ use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use pingora_http::{IntoCaseHeaderName, RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
 use regex::bytes::Regex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::body::{BodyReader, BodyWriter};
@@ -73,6 +73,19 @@ pub struct HttpSession {
     /// timeouts:
     keepalive_timeout: KeepaliveStatus,
     read_timeout: Option<Duration>,
+    /// Absolute deadline of the CURRENT request-body read.
+    ///
+    /// The body bound is a DEADLINE, not a per-call duration, for the same
+    /// reason as its h2 counterpart (see `v2::server::HttpSession::read_deadline`):
+    /// the proxy polls `read_body_or_idle` from a `tokio::select!` branch, so
+    /// any other ready branch drops the read future, and a duration recomputed
+    /// on the next iteration would restart the bound from zero. A client that
+    /// stalls forever while the upstream speaks even once per period would
+    /// then never be released.
+    ///
+    /// Cleared only by a read that actually produced body bytes, or by the end
+    /// of the body -- never by a cancelled read.
+    read_deadline: Option<Instant>,
     write_timeout: Option<Duration>,
     /// How long to wait to make downstream session reusable, if body needs to be drained.
     total_drain_timeout: Option<Duration>,
@@ -146,6 +159,7 @@ impl HttpSession {
             response_written: None,
             request_header: None,
             read_timeout: Some(Duration::from_secs(60)),
+            read_deadline: None,
             write_timeout: None,
             total_drain_timeout: None,
             body_bytes_sent: 0,
@@ -507,12 +521,37 @@ impl HttpSession {
     }
 
     /// Read the body into the internal buffer
+    ///
+    /// The `read_timeout` is applied as an inter-chunk idle bound anchored on
+    /// `read_deadline`: it survives the cancellation of this future by a losing
+    /// `select!` branch, and it is rearmed only by a read that produced body
+    /// bytes or reached the end of the body. A read that returns zero bytes --
+    /// chunked framing split across packets, and the empty payloads the chunk
+    /// parser reports for it -- is not progress and must not rearm it, or a
+    /// peer could hold the connection open forever with framing alone.
     async fn read_body(&mut self) -> Result<Option<BufRef>> {
         match self.read_timeout {
-            Some(t) => match timeout(t, self.do_read_body()).await {
-                Ok(res) => res,
-                Err(_) => Error::e_explain(ReadTimedout, format!("reading body, timeout: {t:?}")),
-            },
+            Some(t) => {
+                let now = Instant::now();
+                let deadline = *self.read_deadline.get_or_insert(now + t);
+                let remaining = deadline.saturating_duration_since(now);
+                match timeout(remaining, self.do_read_body()).await {
+                    Ok(res) => {
+                        let progressed = match res.as_ref() {
+                            Ok(Some(b)) => !b.is_empty(),
+                            Ok(None) => true, // end of body
+                            Err(_) => true,   // failed reads get a fresh bound
+                        };
+                        if progressed {
+                            self.read_deadline = None;
+                        }
+                        res
+                    }
+                    Err(_) => {
+                        Error::e_explain(ReadTimedout, format!("reading body, timeout: {t:?}"))
+                    }
+                }
+            }
             None => self.do_read_body().await,
         }
     }
@@ -1217,6 +1256,10 @@ impl HttpSession {
             return Ok(false);
         };
         registered.begin_replay().await?;
+        // See the h2 counterpart: a deadline left over from a live read that
+        // was cancelled before this attempt no longer describes the client's
+        // silence once replay is serving buffered chunks.
+        self.read_deadline = None;
         Ok(true)
     }
 
@@ -3225,6 +3268,48 @@ mod test_timeouts {
         let res = test_read_with_tokio_timeout(http_stream.read_body_bytes()).await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap().unwrap_err().etype(), &ReadTimedout);
+    }
+
+    /// The h1 counterpart of
+    /// `v2::server::test::test_read_body_timeout_survives_select_cancellation`.
+    ///
+    /// The proxy polls the downstream body read from a `tokio::select!` branch,
+    /// so any other ready branch drops the read future. The bound must be a
+    /// deadline that survives that, or an upstream chattier than the timeout
+    /// rearms it forever and a stalled client pins the pump.
+    #[tokio::test]
+    async fn test_read_http_body_timeout_survives_select_cancellation() {
+        /// Well under `TEST_READ_TIMEOUT`: the read is cancelled and rebuilt
+        /// several times before the deadline is reached.
+        const COMPETING_BRANCH_TICK: Duration = Duration::from_millis(100);
+
+        let mut http_stream = HttpSession::new(mocked_blocking_body_forever_stream());
+        http_stream.read_timeout = Some(TEST_READ_TIMEOUT);
+        http_stream.read_request().await.unwrap();
+
+        let mut cancellations = 0u32;
+        let res = test_read_with_tokio_timeout(async {
+            loop {
+                tokio::select! {
+                    body = http_stream.read_body_bytes() => break body,
+                    _ = tokio::time::sleep(COMPETING_BRANCH_TICK) => {
+                        cancellations += 1;
+                    }
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            res.is_ok(),
+            "an unrelated ready select! branch must not rearm the request-body idle bound"
+        );
+        assert_eq!(res.unwrap().unwrap_err().etype(), &ReadTimedout);
+        assert!(
+            cancellations >= 2,
+            "the competing branch must have cancelled the read at least twice for this \
+             to test anything; saw {cancellations}"
+        );
     }
 }
 

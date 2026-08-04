@@ -27,7 +27,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_timeout::timeout;
 use std::sync::Arc;
 use std::task::ready;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::protocols::http::body_buffer::{
     FixedBuffer, RegisteredRequestBodyBuffer, RequestBodyBuffer,
@@ -39,6 +39,19 @@ use crate::protocols::{Digest, SocketAddr, Stream};
 use crate::{Error, ErrorType, OrErr, Result};
 
 const BODY_BUF_LIMIT: usize = 1024 * 64;
+
+/// The default downstream request-body read timeout, matching the HTTP/1
+/// server session's own default (`v1::server::HttpSession::new`).
+///
+/// A default is what makes the bound real: nothing in `pingora-core` or
+/// `pingora-proxy` calls [`HttpSession::set_read_timeout`], so an opt-in bound
+/// would leave every consumer that does not set one -- including pingora's own
+/// server apps -- with an unbounded H2 body read, while the same application
+/// over HTTP/1 is protected. Applications with legitimately idle uploads
+/// (long-idle client-streaming gRPC) raise or clear it per request with
+/// [`HttpSession::set_read_timeout`]; CONNECT tunnels are exempt by
+/// construction, see [`HttpSession::body_read_timeout`].
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 type H2Connection<S> = server::Connection<S, Bytes>;
 
@@ -220,6 +233,28 @@ pub struct HttpSession {
     /// The timeout is reset on every write. This is not a timeout on the overall duration of the
     /// response.
     pub write_timeout: Option<Duration>,
+    // The read timeout applied to each downstream request-body read. The
+    // timeout is reset on every received chunk, so it bounds a stalled upload
+    // without limiting the overall duration of a progressing one (the same
+    // per-read semantics as the HTTP/1 `read_timeout`).
+    read_timeout: Option<Duration>,
+    // Absolute deadline of the CURRENT request-body read, i.e. "the client has
+    // been silent since this instant plus `read_timeout`".
+    //
+    // The bound is a DEADLINE and not a per-call duration on purpose. Every
+    // caller of `read_body_bytes` in this repo polls it from a `tokio::select!`
+    // branch (see `proxy_h1::bidirection_1to2` / `proxy_h2::bidirection_down_to_up`),
+    // where any OTHER branch becoming ready -- an upstream response chunk, a
+    // cache task, a custom message -- completes the select and DROPS this
+    // future. A duration recomputed per call would restart from zero on the
+    // next loop iteration, so a client that stalls forever against an upstream
+    // that speaks even once per timeout period would never be released: the
+    // exact DoS this bound exists to close. Carrying the deadline on the
+    // session makes cancellation unable to rearm it.
+    //
+    // Cleared ONLY by transport progress (a non-empty DATA payload, or
+    // END_STREAM), never by a cancelled read. See `read_body_bytes`.
+    read_deadline: Option<Instant>,
     // How long to wait when draining (discarding) request body
     total_drain_timeout: Option<Duration>,
 }
@@ -273,6 +308,8 @@ impl HttpSession {
                 trailers_polled: false,
                 digest,
                 write_timeout: None,
+                read_timeout: Some(DEFAULT_READ_TIMEOUT),
+                read_deadline: None,
                 total_drain_timeout: None,
             }
         }))
@@ -327,6 +364,24 @@ impl HttpSession {
                 .is_some_and(|len| self.body_read >= len)
     }
 
+    /// The idle bound that applies to the next request-body chunk read, or
+    /// `None` when this session's body reads are deliberately unbounded.
+    ///
+    /// CONNECT is exempt. For a tunnel the "request body" IS the client-to-peer
+    /// uplink, and a long idle period on it is ordinary rather than abusive: an
+    /// idle SSH session, or a WebSocket over extended CONNECT (RFC 8441, which
+    /// also uses `:method = CONNECT`, so this one check covers both) whose
+    /// traffic happens to run server-to-client only. Applying the bound would
+    /// tear such tunnels down at exactly the moment they are behaving
+    /// correctly. The same check guards the request-body buffer registrations
+    /// below.
+    fn body_read_timeout(&self) -> Option<Duration> {
+        if self.request_header.method == http::Method::CONNECT {
+            return None;
+        }
+        self.read_timeout
+    }
+
     /// Read request body bytes. `None` when there is no more body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
         if self.early_body_capture_poisoned {
@@ -335,8 +390,57 @@ impl HttpSession {
                 "request body capture failed or was cancelled mid-chunk; buffered body is incomplete",
             );
         }
-        // TODO: timeout
-        let data = match self.request_body_reader.data().await.transpose() {
+        let polled = match self.body_read_timeout() {
+            Some(t) => {
+                // Resume the deadline of the read this one continues; only
+                // transport progress clears it (see `read_deadline`). A read
+                // whose deadline already passed still gets one poll: the data
+                // may already be buffered, and answering a ready chunk with a
+                // timeout would be wrong.
+                let now = Instant::now();
+                let deadline = *self.read_deadline.get_or_insert(now + t);
+                let remaining = deadline.saturating_duration_since(now);
+                match timeout(remaining, self.request_body_reader.data()).await {
+                    Ok(data) => data,
+                    Err(_) => {
+                        // A body the TRANSPORT has promised is empty
+                        // (`Content-Length: 0`) has no bytes left to lose, so
+                        // there is nothing for this timeout to protect: the
+                        // client owes us only an END_STREAM that H2 does not
+                        // require it to have sent yet (design 4.3). Failing the
+                        // exchange here would 4xx a request that is otherwise
+                        // complete -- and would do it for an entirely ordinary
+                        // client whose upstream simply had nothing more to say.
+                        // Finish the read side instead; it is the same
+                        // conclusion `proxy_common::downstream_body_read_is_futile`
+                        // reaches for this shape, just reached from the read
+                        // side and without waiting on the response.
+                        //
+                        // No trailer poll and no capture finish here, unlike
+                        // the EOF branch below: the data section has NOT ended,
+                        // so `trailers()` would park forever, and a registered
+                        // capture buffer cannot coexist with an empty body
+                        // (`set_request_body_buffer` rejects it, and
+                        // `is_body_empty()` is false while one is registered).
+                        if self.is_body_empty() {
+                            debug!(
+                                "downstream request body read timed out after {t:?} on a body \
+                                 declared empty; finishing the read side instead of failing the \
+                                 request"
+                            );
+                            self.request_body_eof = true;
+                            return Ok(None);
+                        }
+                        return Error::e_explain(
+                            ErrorType::ReadTimedout,
+                            format!("while reading downstream request body, timeout: {t:?}"),
+                        );
+                    }
+                }
+            }
+            None => self.request_body_reader.data().await,
+        };
+        let data = match polled.transpose() {
             Ok(data) => data,
             Err(e) => {
                 // Once the request body is complete, a client ending the
@@ -355,6 +459,17 @@ impl HttpSession {
             }
         };
         if let Some(data) = data.as_ref() {
+            // Rearm the idle bound only on real progress. An EMPTY DATA frame
+            // without END_STREAM is legal, costs the peer 9 bytes, consumes
+            // NO flow-control window (h2 `proto::streams::recv::recv_data`
+            // credits the window back for a zero-length payload) and trips no
+            // flood counter, so treating it as progress would hand an attacker
+            // a free, unlimited rearm -- and `body_read` never advances, so no
+            // byte-count body-size limit catches it either. END_STREAM is
+            // progress even with a zero-length payload: it ends the body.
+            if !data.is_empty() || self.request_body_reader.is_end_stream() {
+                self.read_deadline = None;
+            }
             self.body_read += data.len();
             if let Some(buffer) = self.retry_buffer.as_mut() {
                 buffer.write_to_buffer(data);
@@ -383,6 +498,7 @@ impl HttpSession {
                 }
             }
         } else {
+            self.read_deadline = None;
             self.request_body_eof = true;
             // Establish the trailer fact exactly once: it is never cleared
             // again within this request.
@@ -415,6 +531,12 @@ impl HttpSession {
     // A `RequestBodyBuffer::write` is async and cannot run in a poll context.
     // Fail closed when capture/replay is registered instead of silently returning
     // bytes that bypass the buffer.
+    //
+    // NOTE: this does NOT apply `read_timeout` -- it is a plain poll with no
+    // timer of its own, so a caller that drives the request body through here
+    // is responsible for its own idle bound (`read_body_bytes` is the bounded
+    // entry point). There is no in-tree consumer today; add the bound here
+    // before adding one.
     #[doc(hidden)]
     pub fn poll_read_body_bytes(
         &mut self,
@@ -484,6 +606,29 @@ impl HttpSession {
             },
             None => self.do_drain_request_body().await,
         }
+    }
+
+    /// Sets the downstream read timeout. This will trigger if the next
+    /// request-body chunk cannot be read within `timeout`.
+    ///
+    /// The bound is an INTER-CHUNK idle bound, not a bound on the overall
+    /// upload: it is rearmed by every DATA payload that carries at least one
+    /// byte (and by END_STREAM), so a slow but progressing upload is never
+    /// limited in total duration, while a client that stops sending is
+    /// released after one `timeout` of silence. An empty DATA frame is not
+    /// progress and does not rearm it.
+    ///
+    /// Defaults to 60s, matching the HTTP/1 server session. CONNECT requests
+    /// (including extended CONNECT) are exempt regardless of what is set here;
+    /// their "body" is a tunnel uplink on which idling is normal. Pass `None`
+    /// to make the reads unbounded.
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.read_timeout = timeout;
+    }
+
+    /// Get the read timeout.
+    pub fn get_read_timeout(&self) -> Option<Duration> {
+        self.read_timeout
     }
 
     /// Sets the downstream write timeout. This will trigger if we're unable
@@ -995,6 +1140,11 @@ impl HttpSession {
             return Ok(false);
         };
         registered.begin_replay().await?;
+        // Replay serves buffered chunks, so any deadline left over from a live
+        // read that was cancelled before this attempt no longer describes the
+        // client's silence: drop it so the first live read after the replay
+        // starts a fresh bound instead of expiring immediately.
+        self.read_deadline = None;
         Ok(true)
     }
 
@@ -2680,6 +2830,453 @@ mod test {
                 // the session must fail closed on any further read or replay.
                 assert!(http.read_body_bytes().await.is_err());
                 assert!(http.begin_request_body_replay().await.is_err());
+            }));
+        }
+
+        for handle in handles {
+            assert!(handle.await.is_ok());
+        }
+    }
+
+    // NOTE on wall-clock in the read-timeout tests below: `tokio::time::pause()`
+    // cannot drive them. The bound is armed with `pingora_timeout::timeout`,
+    // whose fast timer runs on a dedicated OS thread against the real clock
+    // (`pingora_timeout::fast_timeout::TIMER_MANAGER`), so paused/auto-advanced
+    // tokio time never fires it and every one of these tests would hang. The
+    // durations are therefore kept small, and every "must fire" assertion is
+    // wrapped in an outer bound that is orders of magnitude larger than the
+    // timeout under test, so load can slow these tests down without failing
+    // them.
+    const TEST_STALL_GRACE: Duration = Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn test_read_body_timeout_releases_stalled_upload() {
+        let (client, server) = duplex(65536);
+        let mut handles = vec![];
+        // The client stalls until the server has observed the timeout, so the
+        // release is provably the read timeout firing and not this task
+        // dropping the stream -- without paying a fixed wall-clock sleep.
+        let (released_tx, released_rx) = tokio::sync::oneshot::channel::<()>();
+
+        handles.push(tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                // The server errors the session on timeout, so the connection
+                // future may resolve with an error; either way is fine here.
+                let _ = connection.await;
+            });
+            let mut h2 = h2.ready().await.unwrap();
+
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://www.example.com/")
+                .body(())
+                .unwrap();
+            let (_response, mut req_body) = h2.send_request(request, false).unwrap();
+            req_body.send_data("first chunk".into(), false).unwrap();
+            // Stall: keep the request-body half open, never send another byte.
+            let _ = released_rx.await;
+        }));
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        let mut released_tx = Some(released_tx);
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
+            let released_tx = released_tx.take().unwrap();
+            handles.push(tokio::spawn(async move {
+                http.set_read_timeout(Some(Duration::from_millis(300)));
+
+                let body = http.read_body_or_idle(false).await.unwrap().unwrap();
+                assert_eq!(body, "first chunk");
+
+                // The stalled second read must be released by the read timeout
+                // instead of pinning this task forever. The outer bound only
+                // distinguishes "timeout fired" from "test hung": it is far
+                // above the read timeout and never expires on a healthy run.
+                let err = tokio::time::timeout(TEST_STALL_GRACE, http.read_body_or_idle(false))
+                    .await
+                    .expect("read_timeout should have released the stalled read")
+                    .unwrap_err();
+                assert_eq!(err.etype(), &ErrorType::ReadTimedout);
+                let _ = released_tx.send(());
+            }));
+        }
+
+        for handle in handles {
+            assert!(handle.await.is_ok());
+        }
+    }
+
+    /// The idle bound must be a DEADLINE carried by the session, not a duration
+    /// rebuilt per call.
+    ///
+    /// Every caller polls the body read from a `tokio::select!` branch, and any
+    /// other ready branch -- an upstream response chunk, a cache task, a custom
+    /// message -- cancels it. Here a ticker fires several times per read
+    /// timeout, standing in for an upstream that emits at least one event per
+    /// period (SSE, gRPC server-streaming, a slow multi-chunk 200). With a
+    /// per-call duration the bound is rearmed by every cancellation and the
+    /// stalled client pins this pump, its downstream stream and its upstream
+    /// connection forever: the DoS the bound exists to close.
+    #[tokio::test]
+    async fn test_read_body_timeout_survives_select_cancellation() {
+        const READ_TIMEOUT: Duration = Duration::from_millis(300);
+        // Well under the read timeout: the read is cancelled and rebuilt
+        // several times before the deadline is reached.
+        const CHATTY_UPSTREAM_TICK: Duration = Duration::from_millis(60);
+
+        let (client, server) = duplex(65536);
+        let mut handles = vec![];
+        let (released_tx, released_rx) = tokio::sync::oneshot::channel::<()>();
+
+        handles.push(tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let mut h2 = h2.ready().await.unwrap();
+
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://www.example.com/")
+                .body(())
+                .unwrap();
+            let (_response, mut req_body) = h2.send_request(request, false).unwrap();
+            req_body.send_data("first chunk".into(), false).unwrap();
+            // Stall forever; only the server's deadline can end this.
+            let _ = released_rx.await;
+        }));
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        let mut released_tx = Some(released_tx);
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
+            let released_tx = released_tx.take().unwrap();
+            handles.push(tokio::spawn(async move {
+                http.set_read_timeout(Some(READ_TIMEOUT));
+
+                let body = http.read_body_or_idle(false).await.unwrap().unwrap();
+                assert_eq!(body, "first chunk");
+
+                let mut cancellations = 0u32;
+                let result = tokio::time::timeout(TEST_STALL_GRACE, async {
+                    loop {
+                        tokio::select! {
+                            body = http.read_body_or_idle(false) => break body,
+                            _ = tokio::time::sleep(CHATTY_UPSTREAM_TICK) => {
+                                cancellations += 1;
+                            }
+                        }
+                    }
+                })
+                .await
+                .expect(
+                    "an unrelated ready select! branch must not rearm the downstream \
+                     request-body idle bound",
+                );
+
+                assert_eq!(result.unwrap_err().etype(), &ErrorType::ReadTimedout);
+                assert!(
+                    cancellations >= 2,
+                    "the competing branch must have cancelled the read at least twice \
+                     for this to test anything; saw {cancellations}"
+                );
+                let _ = released_tx.send(());
+            }));
+        }
+
+        for handle in handles {
+            assert!(handle.await.is_ok());
+        }
+    }
+
+    /// An empty DATA frame is not progress and must not rearm the bound.
+    ///
+    /// A zero-length DATA frame without END_STREAM is legal, costs the peer 9
+    /// bytes, consumes no flow-control window and trips no h2 flood counter, so
+    /// treating it as a received chunk would hand an attacker an unlimited
+    /// rearm at ~zero cost -- and because `body_read` never advances, no
+    /// byte-count body-size limit would catch it either.
+    #[tokio::test]
+    async fn test_empty_data_frames_do_not_rearm_read_timeout() {
+        const READ_TIMEOUT: Duration = Duration::from_millis(300);
+        const TRICKLE_GAP: Duration = Duration::from_millis(80);
+
+        let (client, server) = duplex(65536);
+        let mut handles = vec![];
+        let (released_tx, mut released_rx) = tokio::sync::oneshot::channel::<()>();
+
+        handles.push(tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let mut h2 = h2.ready().await.unwrap();
+
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://www.example.com/")
+                .body(())
+                .unwrap();
+            let (_response, mut req_body) = h2.send_request(request, false).unwrap();
+            req_body.send_data("first chunk".into(), false).unwrap();
+            // Then nothing but empty DATA frames, forever.
+            loop {
+                tokio::select! {
+                    _ = &mut released_rx => break,
+                    _ = tokio::time::sleep(TRICKLE_GAP) => {
+                        if req_body.send_data(Bytes::new(), false).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }));
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        let mut released_tx = Some(released_tx);
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
+            let released_tx = released_tx.take().unwrap();
+            handles.push(tokio::spawn(async move {
+                http.set_read_timeout(Some(READ_TIMEOUT));
+
+                let body = http.read_body_or_idle(false).await.unwrap().unwrap();
+                assert_eq!(body, "first chunk");
+
+                let mut empty_chunks = 0u32;
+                let err = tokio::time::timeout(TEST_STALL_GRACE, async {
+                    loop {
+                        match http.read_body_or_idle(false).await {
+                            Ok(Some(chunk)) => {
+                                assert!(chunk.is_empty(), "the client only sends empty frames");
+                                empty_chunks += 1;
+                            }
+                            Ok(None) => panic!("the client never ends the stream"),
+                            Err(e) => break e,
+                        }
+                    }
+                })
+                .await
+                .expect("empty DATA frames must not rearm the request-body idle bound");
+
+                assert_eq!(err.etype(), &ErrorType::ReadTimedout);
+                assert!(
+                    empty_chunks >= 2,
+                    "the trickle must have delivered at least two empty frames for this \
+                     to test anything; saw {empty_chunks}"
+                );
+                // The bound fired without a single body byte having been added.
+                assert_eq!(http.body_bytes_read(), "first chunk".len());
+                let _ = released_tx.send(());
+            }));
+        }
+
+        for handle in handles {
+            assert!(handle.await.is_ok());
+        }
+    }
+
+    /// A CONNECT tunnel's "request body" is its uplink, on which long idle
+    /// periods are ordinary (an idle SSH session; a WebSocket over extended
+    /// CONNECT whose traffic runs server-to-client only). The bound must not
+    /// apply to it.
+    #[tokio::test]
+    async fn test_read_body_timeout_spares_connect_tunnel() {
+        const READ_TIMEOUT: Duration = Duration::from_millis(100);
+        // Several times the read timeout: enough for the bound to have fired.
+        const IDLE_UPLINK: Duration = Duration::from_millis(500);
+
+        let (client, server) = duplex(65536);
+        let mut handles = vec![];
+
+        handles.push(tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let mut h2 = h2.ready().await.unwrap();
+            // Plain CONNECT: authority-form URI, no END_STREAM (it is a tunnel).
+            let request = Request::builder()
+                .method(Method::CONNECT)
+                .uri("www.example.com:443")
+                .body(())
+                .unwrap();
+            let (response, _req_body) = h2.send_request(request, false).unwrap();
+            let (head, _body) = response.await.unwrap().into_parts();
+            assert_eq!(head.status, 200);
+        }));
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
+            handles.push(tokio::spawn(async move {
+                http.set_read_timeout(Some(READ_TIMEOUT));
+
+                tokio::select! {
+                    read = http.read_body_or_idle(false) => {
+                        panic!(
+                            "an idle CONNECT uplink must not be cut by the request-body \
+                             read timeout, got {read:?}"
+                        );
+                    }
+                    _ = tokio::time::sleep(IDLE_UPLINK) => {}
+                }
+
+                let response_header = Box::new(ResponseHeader::build(200, None).unwrap());
+                http.write_response_header(response_header, true).unwrap();
+            }));
+        }
+
+        for handle in handles {
+            assert!(handle.await.is_ok());
+        }
+    }
+
+    /// `Content-Length: 0` without END_STREAM is legal on H2 (design 4.3): the
+    /// transport has promised there are no body bytes, but the client owes an
+    /// END_STREAM it may take arbitrarily long to send. Failing such a request
+    /// with a read timeout would discard an exchange that has nothing left to
+    /// read, so the bound finishes the read side instead of erroring.
+    #[tokio::test]
+    async fn test_read_body_timeout_finishes_declared_empty_body() {
+        const READ_TIMEOUT: Duration = Duration::from_millis(200);
+
+        let (client, server) = duplex(65536);
+        let mut handles = vec![];
+
+        handles.push(tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let mut h2 = h2.ready().await.unwrap();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://www.example.com/")
+                .header("content-length", "0")
+                .body(())
+                .unwrap();
+            // No END_STREAM, and the client never sends one.
+            let (response, _req_body) = h2.send_request(request, false).unwrap();
+            let (head, _body) = response.await.unwrap().into_parts();
+            assert_eq!(head.status, 200);
+        }));
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
+            handles.push(tokio::spawn(async move {
+                // Parity with the HTTP/1 session: the bound is on by default,
+                // because nothing in pingora-core or pingora-proxy sets one.
+                assert_eq!(http.get_read_timeout(), Some(Duration::from_secs(60)));
+                http.set_read_timeout(Some(READ_TIMEOUT));
+                assert!(http.is_body_empty());
+                assert!(!http.is_body_done());
+
+                let read = tokio::time::timeout(TEST_STALL_GRACE, http.read_body_or_idle(false))
+                    .await
+                    .expect("the read side must be finished by the bound, not left pending")
+                    .expect("a provably empty body must not be failed by the read timeout");
+                assert!(read.is_none());
+                // The read side is finished for good: no second timeout, and no
+                // idle-path error on a later poll.
+                assert!(http.is_body_done());
+
+                let response_header = Box::new(ResponseHeader::build(200, None).unwrap());
+                http.write_response_header(response_header, true).unwrap();
+            }));
+        }
+
+        for handle in handles {
+            assert!(handle.await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_body_timeout_spares_progressing_upload() {
+        let (client, server) = duplex(65536);
+        let mut handles = vec![];
+
+        // Inter-chunk gaps stay well under the read timeout while the total
+        // upload duration exceeds it: the bound must be rearmed per chunk.
+        const CHUNKS: usize = 8;
+        const GAP: Duration = Duration::from_millis(100);
+        const READ_TIMEOUT: Duration = Duration::from_millis(500);
+
+        handles.push(tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                connection.await.unwrap();
+            });
+            let mut h2 = h2.ready().await.unwrap();
+
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://www.example.com/")
+                .body(())
+                .unwrap();
+            let (response, mut req_body) = h2.send_request(request, false).unwrap();
+            for i in 0..CHUNKS {
+                tokio::time::sleep(GAP).await;
+                let eos = i == CHUNKS - 1;
+                req_body.send_data("chunk".into(), eos).unwrap();
+            }
+
+            let (head, _body) = response.await.unwrap().into_parts();
+            assert_eq!(head.status, 200);
+        }));
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
+            handles.push(tokio::spawn(async move {
+                http.set_read_timeout(Some(READ_TIMEOUT));
+
+                // Stop on `is_body_done()` rather than on a `None` read: the
+                // final chunk carries END_STREAM, so one more read after it
+                // would take the idle path and pend until the client closes --
+                // and the client is waiting for our response. The outer
+                // per-read bound only distinguishes "spared" from "test hung";
+                // it never expires on a healthy run.
+                let mut total = 0;
+                while !http.is_body_done() {
+                    let chunk =
+                        tokio::time::timeout(TEST_STALL_GRACE, http.read_body_or_idle(false))
+                            .await
+                            .expect("a progressing upload must not be starved by the read timeout")
+                            .unwrap()
+                            .unwrap();
+                    total += chunk.len();
+                }
+                assert_eq!(total, CHUNKS * "chunk".len());
+
+                let response_header = Box::new(ResponseHeader::build(200, None).unwrap());
+                http.write_response_header(response_header, true).unwrap();
             }));
         }
 

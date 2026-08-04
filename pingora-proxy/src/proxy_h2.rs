@@ -652,10 +652,14 @@ where
                 // TODO: implement for write timeouts?
                 if e.esource == ErrorSource::Upstream && matches!(e.etype, ReadTimedout) {
                     client_body.send_reset(h2::Reason::CANCEL);
-                    // See the terminate arm above: source (iv) is given up at
-                    // every local reset.
-                    client_session.note_local_reset();
                 }
+                // Whether or not the explicit reset above was sent, this arm
+                // abandons the upstream request stream: `client_body` is
+                // dropped on return and `h2` cancels a still-open stream when
+                // its last handle goes away. Source (iv) is given up either
+                // way, so record it here rather than only on the explicit
+                // reset -- see `Http2Session::note_local_reset`.
+                client_session.note_local_reset();
                 (false, Some(e))
             }
         }

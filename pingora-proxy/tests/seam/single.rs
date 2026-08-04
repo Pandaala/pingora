@@ -271,24 +271,9 @@ fn h2_cl0_never_ending_request_completes() {
     let h2_upstream = spawn_scripted_h2_upstream(vec![H2UpstreamStep::Ok200Linger]);
     let (h1_port, h2_port) = (h1_upstream.port(), h2_upstream.port());
 
-    for (tag, port, h2_upstream, counter, final_eos) in [
-        (
-            "h1",
-            h1_port,
-            false,
-            &COMPLETED_H1_UPSTREAM,
-            &FINAL_EOS_H1_UPSTREAM,
-        ),
-        (
-            "h2",
-            h2_port,
-            true,
-            &COMPLETED_H2_UPSTREAM,
-            &FINAL_EOS_H2_UPSTREAM,
-        ),
-    ] {
-        let before = counter.load(Ordering::SeqCst);
+    for (tag, port, h2_upstream) in [("h1", h1_port, false), ("h2", h2_port, true)] {
         RT.block_on(async {
+            let (id, completion) = observe_completion();
             let tcp = TcpStream::connect(ports.h2c_addr()).await.unwrap();
             let (h2, connection) = h2::client::handshake(tcp).await.unwrap();
             tokio::spawn(async move {
@@ -300,7 +285,7 @@ fn h2_cl0_never_ending_request_completes() {
                 .method("POST")
                 .uri("http://t/")
                 .header("x-port", port.to_string())
-                .header("x-count-completion", tag)
+                .header("x-observe-completion", id.into_header())
                 .header("content-length", "0");
             if h2_upstream {
                 builder = builder.header("x-h2", "1");
@@ -316,21 +301,20 @@ fn h2_cl0_never_ending_request_completes() {
             assert_eq!(response.status(), 200, "{tag} upstream");
 
             // The request must actually FINISH, not merely answer.
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-            while counter.load(Ordering::SeqCst) == before {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "the {tag}-upstream pump never finished the request: it is still \
-                     parked on a downstream body read that can never yield"
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+            let record = completion
+                .wait(
+                    Duration::from_secs(10),
+                    &format!(
+                        "the {tag}-upstream pump never finished the request: it is still \
+                         parked on a downstream body read that can never yield"
+                    ),
+                )
+                .await;
 
             // ... and abandoning the read must not cost the application its
             // single end-of-stream event (invariant B).
             assert_eq!(
-                final_eos.load(Ordering::SeqCst),
-                1,
+                record.eos_events, 1,
                 "the application must still see exactly one end-of-stream event \
                  when the {tag}-upstream pump abandons the downstream read"
             );
@@ -454,6 +438,154 @@ fn streamed_does_not_reframe_a_bodyless_request() {
         "nothing may follow the headers of a bodyless request (a chunked \
          terminator here is a smuggling primitive on a pooled connection): {:?}",
         String::from_utf8_lossy(&bytes[header_end + 4..])
+    );
+}
+
+/// A CONNECT tunnel must not be half-closed at header time by an application
+/// disposition: `safe_disposition` (in `proxy_common.rs`) coerces a
+/// non-`Ordinary` disposition back to `Ordinary` for CONNECT requests. An
+/// honored `Bodyless` would put END_STREAM on the upstream HEADERS -- ending
+/// the request half of the tunnel before a single tunnel byte could flow.
+///
+/// The observable is therefore the TUNNEL BYTES arriving upstream, and it is
+/// asserted before anything else so that it is what fails. Two corrections
+/// are folded into that ordering:
+/// - the doc used to name `headers_eos == false` as the observable, but under
+///   the mutation (coercion removed) the run failed at `resp.status() == 200`
+///   several assertions earlier -- the named observable was not the one that
+///   spoke;
+/// - and it could not have spoken reliably anyway: `headers_eos` reads
+///   `false` whenever anything else is pending on the stream, and an honored
+///   `Bodyless` here also makes the proxy fail the request closed and reset
+///   the stream. See the note on `UpEvent::ReqHeaders::headers_eos`. The
+///   whole-log count is kept below as a corroborating check, not as the
+///   claim.
+///
+/// The pure-function truth table (`safe_disposition_truth_table`) already
+/// pins the DECISION for every fact combination; what this pins end-to-end is
+/// the WIRING -- a pump consulting the coercion at all, with correctly
+/// collected facts, for a real CONNECT request.
+///
+/// One cell (H2c downstream -> H2 upstream), not the matrix, because no other
+/// cell is constructible in this fork:
+/// - H1 downstream: an authority-form request-target needs the
+///   `patched_http1` feature, which does not compile here (it requires a
+///   patched httparse this workspace does not carry); without it the parse
+///   rejects the request line (400 from `set_raw_path`).
+/// - H1 upstream: `http_req_header_to_wire` serializes `raw_path()`, which
+///   panics on an authority-form URI (no path-and-query, no raw-path
+///   fallback), so CONNECT-to-an-H1-peer cannot even be driven.
+///
+/// Consequently the H1-specific hazard the coercion also guards (re-framing
+/// the tunnel as `Transfer-Encoding: chunked`) is unreachable end-to-end in
+/// this fork and stays pinned by the truth table alone. `Streamed` is not
+/// separately driven either: on the H2 pump its honored rewrite is
+/// wire-identical to the coerced `Ordinary` for a bare CONNECT, so no
+/// end-to-end assertion could discriminate it.
+///
+/// Edgion cannot reach this path at all -- Gateway API has no CONNECT route
+/// type -- which is exactly why the guard is pinned here in the fork
+/// (`tasks/todo/important_test/03-fork-layer-coverage-for-unreachable-paths.md`
+/// in the Edgion repository).
+#[test]
+fn bodyless_does_not_half_close_a_connect_tunnel() {
+    let ports = init();
+    let upstream = spawn_scripted_h2_upstream(vec![H2UpstreamStep::EchoRequestEos]);
+    let (port, rec) = (upstream.port(), upstream.rec());
+
+    RT.block_on(async {
+        let tcp = TcpStream::connect(ports.h2c_addr()).await.unwrap();
+        let (h2, connection) = h2::client::handshake(tcp).await.unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let mut h2 = h2.ready().await.unwrap();
+
+        // Plain CONNECT: authority-form URI, no END_STREAM on HEADERS -- the
+        // stream IS the tunnel.
+        let req = http::Request::builder()
+            .method("CONNECT")
+            .uri(format!("127.0.0.1:{port}"))
+            .header("x-port", port.to_string())
+            .header("x-h2", "1")
+            .header("x-disposition", "bodyless")
+            .body(())
+            .unwrap();
+        let (response, mut req_body) = h2.send_request(req, false).unwrap();
+
+        // Tunnel bytes from the client, then end the request half so the
+        // scripted upstream's drain completes and responds. An honored
+        // `Bodyless` could not carry these bytes at all (its HEADERS already
+        // closed the stream), so their arrival upstream is itself half the
+        // claim.
+        req_body
+            .send_data(Bytes::from_static(b"tunnel-preamble"), true)
+            .unwrap();
+
+        // The claim, first: an honored `Bodyless` closes the upstream request
+        // half at header time, so not one tunnel byte could arrive and this
+        // wait is what times out.
+        expect_ok(
+            rec.wait_for(
+                "the upstream to see the CONNECT request",
+                Duration::from_secs(10),
+                |e| matches!(e, UpEvent::ReqHeaders { .. }),
+            )
+            .await,
+        );
+        expect_ok(
+            rec.wait_for(
+                "the tunnel bytes to finish arriving upstream (an honored \
+                 Bodyless disposition would have half-closed the tunnel at \
+                 header time, so none could)",
+                Duration::from_secs(10),
+                |e| {
+                    matches!(
+                        e,
+                        UpEvent::ReqData {
+                            end_stream: true,
+                            ..
+                        }
+                    )
+                },
+            )
+            .await,
+        );
+
+        let resp = tokio::time::timeout(Duration::from_secs(10), response)
+            .await
+            .expect("the tunnel response must not hang")
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    });
+
+    assert_eq!(
+        rec.count(|e| matches!(e, UpEvent::ReqHeaders { .. })),
+        1,
+        "exactly one upstream CONNECT request:\n{}",
+        rec.dump()
+    );
+    // Corroboration, not the claim: a `false` reading of `headers_eos` is not
+    // proof on its own (see its doc comment), but a `true` one would be proof
+    // of the defect.
+    assert_eq!(
+        rec.count(|e| matches!(
+            e,
+            UpEvent::ReqHeaders {
+                headers_eos: true,
+                ..
+            }
+        )),
+        0,
+        "a CONNECT tunnel's HEADERS must not carry END_STREAM (an honored \
+         Bodyless disposition would half-close the tunnel at header time):\n{}",
+        rec.dump()
+    );
+    assert_eq!(
+        rec.body_bytes(),
+        b"tunnel-preamble".len(),
+        "the client's tunnel bytes must reach the upstream exactly once:\n{}",
+        rec.dump()
     );
 }
 
@@ -787,13 +919,13 @@ fn retry_predicate_forces_the_error_from_error_while_proxy() {
             .unwrap();
         assert_eq!(res.status(), 200);
 
-        let before = OBSERVED_RETRY_PROXY.requests.load(Ordering::SeqCst);
+        let (id, completion) = observe_completion();
         // Attempt 2 reuses it and gets closed without a response.
         let res = client
             .get(format!("http://{}/", ports.h1_addr()))
             .header("x-port", port.to_string())
             .header("x-no-retry", "1")
-            .header("x-observe-retry", "proxy")
+            .header("x-observe-completion", id.into_header())
             .send()
             .await
             .unwrap();
@@ -808,9 +940,14 @@ fn retry_predicate_forces_the_error_from_error_while_proxy() {
             )
             .await,
         );
+        let record = completion
+            .wait(
+                Duration::from_secs(10),
+                "the request never reached ProxyHttp::logging",
+            )
+            .await;
         assert_eq!(
-            await_observed_retry_flag(&OBSERVED_RETRY_PROXY, before).await,
-            0,
+            record.retry_flag, 0,
             "the error handed to the application must be marked non-retryable"
         );
     });
@@ -848,23 +985,28 @@ fn retry_predicate_forces_the_error_from_fail_to_connect() {
     // A port that was bound and released: nothing is listening on it.
     let dead_port = reserve_port();
 
-    let before = OBSERVED_RETRY_CONNECT.requests.load(Ordering::SeqCst);
     RT.block_on(async {
+        let (id, completion) = observe_completion();
         let client = reqwest::Client::new();
         let res = client
             .get(format!("http://{}/", ports.h1_addr()))
             .header("x-port", dead_port.to_string())
             .header("x-no-retry", "1")
             .header("x-connect-retryable", "1")
-            .header("x-observe-retry", "connect")
+            .header("x-observe-completion", id.into_header())
             .send()
             .await
             .unwrap();
         assert_eq!(res.status(), 502);
 
+        let record = completion
+            .wait(
+                Duration::from_secs(10),
+                "the request never reached ProxyHttp::logging",
+            )
+            .await;
         assert_eq!(
-            await_observed_retry_flag(&OBSERVED_RETRY_CONNECT, before).await,
-            0,
+            record.retry_flag, 0,
             "a connect failure that may not be retried must be marked non-retryable"
         );
     });

@@ -342,9 +342,12 @@ pub(crate) fn bodyless_contract_violation() -> BError {
 /// also derive their UPSTREAM end-of-stream from the declaration
 /// (`is_body_empty()`), so with the strict fact their two halves contradict each
 /// other: the upstream request is closed at header time while the downstream
-/// state machine still believes a body is coming, and -- because no downstream
-/// request-body idle timeout exists -- the pump parks forever on a read that can
-/// never yield, pinning the task, both streams and the upstream session.
+/// state machine still believes a body is coming, and -- because these two
+/// session types carry no downstream request-body idle timeout of their own
+/// (the H1 and H2 sessions do, 60s by default, but a custom session's
+/// `set_read_timeout` is `unreachable!()` and the subrequest pipe has no
+/// transport to bound) -- the pump parks forever on a read that can never
+/// yield, pinning the task, both streams and the upstream session.
 /// Restoring the union here makes the two halves agree again, which is exactly
 /// how both pumps behaved before the tightening.
 pub(crate) fn no_downstream_body_to_read(session: &mut Session) -> bool {
@@ -358,10 +361,20 @@ pub(crate) fn no_downstream_body_to_read(session: &mut Session) -> bool {
 /// promises zero DATA bytes yet says nothing about END_STREAM (design 4.3) --
 /// after the upstream exchange has completed. At that point there is provably
 /// no body data left to forward (the emptiness is the transport's own
-/// promise), nothing left to consume it (the response is fully written), and
-/// no downstream request-body idle timeout, so continuing to poll would pin
-/// the request, its task, the downstream stream and the upstream stream
-/// indefinitely. Finishing the read side lets the request complete instead.
+/// promise) and nothing left to consume it (the response is fully written), so
+/// continuing to poll would pin the request, its task, the downstream stream
+/// and the upstream stream for as long as the client cares to keep the stream
+/// open. Finishing the read side lets the request complete instead.
+///
+/// Do NOT delete this as redundant now that H1/H2 sessions carry a
+/// request-body idle timeout (60s by default). This rule fires immediately
+/// rather than one idle period later; it also covers the session types that
+/// have no such bound at all (custom, subrequest), and the H2 CONNECT sessions
+/// that are deliberately exempt from it. The read-side counterpart --
+/// `v2::server::HttpSession::read_body_bytes` answering its own timeout with
+/// `Ok(None)` for a provably empty body -- is the backstop for the case this
+/// one cannot see, where the response never completes because the upstream is
+/// silent.
 pub(crate) fn downstream_body_read_is_futile(
     session: &mut Session,
     downstream_state: &DownstreamStateMachine,

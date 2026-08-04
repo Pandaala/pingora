@@ -13,9 +13,12 @@
 use super::harness::*;
 use super::{Combo, Down, Step, Up};
 use crate::skip_combo;
+use bytes::Bytes;
 use h2::Reason;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Notify;
 
 /// The `x-h2` request header line (H1 wire form) this combination needs, or the
 /// empty string. `SeamProxy::upstream_peer` keys the upstream protocol -- and
@@ -30,6 +33,12 @@ fn up_header_line(combo: Combo) -> &'static str {
 
 /// How long a "nothing else happened" window runs for.
 const QUIET_WINDOW: Duration = Duration::from_millis(300);
+/// How long to let the proxy's h2 connection task notice a frame the origin
+/// has just queued (a GOAWAY), or hand a finished connection back to its pool.
+///
+/// An ordering aid for claims that only make sense afterwards; never itself a
+/// claim. Every use is placed so that losing the race fails the test.
+const GOAWAY_SETTLE: Duration = Duration::from_millis(200);
 const WAIT: Duration = Duration::from_secs(10);
 
 /// The cell's manifestation of "the proxy gave up on the upstream leg".
@@ -67,58 +76,181 @@ async fn expect_upstream_cancelled(combo: Combo, rec: &Recorder) {
 /// observable each. The upstream never answers, so nothing here can pass by the
 /// request having completed normally.
 ///
-/// Promptness is measured as time-to-EOF downstream from the moment the
-/// upstream demonstrably held the request; see `terminate_reply_and_eof`.
+/// Promptness needs both bounds. The lower is the recorded `ReqHeaders`
+/// instant -- the upstream demonstrably held the request, without which the
+/// upper bound cannot fail. The upper is "the pump FINISHED within
+/// `TERMINATE_BUDGET` of it", and how "finished" is observed differs per
+/// downstream:
+/// - H1: time-to-EOF on the downstream connection, a wire fact -- the
+///   connection can only close once the pump finished; see
+///   `terminate_reply_and_eof`.
+/// - H2c: the connection deliberately stays open across a terminate (its
+///   contract -- see `single::h2c_downstream_terminate_keeps_connection`), and
+///   the application flushes its complete 403 from inside the hook, so no
+///   wire observable can distinguish a finished pump from one still parked on
+///   the hung upstream. The per-request completion observation takes its
+///   place: `ProxyHttp::logging` only runs once the proxy finished the
+///   request, and `x-observe-completion` attributes that fact to this one
+///   stream even on a shared connection.
 pub fn terminate_is_prompt_and_cancels_the_upstream(combo: Combo) {
-    if combo.down == Down::H2c {
-        // The promptness half has no downstream observable here. The
-        // application flushes its own complete 403, and an H2 session
-        // deliberately stays open across a terminate (that is its contract --
-        // see `single::h2c_downstream_terminate_keeps_connection`), so a pump
-        // still parked on the hung upstream looks exactly like one that
-        // finished.
-        skip_combo!(
-            combo,
-            "an H2 downstream keeps its connection across a terminate, so \
-             time-to-EOF -- the only observable that can distinguish a finished \
-             pump from one still awaiting the hung upstream -- does not exist"
-        );
-    }
     let (port, rec, _upstream) = combo.spawn(&[Step::HangObservingCancel]);
-    let up = up_header_line(combo);
 
-    let text = RT.block_on(async {
-        let request = format!(
-            "POST / HTTP/1.1\r\nHost: t\r\nx-port: {port}\r\n{up}\
-             x-terminate-after-bytes: 1\r\n\
-             Transfer-Encoding: chunked\r\n\r\n\
-             5\r\nhello\r\n"
-        );
-        // Asserts both promptness bounds; see `terminate_reply_and_eof`.
-        let text = terminate_reply_and_eof(&combo.down_addr(), &request, &rec).await;
+    match combo.down {
+        Down::H1 => {
+            let up = up_header_line(combo);
+            let text = RT.block_on(async {
+                let request = format!(
+                    "POST / HTTP/1.1\r\nHost: t\r\nx-port: {port}\r\n{up}\
+                     x-terminate-after-bytes: 1\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n\
+                     5\r\nhello\r\n"
+                );
+                // Asserts both promptness bounds; see `terminate_reply_and_eof`.
+                let text = terminate_reply_and_eof(&combo.down_addr(), &request, &rec).await;
 
-        expect_upstream_cancelled(combo, &rec).await;
+                expect_upstream_cancelled(combo, &rec).await;
 
-        // "No second attempt" as an absence over a bounded window. A
-        // `counter <= 1` form is also satisfied by a counter that never moved,
-        // i.e. by the request never reaching the upstream at all.
-        expect_ok(
-            rec.expect_none("a second upstream attempt", QUIET_WINDOW, |e| {
-                matches!(e, UpEvent::ReqHeaders { .. })
-            })
-            .await,
-        );
-        text
-    });
+                // "No second attempt" as an absence over a bounded window. A
+                // `counter <= 1` form is also satisfied by a counter that never
+                // moved, i.e. by the request never reaching the upstream at all.
+                expect_ok(
+                    rec.expect_none("a second upstream attempt", QUIET_WINDOW, |e| {
+                        matches!(e, UpEvent::ReqHeaders { .. })
+                    })
+                    .await,
+                );
+                text
+            });
 
-    assert!(
-        text.starts_with("HTTP/1.1 403"),
-        "local reply expected: {text}"
-    );
-    assert!(
-        !text.contains("502") && !text.contains("500"),
-        "terminate must not produce a generic proxy error response: {text}"
-    );
+            assert!(
+                text.starts_with("HTTP/1.1 403"),
+                "local reply expected: {text}"
+            );
+            assert!(
+                !text.contains("502") && !text.contains("500"),
+                "terminate must not produce a generic proxy error response: {text}"
+            );
+        }
+        Down::H2c => RT.block_on(async {
+            let (id, completion) = observe_completion();
+            let tcp = tokio::net::TcpStream::connect(combo.down_addr())
+                .await
+                .unwrap();
+            let (h2, connection) = h2::client::handshake(tcp).await.unwrap();
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let mut h2 = h2.ready().await.unwrap();
+
+            let mut builder = http::Request::builder()
+                .method("POST")
+                .uri("http://t/")
+                .header("x-port", port.to_string())
+                .header("x-terminate-after-bytes", "1")
+                .header("x-observe-completion", id.into_header());
+            if combo.upstream_is_h2() {
+                builder = builder.header("x-h2", "1");
+            }
+            // HEADERS without END_STREAM, then one DATA frame with the stream
+            // held open for the rest of this block: the same mid-upload shape
+            // as the H1 arm's unfinished chunked body.
+            let (response, mut request_body) =
+                h2.send_request(builder.body(()).unwrap(), false).unwrap();
+            request_body
+                .send_data(Bytes::from_static(b"hello"), false)
+                .unwrap();
+
+            // Lower bound: the upstream really did receive this request, so
+            // everything measured from here is measured against a hung
+            // upstream that exists.
+            expect_ok(
+                rec.wait_for(
+                    "the upstream to receive the request headers",
+                    Duration::from_secs(10),
+                    |e| matches!(e, UpEvent::ReqHeaders { .. }),
+                )
+                .await,
+            );
+            let upstream_had_it = rec
+                .first_seen(|e| matches!(e, UpEvent::ReqHeaders { .. }))
+                .expect("the wait above returned, so the event is recorded");
+
+            // On H2 a stream carries exactly one response, so "no generic 5xx
+            // behind the local reply" is structural; the status IS the claim.
+            let response = tokio::time::timeout(Duration::from_secs(10), response)
+                .await
+                .expect("the local reply must reach the client")
+                .unwrap();
+            assert_eq!(response.status(), 403, "local reply expected");
+            // Drain the local reply until the stream is over. Two wire shapes
+            // both mean that: END_STREAM on the last DATA frame, or the
+            // RST_STREAM(NO_ERROR) the proxy sends because the client's
+            // request half is still open -- and h2 may surface the latter as
+            // a read error that discards buffered DATA, since the reset lands
+            // while the client is still uploading (RFC 9113 section 8.1's own
+            // premise). Any OTHER reset code would be the terminate dressed
+            // up as a proxy error, which is exactly what this scenario
+            // forbids.
+            let mut body = response.into_body();
+            loop {
+                match tokio::time::timeout(Duration::from_secs(10), body.data())
+                    .await
+                    .expect("the local reply stream must end")
+                {
+                    Some(Ok(chunk)) => {
+                        let _ = body.flow_control().release_capacity(chunk.len());
+                    }
+                    Some(Err(e)) => {
+                        assert_eq!(
+                            e.reason(),
+                            Some(Reason::NO_ERROR),
+                            "the terminated stream must end cleanly, not with a \
+                             proxy-error reset: {e:?}"
+                        );
+                        break;
+                    }
+                    None => break,
+                }
+            }
+
+            // Upper bound: the pump must actually FINISH -- release the
+            // request rather than stay parked on the hung upstream -- within
+            // the budget. `finished_at` is stamped proxy-side in `logging`,
+            // so the measurement is immune to this test's own scheduling.
+            // The wait is derived from the budget (see `TERMINATE_WAIT`): a
+            // 10s wait here would mean the budget only ever caught a
+            // regression that finished between 2s and 10s, and anything slower
+            // failed on the wait's message instead of on the claim.
+            let record = completion
+                .wait(
+                    TERMINATE_WAIT,
+                    "the terminate never finished: the pump is still waiting on \
+                     the hung upstream instead of cancelling it",
+                )
+                .await;
+            let elapsed = record.finished_at.duration_since(upstream_had_it);
+            assert!(
+                elapsed < TERMINATE_BUDGET,
+                "the terminate took {elapsed:?} to finish after the upstream had \
+                 the request, which is longer than the {TERMINATE_BUDGET:?} \
+                 budget: it is waiting on the upstream rather than cancelling \
+                 it.\n{}",
+                rec.dump()
+            );
+
+            expect_upstream_cancelled(combo, &rec).await;
+
+            // "No second attempt" as an absence over a bounded window (see the
+            // H1 arm).
+            expect_ok(
+                rec.expect_none("a second upstream attempt", QUIET_WINDOW, |e| {
+                    matches!(e, UpEvent::ReqHeaders { .. })
+                })
+                .await,
+            );
+        }),
+    }
+
     assert_eq!(
         rec.count(|e| matches!(e, UpEvent::ReqHeaders { .. })),
         1,
@@ -426,18 +558,86 @@ pub fn bodyless_with_a_real_body_fails_closed(combo: Combo) {
             )
             .await,
         );
-        // Failing closed must not leave the origin working on a request nobody
-        // will read. Only H2 can say that as a per-stream fact.
+        // Failing closed must not leave the origin holding a connection the
+        // proxy is done with. H2 says that as a per-stream fact; H1 has no
+        // per-request signal, so its manifestation is the proxy ENDING the
+        // connection -- observed as a FIN or an RST during the upstream's
+        // 300ms recording window. Which of the two arrives is an
+        // implementation accident, not the contract (it depends on whether the
+        // pump drained the upstream's early 200 before the teardown closed the
+        // socket), so pinning one wire form would assert the accident. Both
+        // forms really do occur, and neither dominates: over 20 isolated runs
+        // each, `h1_to_h1` gave 15 FIN / 5 RST and `h2c_to_h1` gave 19 FIN /
+        // 1 RST on this machine. (A reviewer measuring the same cell reported
+        // 16 RST / 4 FIN, i.e. the opposite ratio -- which is the point: the
+        // wire form is a scheduling accident, and a wait for only one of them
+        // would fail somewhere between 5% and 80% of runs.)
+        //
+        // Do NOT read the H1 wait as pinning the reuse VERDICT. This comment
+        // used to claim that "a proxy that pooled the connection for reuse
+        // leaves the window to expire silently", i.e. that the wait
+        // discriminates the verdict. Disproved by mutating a scratch copy:
+        // - reporting the failed upstream leg as reusable
+        //   (`proxy_h1.rs:245` -> `(false, true, Some(e))`): teardown still
+        //   observed, test still green;
+        // - plus `HttpSession::reuse()` handing the stream back
+        //   unconditionally, plus `test_reusable_stream()` returning `true`:
+        //   STILL a teardown (RST in both H1 cells), because the connection
+        //   carries the upstream's unread early 200 and `ConnectionPool::
+        //   idle_poll` closes any pooled connection that has data readable on
+        //   it ("Data received on idle client connection, close it").
+        // The teardown is therefore over-determined by four independent
+        // layers, and no single-condition mutation can flip it. What the wait
+        // pins is the weaker, still-real claim it is worded as: the proxy does
+        // not leave this connection open and idle. The reuse verdict itself
+        // has no observable at this seam -- reaching it would need an upstream
+        // that stays silent, which this scenario cannot have, since its early
+        // 200 is what makes the "no body bytes on the wire" claim meaningful.
         match combo.up {
-            // H1 tears the whole connection down, and it does so with a RESET
-            // (there are unread request bytes in the proxy's receive buffer),
-            // which is neither a `PeerHalfClose` -- that is a clean FIN -- nor
-            // distinguishable from this upstream ending its own connection once
-            // its recording window is up. The H1 cells' claim is carried
-            // entirely by the framing and zero-body-bytes assertions below,
-            // exactly as the test this was merged from made it.
-            Up::H1 => {}
+            Up::H1 => {
+                expect_ok(
+                    rec.wait_for(
+                        "the proxy to end the upstream connection (FIN or RST)",
+                        WAIT,
+                        |e| {
+                            matches!(
+                                e,
+                                UpEvent::PeerHalfClose { .. } | UpEvent::PeerConnReset { .. }
+                            )
+                        },
+                    )
+                    .await,
+                );
+            }
             Up::H2 => {
+                // The fail-closed path owes the origin a cancel, and sends one
+                // in every run.
+                //
+                // A conditional used to stand here, keyed on the recorded
+                // `headers_eos`: the theory was that the bodyless end signal
+                // RACES the HEADERS write, and that when it coalesces the
+                // request half is already closed, so no cancel is owed and no
+                // reset reaches the `RecvStream` this harness records resets
+                // from. Both halves of that theory are wrong, measured:
+                // - the coalescing is not a race, it is unconditional.
+                //   `Bodyless` takes `upstream_headers_end_stream` ->
+                //   `send_end_stream` (default `true`), so END_STREAM rides
+                //   the HEADERS frame in EVERY run; probed in a scratch copy,
+                //   `send_header_eos=true` in both H2 cells;
+                // - the reset is nonetheless sent and recorded every time: 20
+                //   whole-binary parallel runs (40 H2-cell executions) and 20
+                //   isolated runs, `PeerReset` present in all of them, and
+                //   never a NOTE.
+                // What varied was the harness's `headers_eos` field itself:
+                // h2 reports it as "END_STREAM received AND nothing else
+                // pending", so the proxy's own RST_STREAM landing ~30us later
+                // makes an ended stream read as `false`. Delaying that reset
+                // by 300ms in a scratch copy flips the reading to `true` in
+                // both cells, which is what proves the flag was the artifact
+                // and the framing was never in question. See the note on
+                // `UpEvent::ReqHeaders::headers_eos`; asserting `headers_eos
+                // == false` here as a precondition would pin that artifact, so
+                // this arm does not mention the field at all.
                 expect_ok(
                     rec.wait_for("RST_STREAM on the upstream request stream", WAIT, |e| {
                         matches!(e, UpEvent::PeerReset { .. })
@@ -563,6 +763,303 @@ pub fn cl0_without_end_stream_sends_one_eos(combo: Combo) {
         rec.body_bytes(),
         0,
         "a `Content-Length: 0` request has no body bytes to forward:\n{}",
+        rec.dump()
+    );
+}
+
+/// A graceful GOAWAY (`NO_ERROR`) from a busy upstream connection: the
+/// in-flight stream must still complete to the client, and the PROXY -- not
+/// the origin's socket teardown -- must stop putting new requests on that
+/// connection.
+///
+/// The origin applies the GOAWAY BEFORE queueing its response (see
+/// [`H2UpstreamStep::GoawayThenHoldThenOk200`]), so the proxy provably learns
+/// the connection is draining while its stream is in flight -- RFC 9113's
+/// "streams at or below last-stream-id still complete" case.
+///
+/// Then it HOLDS that stream open, and everything this test claims about
+/// reuse is claimed while it is held. That is the whole design of the case,
+/// and it is a correction of an earlier version that let the origin's
+/// `graceful_shutdown` run to completion and asserted the same connection
+/// counts. `graceful_shutdown` closes the socket as soon as the last stream
+/// finishes, so the follow-up request there had to dial again NO MATTER WHAT
+/// THE PROXY DECIDED. Measured during review of that version: the recorded
+/// timeline was `ConnClosed{conn:0}` 0.2ms before `ConnAccepted{conn:1}`, and
+/// two mutations -- deleting `!self.is_shutting_down()` from
+/// `ConnectionRef::more_streams_allowed`, and deleting the
+/// `GOAWAY(NO_ERROR) -> shutting_down` branch of `ConnectionRef::spawn_stream`
+/// -- each left it green, i.e. the reuse half of its name was decoration.
+///
+/// With the stream held, all three requests below run against a connection
+/// the origin has NOT closed and h2 has NOT torn down, so the proxy's own
+/// gates are what is being observed. Both mutations above were re-run against
+/// THIS version in a scratch copy, and both now fail it:
+/// - the follow-up request reaches `spawn_stream` on the pooled, GOAWAY'd
+///   connection, where `new_stream()` fails with
+///   `GoAway(NO_ERROR, Remote)`. The fork turns that into `Ok(None)` -- "no
+///   stream here, dial a fresh connection" -- instead of an error, so the
+///   request is served on conn 1 with `x-no-retry` set, i.e. with the proxy's
+///   retry loop unable to paper over it. With that branch disabled the
+///   follow-up is a 502 (observed, both H2 cells).
+/// - the THIRD request is what pins the pool hygiene half. On the correct
+///   code conn 0 is not returned to the in-use pool (it is shutting down), so
+///   the third request finds conn 1 and reuses it: two connections total.
+///   Without the `!self.is_shutting_down()` guard, conn 0 goes back into the
+///   pool ahead of conn 1 and the third request picks it up again, gets
+///   `Ok(None)` a second time, and dials a THIRD connection (observed: the
+///   connection-count assertion failing 3 != 2, both H2 cells).
+///
+/// Not pinned here: the same guard in `Connector::release_http_session`
+/// (`conn.is_closed() || conn.is_shutting_down()`). It only acts when the
+/// in-flight stream is finally released, and by then h2 has torn the GOAWAY'd
+/// connection down anyway, so the idle pool would evict it in a race this
+/// test cannot make deterministic.
+///
+/// The in-flight half of the claim (a stream at or below last-stream-id still
+/// completes) is asserted at the end, and is NOT fork behavior: it is h2's
+/// own `recv_go_away`, which only errors streams above the GOAWAY's
+/// last-stream-id. There is no fork code to mutate for it; it is asserted
+/// because the rest of the test would otherwise be free to break it.
+pub fn upstream_graceful_goaway_finishes_in_flight_and_is_not_reused(combo: Combo) {
+    if combo.up == Up::H1 {
+        skip_combo!(
+            combo,
+            "GOAWAY is an HTTP/2 connection frame; an H1 upstream has no wire \
+             form for 'finish what is in flight, then never use this connection \
+             again'"
+        );
+    }
+    let applied = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let upstream = spawn_scripted_h2_upstream(vec![
+        H2UpstreamStep::GoawayThenHoldThenOk200 {
+            applied: applied.clone(),
+            release: release.clone(),
+        },
+        H2UpstreamStep::Ok200,
+        H2UpstreamStep::Ok200,
+    ]);
+    let (port, rec) = (upstream.port(), upstream.rec().clone());
+
+    RT.block_on(async {
+        let client = combo.client();
+        let addr = combo.down_addr();
+
+        // The in-flight request, deliberately not awaited yet: its response is
+        // held by the origin for the rest of this block, which is what keeps
+        // the GOAWAY'd connection open and the proxy's pooled connection
+        // alive.
+        let in_flight = {
+            let (client, addr) = (client.clone(), addr.clone());
+            tokio::spawn(async move {
+                client
+                    .get(format!("http://{addr}/"))
+                    .header("x-port", port.to_string())
+                    .header("x-h2", "1")
+                    .header("x-max-h2-streams", "2")
+                    .send()
+                    .await
+            })
+        };
+
+        expect_ok(
+            rec.wait_for("the upstream to receive the in-flight request", WAIT, |e| {
+                matches!(e, UpEvent::ReqHeaders { conn: 0, .. })
+            })
+            .await,
+        );
+        tokio::time::timeout(WAIT, applied.notified())
+            .await
+            .expect("the origin must put its graceful GOAWAY on the connection");
+        // The GOAWAY is queued ahead of anything the origin writes later; this
+        // is the moment the proxy's h2 connection task needs in order to READ
+        // it. It is an ordering aid, not a claim: a follow-up request that beat
+        // the GOAWAY would be multiplexed onto conn 0 (the peer's
+        // MAX_CONCURRENT_STREAMS allows it) and fail the counts below, never
+        // pass wrongly.
+        tokio::time::sleep(GOAWAY_SETTLE).await;
+
+        for attempt in 0..2u32 {
+            if attempt > 0 {
+                // Let the proxy hand the fresh connection back to its pool, so
+                // the second follow-up can reuse it. Same shape as above: a
+                // connection that is not back in the pool yet costs a THIRD
+                // connection and fails, it cannot pass wrongly.
+                tokio::time::sleep(GOAWAY_SETTLE).await;
+            }
+            let req = client
+                .get(format!("http://{addr}/"))
+                .header("x-port", port.to_string())
+                .header("x-h2", "1")
+                .header("x-max-h2-streams", "2")
+                // The redial the fork's GOAWAY branch performs is INSIDE the
+                // connector. Forbidding the proxy's retry loop is what keeps
+                // that from being confused with a retry: with this header a
+                // 200 can only mean the connector itself found a usable
+                // connection.
+                .header("x-no-retry", "1");
+            let res = tokio::time::timeout(Duration::from_secs(10), req.send())
+                .await
+                .expect("the follow-up request must not hang on a draining connection")
+                .unwrap();
+            assert_eq!(
+                res.status(),
+                200,
+                "follow-up request {attempt}: a graceful GOAWAY on a pooled \
+                 connection must cost no request its response -- the connector \
+                 owes it a fresh connection, not an error:\n{}",
+                rec.dump()
+            );
+            let body = tokio::time::timeout(Duration::from_secs(10), res.text())
+                .await
+                .expect("reading the response body must not hang")
+                .expect("the response body must be completely framed");
+            assert_eq!(
+                body,
+                "ok",
+                "follow-up request {attempt}: the response must arrive complete:\n{}",
+                rec.dump()
+            );
+        }
+
+        // The negative claim -- the GOAWAY'd connection never carried another
+        // request -- as an absence over a bounded window, backed by the exact
+        // whole-log counts below. (`count <= 1` alone is also satisfied by a
+        // request that reached no upstream at all.)
+        expect_ok(
+            rec.expect_none(
+                "another request on the GOAWAY'd connection",
+                QUIET_WINDOW,
+                |e| matches!(e, UpEvent::ReqHeaders { conn: 0, .. }),
+            )
+            .await,
+        );
+
+        // All of the following is asserted while the in-flight stream is still
+        // held, i.e. while conn 0 is provably still usable.
+        assert_eq!(
+            rec.count(|e| matches!(e, UpEvent::ConnClosed { conn: 0 })),
+            0,
+            "conn 0 must still be OPEN here: if the origin had closed it, the \
+             follow-up requests would have had no choice but to dial again and \
+             this test would be pinning the origin's teardown rather than the \
+             proxy's decision:\n{}",
+            rec.dump()
+        );
+        assert_eq!(
+            rec.connections(),
+            2,
+            "exactly two upstream connections: the GOAWAY'd one, and the one \
+             the connector dialled for the follow-ups (a third means a \
+             shutting-down connection went back into the pool):\n{}",
+            rec.dump()
+        );
+        assert_eq!(
+            rec.count(|e| matches!(e, UpEvent::ReqHeaders { conn: 0, .. })),
+            1,
+            "exactly one request on the GOAWAY'd connection:\n{}",
+            rec.dump()
+        );
+        assert_eq!(
+            rec.count(|e| matches!(e, UpEvent::ReqHeaders { conn: 1, .. })),
+            2,
+            "both follow-up requests on the fresh connection -- the second one \
+             is what shows the fresh connection was pooled and the GOAWAY'd one \
+             was not:\n{}",
+            rec.dump()
+        );
+
+        // Only now: let the origin answer the stream it has been holding since
+        // before the GOAWAY.
+        release.notify_one();
+        let res = tokio::time::timeout(Duration::from_secs(10), in_flight)
+            .await
+            .expect("the in-flight request must not hang after the GOAWAY")
+            .expect("the in-flight request task must not panic")
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            200,
+            "the in-flight stream must still complete after a graceful \
+             GOAWAY:\n{}",
+            rec.dump()
+        );
+        let body = tokio::time::timeout(Duration::from_secs(10), res.text())
+            .await
+            .expect("reading the in-flight response body must not hang")
+            .expect("the in-flight response body must be completely framed");
+        assert_eq!(
+            body,
+            "ok",
+            "the in-flight response must arrive complete, not truncated by the \
+             connection draining:\n{}",
+            rec.dump()
+        );
+    });
+}
+
+/// An error GOAWAY (`INTERNAL_ERROR`) killing the connection mid-exchange:
+/// the in-flight request can never complete, and the proxy must answer its
+/// client with a proxy error rather than hanging -- without a silent second
+/// attempt.
+///
+/// The second script step is a working `Ok200` on purpose: if the proxy DID
+/// silently retry, the retry would succeed and this test would see a 200 plus
+/// a second connection -- an observable wrong outcome instead of a vacuously
+/// passing one.
+pub fn upstream_error_goaway_fails_the_request_without_a_silent_retry(combo: Combo) {
+    if combo.up == Up::H1 {
+        skip_combo!(
+            combo,
+            "GOAWAY is an HTTP/2 connection frame; an H1 upstream cannot emit \
+             one, and its connection-fatal analogue (a mid-response close) is \
+             a different contract"
+        );
+    }
+    let upstream = spawn_scripted_h2_upstream(vec![
+        H2UpstreamStep::AbruptGoaway(Reason::INTERNAL_ERROR),
+        H2UpstreamStep::Ok200,
+    ]);
+    let (port, rec) = (upstream.port(), upstream.rec().clone());
+
+    RT.block_on(async {
+        let client = combo.client();
+        let req = client
+            .get(format!("http://{}/", combo.down_addr()))
+            .header("x-port", port.to_string())
+            .header("x-h2", "1");
+        let res = tokio::time::timeout(Duration::from_secs(10), req.send())
+            .await
+            .expect("the error GOAWAY must surface as a response, not a hang")
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            502,
+            "a connection killed by an error GOAWAY must fail the in-flight \
+             request as a proxy error:\n{}",
+            rec.dump()
+        );
+
+        // "No silent retry" as an absence over a bounded window; the exact
+        // whole-log counts below make it a statement about the entire run.
+        expect_ok(
+            rec.expect_none("a second upstream attempt", QUIET_WINDOW, |e| {
+                matches!(e, UpEvent::ConnAccepted { .. } | UpEvent::ReqHeaders { .. })
+            })
+            .await,
+        );
+    });
+
+    assert_eq!(
+        rec.connections(),
+        1,
+        "exactly one upstream connection:\n{}",
+        rec.dump()
+    );
+    assert_eq!(
+        rec.count(|e| matches!(e, UpEvent::ReqHeaders { .. })),
+        1,
+        "exactly one upstream attempt:\n{}",
         rec.dump()
     );
 }

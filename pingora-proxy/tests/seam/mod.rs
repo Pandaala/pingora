@@ -225,6 +225,8 @@ macro_rules! matrix {
                 bodyless_with_a_real_body_fails_closed,
                 cl0_without_end_stream_sends_one_eos,
                 streamed_disposition_rewrites_upstream_framing,
+                upstream_graceful_goaway_finishes_in_flight_and_is_not_reused,
+                upstream_error_goaway_fails_the_request_without_a_silent_retry,
             }
         }
     };

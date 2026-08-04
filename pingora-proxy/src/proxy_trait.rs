@@ -707,6 +707,10 @@ pub trait ProxyHttp {
                                 /* conn already dead */
                                 0
                             }
+                            /* the client stopped sending its request; the
+                             * request itself was never malformed, so 408 is
+                             * the accurate answer rather than 400 */
+                            ReadTimedout => 408,
                             _ => 400,
                         }
                     }
