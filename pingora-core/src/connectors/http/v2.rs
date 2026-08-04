@@ -17,6 +17,7 @@ use crate::connectors::{ConnectorOptions, TransportConnector};
 use crate::protocols::http::custom::client::Session;
 use crate::protocols::http::v1::client::HttpSession as Http1Session;
 use crate::protocols::http::v2::client::{drive_connection, Http2Session};
+use crate::protocols::http::v2::end_stream_watch::{EndStreamWatch, EndStreamWatchStream};
 use crate::protocols::{Digest, Stream, UniqueIDType};
 use crate::upstreams::peer::{Peer, ALPN};
 
@@ -60,6 +61,11 @@ pub(crate) struct ConnectionRefInner {
     pub(crate) digest: Digest,
     // To serialize certain operations when trying to release the connect back to the pool,
     pub(crate) release_lock: Arc<Mutex<()>>,
+    // Records which streams the peer ended with END_STREAM before tearing them
+    // down, a wire fact `h2` itself discards. `None` for connections built
+    // without the watch (only tests do that), which just falls back to the
+    // weaker end-of-body proofs.
+    end_stream_watch: Option<Arc<EndStreamWatch>>,
 }
 
 #[derive(Clone)]
@@ -74,6 +80,27 @@ impl ConnectionRef {
         max_streams: usize,
         digest: Digest,
     ) -> Self {
+        Self::new_with_end_stream_watch(
+            send_req,
+            closed,
+            ping_timeout_occurred,
+            id,
+            max_streams,
+            digest,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_end_stream_watch(
+        send_req: SendRequest<Bytes>,
+        closed: watch::Receiver<bool>,
+        ping_timeout_occurred: Arc<AtomicBool>,
+        id: UniqueIDType,
+        max_streams: usize,
+        digest: Digest,
+        end_stream_watch: Option<Arc<EndStreamWatch>>,
+    ) -> Self {
         ConnectionRef(Arc::new(ConnectionRefInner {
             connection_stub: Stub(send_req),
             closed,
@@ -84,7 +111,12 @@ impl ConnectionRef {
             shutting_down: false.into(),
             digest,
             release_lock: Arc::new(Mutex::new(())),
+            end_stream_watch,
         }))
+    }
+
+    pub(crate) fn end_stream_watch(&self) -> Option<&Arc<EndStreamWatch>> {
+        self.0.end_stream_watch.as_ref()
     }
 
     pub fn more_streams_allowed(&self) -> bool {
@@ -446,6 +478,11 @@ pub async fn handshake(
         proxy_digest: stream.get_proxy_digest(),
         socket_digest: stream.get_socket_digest(),
     };
+    // Watch the peer's frame headers on their way into `h2` so that a stream
+    // the peer ended with END_STREAM stays provably ended even after the peer
+    // resets it, which `h2` cannot report on its own.
+    let end_stream_watch = EndStreamWatch::new();
+    let stream = EndStreamWatchStream::new(stream, end_stream_watch.clone());
     // TODO: make these configurable
     let (send_req, connection) = Builder::new()
         .enable_push(false)
@@ -482,13 +519,14 @@ pub async fn handshake(
         )
         .await;
     });
-    Ok(ConnectionRef::new(
+    Ok(ConnectionRef::new_with_end_stream_watch(
         send_req,
         closed_rx,
         ping_timeout_occurred,
         id,
         max_allowed_streams,
         digest,
+        Some(end_stream_watch),
     ))
 }
 

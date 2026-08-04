@@ -21,7 +21,10 @@ use crate::proxy_common::*;
 use http::{header::CONTENT_LENGTH, Method, StatusCode};
 use pingora_cache::CachePhase;
 use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
-use pingora_core::protocols::http::v2::{client::Http2Session, write_body};
+use pingora_core::protocols::http::v2::{
+    client::{Http2Session, PeerEndStream},
+    write_body,
+};
 
 fn apply_upstream_body_disposition(
     request: &mut RequestHeader,
@@ -127,8 +130,31 @@ fn upstream_framing_body_empty(
     }
 }
 
+/// What one downstream request-body event did to the upstream request stream.
+#[derive(Debug, PartialEq, Eq)]
+enum UpstreamBodyOutcome {
+    /// The event was forwarded (or deliberately not written), and the pump's
+    /// downstream read side is governed by the wrapped outcome as usual.
+    Downstream(DownstreamRequestOutcome),
+    /// The upstream refused the write on a stream whose response the peer had
+    /// ALREADY flagged complete on the wire (RFC 9113 §8.1: "stop uploading, I
+    /// have answered you"). Nothing more may be written, but nothing is lost
+    /// either -- see [`upstream_write_error_outcome`].
+    UpstreamDoneReceiving {
+        /// Whether the event whose write failed was itself the end of the
+        /// downstream body, i.e. whether the application's single
+        /// `(None, end_of_stream = true)` event has already been delivered.
+        ///
+        /// The canonical §8.1 shape fails on a MID-body write, where it has
+        /// not: the handler then owes the application that event before it
+        /// takes the downstream read side out of the loop, because nothing else
+        /// will ever deliver it. See the arms in `bidirection_down_to_up`.
+        end_of_stream_delivered: bool,
+    },
+}
+
 /// How the pump may write the upstream request body on this attempt.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct UpstreamBodyWrite {
     /// Per-write timeout from the peer options.
     timeout: Option<Duration>,
@@ -158,6 +184,149 @@ struct UpstreamBodyWrite {
     /// `Http2Session::read_trailers` for why `UserError::InactiveStreamId` and
     /// `poll_reset` cannot distinguish the cases.
     eos_write_optional: bool,
+    /// Source (iv) for the UPSTREAM stream: whether the peer flagged the end of
+    /// its response on the wire before tearing the stream down.
+    ///
+    /// This is the one fact about a failed h2 write that the write site can
+    /// establish, and it is what `upstream_write_error_outcome` classifies a
+    /// write failure with. The response half is read concurrently in the other
+    /// arm of `proxy_down_to_up`'s `select!`, so the session itself is
+    /// unreachable from here; the flag is a cheap `Arc` handle sampled at the
+    /// moment the write fails.
+    upstream_response_ended: PeerEndStream,
+}
+
+/// Classify a failed upstream request-body write.
+///
+/// # Why swallowing this cannot deliver a truncated response
+///
+/// The premise of RFC 9113 §8.1's shape is that this side is still uploading --
+/// that is *why* the origin resets -- so the write failing is not evidence of
+/// anything going wrong: with `upstream_response_ended` set, the peer had
+/// already put END_STREAM on the wire before the frame that killed the stream.
+/// Failing the exchange there would throw away a response the proxy already
+/// holds because of an upload the origin explicitly said it no longer wants.
+///
+/// The swallow cannot launder a truncation, because it decides NOTHING about
+/// the response:
+///
+/// - Response completeness is decided exclusively by the READ half
+///   (`pipe_up_to_down_response` -> `Http2Session::read_response_body` /
+///   `read_trailers`), which applies its own, stricter guard: the wire flag is
+///   consulted only once a read has actually failed, only for a `NO_ERROR`
+///   remote stream end, and only when the wire's DATA byte count for the stream
+///   matches what was actually read. A truncated body fails at least one of
+///   those (see `Http2Session::response_body_complete_at_stream_end`), so the
+///   read half still errors, still emits `HttpTask::Failed`, and the exchange
+///   still fails -- with or without this classification. Note that the flag
+///   this function consults is the WEAK one and deliberately so: it is asking
+///   "did the origin say it was done with me", not "is the response whole".
+/// - Nothing here reports success downstream. It only stops the pump from
+///   turning the failed WRITE into the error that ends the exchange.
+///
+/// For the same reason it is safe that the flag says nothing about the reset's
+/// error code: a non-`NO_ERROR` reset after a complete response leaves the flag
+/// set, but the read half rejects that reason and fails the exchange anyway.
+/// Without the flag -- any other write failure, and every stream whose response
+/// the peer never flagged complete -- the error is returned unchanged.
+///
+/// # Why the flag is not sufficient on its own
+///
+/// `upstream_response_ended` is set for EVERY upstream response the peer ended
+/// cleanly, reset or not, and it stays set for the life of the exchange. Taken
+/// alone it would therefore swallow every request-body write failure that can
+/// happen after the response arrives, including ones that have nothing to do
+/// with the peer having stopped listening -- most importantly a locally
+/// configured `write_timeout` expiring. An origin that answers a POST in full
+/// and then simply stops granting flow-control window would silently truncate
+/// the upstream request body and be logged a success. So the classification
+/// also requires the failure SHAPE to mean "the stream is gone"; see
+/// [`upstream_write_failed_because_stream_gone`].
+fn upstream_write_error_outcome(
+    e: Box<Error>,
+    end_of_stream_delivered: bool,
+    body_write: &UpstreamBodyWrite,
+) -> Result<UpstreamBodyOutcome> {
+    if body_write.upstream_response_ended.observed()
+        && upstream_write_failed_because_stream_gone(&e)
+    {
+        debug!(
+            "upstream stopped receiving the request body after flagging its response complete: {e}"
+        );
+        Ok(UpstreamBodyOutcome::UpstreamDoneReceiving {
+            end_of_stream_delivered,
+        })
+    } else {
+        Err(e.into_up())
+    }
+}
+
+/// Whether a failed `write_body` means the upstream request stream is GONE, as
+/// opposed to still being there and merely not cooperating.
+///
+/// `write_body` fails in exactly three shapes, and only two of them are the
+/// peer telling us something:
+fn upstream_write_failed_because_stream_gone(e: &Error) -> bool {
+    match e.etype {
+        // `reserve_and_send`: `poll_capacity` answered `Ready(None)` ("cannot
+        // reserve capacity"), or yielded the stream's own `h2::Error`. Both
+        // mean h2 will never accept another byte on this stream -- it is closed
+        // or the whole connection is.
+        H2Error => true,
+        // `SendStream::send_data` refused the frame, which for a stream h2 has
+        // already closed is `UserError::InactiveStreamId`. Same conclusion.
+        WriteError => true,
+        // A LOCAL deadline, from `peer.options.write_timeout`. The stream may be
+        // perfectly alive and the peer merely slow (or withholding flow-control
+        // window). Swallowing this would truncate the upstream request body and
+        // report success, so it is not a peer signal and must not be treated as
+        // one.
+        WriteTimedout => false,
+        _ => false,
+    }
+}
+
+/// How long the downstream request body may be drained for once the pump has
+/// stopped reading it. Generous enough that an ordinary in-flight upload
+/// finishes and the connection stays reusable; finite so that one cannot hold
+/// the connection and its task open indefinitely.
+const ABANDONED_BODY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound the drain of a downstream request body the pump has stopped reading.
+///
+/// `UpstreamDoneReceiving` returns the exchange as a SUCCESS, so unlike the two
+/// `Terminate` paths nothing here clears keepalive -- and for an H1 downstream
+/// that means `finish()` will DRAIN whatever the client is still uploading in
+/// order to reuse the socket, bounded only by `total_drain_timeout`, which
+/// defaults to `None`. A client with a multi-gigabyte upload in flight would
+/// otherwise hold the connection, and this task, for as long as it cared to
+/// keep writing.
+///
+/// Bounding is chosen over the terminate paths' `set_keepalive(None)`, and the
+/// difference is not cosmetic: those paths have no response left to protect,
+/// whereas this one is in the middle of delivering a complete response the
+/// section 8.1 handling just rescued. Closing an H1 socket that still has an
+/// unread multi-megabyte upload sitting in its receive queue makes the kernel
+/// send RST rather than FIN, and the RST discards whatever the client has not
+/// yet read -- so clearing keepalive here trades an unbounded drain for
+/// intermittently truncating the very response this code exists to deliver.
+/// That was measured, not theorised: it cost
+/// `h2_upstream_no_error_reset_keeps_streaming_while_the_client_uploads` about
+/// one run in fifteen.
+///
+/// An application that has set its own drain timeout keeps it. A no-op when the
+/// downstream body is already done, which is the common case.
+fn bound_undrained_downstream_body(session: &mut Session) {
+    if session.as_mut().is_body_done() || session.as_mut().get_total_drain_timeout().is_some() {
+        return;
+    }
+    debug!(
+        "the upstream stopped receiving before the downstream request body ended; \
+         bounding the drain at {ABANDONED_BODY_DRAIN_TIMEOUT:?}"
+    );
+    session
+        .as_mut()
+        .set_total_drain_timeout(Some(ABANDONED_BODY_DRAIN_TIMEOUT));
 }
 
 // add scheme and authority as required by h2 lib
@@ -392,6 +561,7 @@ where
                     stream_closed: upstream_body_closed,
                     eos_write_optional: false,
                     disposition: body_disposition,
+                    upstream_response_ended: client_session.peer_end_stream(),
                 },
             );
             let upstream = pipe_up_to_down_response(client_session, tx);
@@ -447,6 +617,13 @@ where
                 // stream is still open: reset it to stop the upstream from working on
                 // a request nobody will read.
                 client_body.send_reset(h2::Reason::CANCEL);
+                // A locally reset stream may no longer be judged by the wire
+                // END_STREAM record: `h2` starts DROPPING the DATA it decodes,
+                // while a peer RST_STREAM landing afterwards can still surface
+                // as a remote NO_ERROR. Nothing reads this stream after this
+                // point, so this is enforcement of an invariant rather than a
+                // fix -- see `Http2Session::note_local_reset`.
+                client_session.note_local_reset();
                 release_cache_on_terminate(session);
                 // Downstream hygiene is keyed by the DOWNSTREAM protocol, not by the
                 // upstream one this pump was selected for: an H1 client proxied to an
@@ -475,6 +652,9 @@ where
                 // TODO: implement for write timeouts?
                 if e.esource == ErrorSource::Upstream && matches!(e.etype, ReadTimedout) {
                     client_body.send_reset(h2::Reason::CANCEL);
+                    // See the terminate arm above: source (iv) is given up at
+                    // every local reset.
+                    client_session.note_local_reset();
                 }
                 (false, Some(e))
             }
@@ -555,6 +735,30 @@ where
         }
 
         let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
+        // Set once the upstream has stopped receiving the request body after
+        // flagging its response complete (RFC 9113 §8.1). It takes the read side
+        // out of the loop for good: the state machine says "finished reading",
+        // which is what keeps the downstream connection out of the errored path,
+        // and this flag is what stops the loop from polling a read side it has
+        // just declared done -- `read_body_or_idle` answers such a poll with
+        // "Sent data after end of body" as soon as the client sends its next
+        // byte, and the loop would turn that into a downstream error, failing
+        // the very exchange this is saving.
+        //
+        // The guard is CONDITIONAL: it only bites while the loop is still
+        // running for the RESPONSE's sake, i.e. while `response_state` is not
+        // yet done. That window is narrow and easy to miss -- most shapes of
+        // this exchange have the response fully written downstream by the time
+        // the request-body write fails, and then the loop exits at once and
+        // this flag is dead code. Do not take the file's other tests as
+        // coverage; the one that enters the window on purpose is
+        // `h2_upstream_no_error_reset_keeps_streaming_while_the_client_uploads`,
+        // and it is the only one that fails when this guard is deleted.
+        //
+        // Not folded into `DownstreamStateMachine`: that type is shared with the
+        // H1 pump, whose `Errored`/`ReadingFinished` distinction means other
+        // things there.
+        let mut upstream_stopped_receiving = false;
 
         let buffer = session.as_mut().get_retry_buffer();
         // Native retry-buffer path. Registered app buffers are replayed through
@@ -582,17 +786,41 @@ where
                     downstream_state.is_done(),
                     client_body,
                     ctx,
-                    body_write,
+                    &body_write,
                 )
                 .await?;
-            if outcome == DownstreamRequestOutcome::Terminate {
-                // No-op for an H2 downstream; required for an H1 downstream proxied
-                // to an H2 upstream, whose unread request bytes must not be drained
-                // and the connection reused.
-                session.set_keepalive(None);
-                finish_terminated_response(session).await;
-                restore_custom_message_reader(session, downstream_custom_message_reader);
-                return Ok(outcome);
+            match outcome {
+                UpstreamBodyOutcome::Downstream(DownstreamRequestOutcome::Terminate) => {
+                    // No-op for an H2 downstream; required for an H1 downstream proxied
+                    // to an H2 upstream, whose unread request bytes must not be drained
+                    // and the connection reused.
+                    session.set_keepalive(None);
+                    finish_terminated_response(session).await;
+                    restore_custom_message_reader(session, downstream_custom_message_reader);
+                    return Ok(DownstreamRequestOutcome::Terminate);
+                }
+                // The replayed body could not be written because the upstream
+                // had already answered in full and reset the stream. Failing the
+                // request here would discard that response; the duplex loop
+                // below still has to run to deliver it.
+                UpstreamBodyOutcome::UpstreamDoneReceiving {
+                    end_of_stream_delivered,
+                } => {
+                    if !end_of_stream_delivered
+                        && self
+                            .finish_downstream_body_side(session, client_body, ctx, &body_write)
+                            .await?
+                    {
+                        session.set_keepalive(None);
+                        finish_terminated_response(session).await;
+                        restore_custom_message_reader(session, downstream_custom_message_reader);
+                        return Ok(DownstreamRequestOutcome::Terminate);
+                    }
+                    upstream_stopped_receiving = true;
+                    downstream_state.maybe_finished(true);
+                    bound_undrained_downstream_body(session);
+                }
+                UpstreamBodyOutcome::Downstream(DownstreamRequestOutcome::Complete(_)) => {}
             }
         }
 
@@ -636,18 +864,25 @@ where
                         true,
                         client_body,
                         ctx,
-                        UpstreamBodyWrite {
+                        &UpstreamBodyWrite {
                             eos_write_optional: true,
-                            ..body_write
+                            ..body_write.clone()
                         },
                     )
                     .await?;
-                if outcome == DownstreamRequestOutcome::Terminate {
+                if outcome == UpstreamBodyOutcome::Downstream(DownstreamRequestOutcome::Terminate) {
                     session.set_keepalive(None);
                     finish_terminated_response(session).await;
                     restore_custom_message_reader(session, downstream_custom_message_reader.take());
-                    return Ok(outcome);
+                    return Ok(DownstreamRequestOutcome::Terminate);
                 }
+                // `UpstreamDoneReceiving` needs nothing extra here. The
+                // end-of-stream event this branch exists to pay has just been
+                // paid (`(None, true)` above), so the only thing the arms in
+                // the loop below add -- `finish_downstream_body_side` -- would
+                // be a second delivery. The read side is already being
+                // finished, and `eos_write_optional` has already swallowed the
+                // same write failure on the normal path.
                 downstream_state.maybe_finished(true);
                 continue;
             }
@@ -671,7 +906,7 @@ where
             // But we don't need to do the same because the h2 client_body pipe is unbounded (never block)
             tokio::select! {
                 // NOTE: cannot avoid this copy since h2 owns the buf
-                body = session.downstream_session.read_body_or_idle(downstream_state.is_done()), if downstream_state.can_poll() => {
+                body = session.downstream_session.read_body_or_idle(downstream_state.is_done()), if downstream_state.can_poll() && !upstream_stopped_receiving => {
                     debug!("downstream event");
                     let body = match body {
                         Ok(b) => b,
@@ -703,11 +938,32 @@ where
                         }
                     };
                     let is_body_done = session.is_body_done();
-                    match self.send_body_to2(session, body, is_body_done, client_body, ctx, body_write).await {
-                        Ok(DownstreamRequestOutcome::Complete(request_done)) =>  {
+                    match self.send_body_to2(session, body, is_body_done, client_body, ctx, &body_write).await {
+                        Ok(UpstreamBodyOutcome::Downstream(DownstreamRequestOutcome::Complete(request_done))) =>  {
                             downstream_state.maybe_finished(request_done);
                         },
-                        Ok(DownstreamRequestOutcome::Terminate) => {
+                        // The upstream answered in full and reset the stream while
+                        // this side was still uploading (RFC 9113 §8.1). The
+                        // exchange is NOT failed over it: the response is already
+                        // in hand, and whether it is complete was decided by the
+                        // read half. All that is left is to stop feeding a write
+                        // half that is gone -- and, first, to pay the application
+                        // the end-of-stream event that taking the read side out of
+                        // the loop would otherwise cost it.
+                        Ok(UpstreamBodyOutcome::UpstreamDoneReceiving { end_of_stream_delivered }) => {
+                            if !end_of_stream_delivered
+                                && self.finish_downstream_body_side(session, client_body, ctx, &body_write).await?
+                            {
+                                session.set_keepalive(None);
+                                finish_terminated_response(session).await;
+                                restore_custom_message_reader(session, downstream_custom_message_reader.take());
+                                return Ok(DownstreamRequestOutcome::Terminate);
+                            }
+                            upstream_stopped_receiving = true;
+                            downstream_state.maybe_finished(true);
+                            bound_undrained_downstream_body(session);
+                        },
+                        Ok(UpstreamBodyOutcome::Downstream(DownstreamRequestOutcome::Terminate)) => {
                             // See the prelude terminate above: hygiene follows the
                             // downstream protocol, which may be H1 here.
                             session.set_keepalive(None);
@@ -1052,6 +1308,55 @@ where
         res
     }
 
+    /// Deliver the downstream body's single end-of-stream event, for a pump
+    /// that is about to stop reading the downstream body without having seen
+    /// its end.
+    ///
+    /// Returns whether the application asked to terminate.
+    ///
+    /// `UpstreamDoneReceiving` on a MID-body write -- the canonical RFC 9113
+    /// §8.1 shape, where the origin resets precisely because we are still
+    /// uploading -- sets `downstream_state` to finished and disables the read
+    /// branch. That also disables `downstream_body_read_is_futile`, which needs
+    /// `is_reading()`, so nothing downstream of here would ever run the hooks
+    /// with `(None, end_of_stream = true)`: `request_body_filter_action` would
+    /// never see the end of the body, `request_trailer_filter` would never
+    /// fire, and the downstream body modules would be left mid-stream -- while
+    /// the request completed 200 and logged as a success. This is the same
+    /// invariant the futile-read branch protects, paid the same way.
+    ///
+    /// `stream_closed` is forced here (unlike in the futile-read branch): the
+    /// upstream request stream is provably gone -- that is what
+    /// `UpstreamDoneReceiving` means -- so the terminating END_STREAM is not
+    /// owed and attempting it would only fail again.
+    async fn finish_downstream_body_side(
+        &self,
+        session: &mut Session,
+        client_body: &mut h2::SendStream<bytes::Bytes>,
+        ctx: &mut SV::CTX,
+        body_write: &UpstreamBodyWrite,
+    ) -> Result<bool>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        let outcome = self
+            .send_body_to2(
+                session,
+                None,
+                true,
+                client_body,
+                ctx,
+                &UpstreamBodyWrite {
+                    stream_closed: true,
+                    eos_write_optional: true,
+                    ..body_write.clone()
+                },
+            )
+            .await?;
+        Ok(outcome == UpstreamBodyOutcome::Downstream(DownstreamRequestOutcome::Terminate))
+    }
+
     async fn send_body_to2(
         &self,
         session: &mut Session,
@@ -1059,8 +1364,8 @@ where
         end_of_body: bool,
         client_body: &mut h2::SendStream<bytes::Bytes>,
         ctx: &mut SV::CTX,
-        body_write: UpstreamBodyWrite,
-    ) -> Result<DownstreamRequestOutcome>
+        body_write: &UpstreamBodyWrite,
+    ) -> Result<UpstreamBodyOutcome>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
@@ -1102,7 +1407,9 @@ where
             session.request_trailer_filter_fired = true;
             if action == RequestBodyAction::Terminate {
                 warn_terminate_without_response(session, "request_trailer_filter");
-                return Ok(DownstreamRequestOutcome::Terminate);
+                return Ok(UpstreamBodyOutcome::Downstream(
+                    DownstreamRequestOutcome::Terminate,
+                ));
             }
         }
 
@@ -1118,14 +1425,18 @@ where
             == RequestBodyAction::Terminate
         {
             warn_terminate_without_response(session, "request_body_filter_action");
-            return Ok(DownstreamRequestOutcome::Terminate);
+            return Ok(UpstreamBodyOutcome::Downstream(
+                DownstreamRequestOutcome::Terminate,
+            ));
         }
 
         /* it is normal to get 0 bytes because of multi-chunk parsing or request_body_filter.
          * Although there is no harm writing empty byte to h2, unlike h1, we ignore it
          * for consistency */
         if !end_of_body && data.as_ref().is_some_and(|d| d.is_empty()) {
-            return Ok(DownstreamRequestOutcome::Complete(false));
+            return Ok(UpstreamBodyOutcome::Downstream(
+                DownstreamRequestOutcome::Complete(false),
+            ));
         }
 
         // Fail closed on a `Bodyless` declaration the downstream body has just
@@ -1178,14 +1489,16 @@ where
                 );
             }
             debug!("upstream request stream already closed; not writing the end of stream");
-            return Ok(DownstreamRequestOutcome::Complete(end_of_body));
+            return Ok(UpstreamBodyOutcome::Downstream(
+                DownstreamRequestOutcome::Complete(end_of_body),
+            ));
         }
 
         if let Some(data) = data {
             debug!("Write {} bytes body to h2 upstream", data.len());
-            write_body(client_body, data, end_of_body, body_write.timeout)
-                .await
-                .map_err(|e| e.into_up())?;
+            if let Err(e) = write_body(client_body, data, end_of_body, body_write.timeout).await {
+                return upstream_write_error_outcome(e, end_of_body, body_write);
+            }
         } else {
             debug!("Read downstream body done");
             /* send a standalone END_STREAM flag */
@@ -1193,12 +1506,18 @@ where
                 if body_write.eos_write_optional {
                     debug!("upstream request stream would not take the final END_STREAM: {e}");
                 } else {
-                    return Err(e.into_up());
+                    // `data == None` is the end of the downstream body by
+                    // construction (see the top of this function), so the
+                    // application hooks above have already had their
+                    // end-of-stream event.
+                    return upstream_write_error_outcome(e, true, body_write);
                 }
             }
         }
 
-        Ok(DownstreamRequestOutcome::Complete(end_of_body))
+        Ok(UpstreamBodyOutcome::Downstream(
+            DownstreamRequestOutcome::Complete(end_of_body),
+        ))
     }
 }
 
@@ -1519,6 +1838,53 @@ fn test_bodyless_with_a_real_body_always_closes_at_header_time() {
         assert!(
             headers_eos ^ data_eos,
             "Bodyless send_end_stream={send_end_stream} must close the stream exactly once"
+        );
+    }
+}
+
+/// I2: the write-error swallow must be keyed on the failure SHAPE, not just on
+/// the wire END_STREAM flag.
+///
+/// `upstream_response_ended` is set for every upstream response the peer ended
+/// cleanly, and it stays set. If it were the whole condition, then after any
+/// such response EVERY request-body write failure would be swallowed and the
+/// exchange logged a success -- including a `write_timeout` expiring against an
+/// origin that answered in full and then stopped granting flow-control window,
+/// which truncates the upstream request body and previously produced a 502.
+#[test]
+fn test_only_stream_gone_write_failures_may_be_swallowed() {
+    // The two shapes `write_body` produces when h2 will never take another byte
+    // on this stream.
+    for (etype, context) in [
+        (H2Error, "cannot reserve capacity"),
+        (H2Error, "while waiting for capacity"),
+        (WriteError, "while writing h2 request body"),
+    ] {
+        let e = Error::explain(etype, context.to_string());
+        assert!(
+            upstream_write_failed_because_stream_gone(&e),
+            "{context} means the upstream stream is gone"
+        );
+    }
+
+    // A local deadline is not a peer signal.
+    let timed_out = Error::explain(
+        WriteTimedout,
+        "while writing h2 request body, timeout: 1s".to_string(),
+    );
+    assert!(
+        !upstream_write_failed_because_stream_gone(&timed_out),
+        "a locally configured write_timeout must still fail the exchange: swallowing \
+         it truncates the upstream request body and reports success"
+    );
+
+    // And nothing else is a peer signal either -- the application's own body
+    // filters, the `Bodyless` contract violation, the cache.
+    for etype in [InternalError, ReadError, ReadTimedout, ConnectError] {
+        let e = Error::explain(etype.clone(), "".to_string());
+        assert!(
+            !upstream_write_failed_because_stream_gone(&e),
+            "{etype:?} is not the upstream closing its request stream"
         );
     }
 }
