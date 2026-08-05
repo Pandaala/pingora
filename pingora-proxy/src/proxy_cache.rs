@@ -718,6 +718,114 @@ where
         Ok(())
     }
 
+    /// Feed `task` and everything the upstream body filter queued in `sink`
+    /// (via [`ResponseBodySink::push`]) to the cache, in the same order
+    /// [`super::proxy_h1::HttpProxy::h1_response_filter`] (and its h2/custom
+    /// siblings) hand them to the downstream writer -- see
+    /// `drain_emitted_chunks` below for that side.
+    ///
+    /// `task`'s own end-of-stream flag is migrated onto the LAST queued
+    /// chunk instead of staying on `task`, whenever there is at least one
+    /// queued chunk. Caching `task` unmodified AND every emitted chunk would
+    /// tell the cache the response ended twice: [`HttpCache::miss_handler`]
+    /// (see its `// this will panic ... should be impossible in real world`
+    /// comment above) takes the [`pingora_cache::MissHandler`] the first
+    /// time it sees `end_stream`, and the very next `Body` write after that
+    /// unwraps `None` and panics. A `Body(Some(data), true)` /
+    /// `UpgradedBody(Some(data), true)` keeps `data` but drops its own
+    /// end-of-stream flag; a bare `Body(None, true)` / `UpgradedBody(None,
+    /// true)` end marker carries no payload of its own and is skipped
+    /// entirely -- the last chunk now carries its meaning instead. See
+    /// `migrate_end_of_stream`.
+    ///
+    /// Every cache write here (the migrated `task` and each chunk) follows
+    /// the same failure policy as the original single-task path: on error,
+    /// disable the cache; if [`ServeFromCache::is_miss_body`] is set, the
+    /// response is already streaming into the cache during a miss, so a
+    /// write failure must give up the entire request (a partial cache write
+    /// would otherwise leave a stream promising bytes it no longer has)
+    /// rather than let the client silently receive fewer bytes than the
+    /// cache now expects; otherwise, warn and stop feeding the cache instead
+    /// of retrying against a cache already disabled.
+    pub(crate) async fn cache_task_and_emitted_chunks(
+        &self,
+        session: &mut Session,
+        task: &HttpTask,
+        sink: &ResponseBodySink,
+        ctx: &mut SV::CTX,
+        serve_from_cache: &mut ServeFromCache,
+    ) -> Result<()>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        if !(session.cache.enabled() || session.cache.bypassing()) {
+            return Ok(());
+        }
+
+        let extra = sink.peek_extra();
+        let leading = if extra.is_empty() {
+            LeadingTask::Unchanged
+        } else {
+            migrate_end_of_stream(task)
+        };
+
+        let leading_result = match &leading {
+            LeadingTask::Unchanged => {
+                self.cache_http_task(session, task, ctx, serve_from_cache)
+                    .await
+            }
+            LeadingTask::Substitute(substitute) => {
+                self.cache_http_task(session, substitute, ctx, serve_from_cache)
+                    .await
+            }
+            LeadingTask::Drop => Ok(()),
+        };
+        if let Err(e) = leading_result {
+            session.cache.disable(NoCacheReason::StorageError);
+            if serve_from_cache.is_miss_body() {
+                // if the response stream cache body during miss but write fails, it has to
+                // give up the entire request
+                return Err(e);
+            }
+            warn!(
+                "Fail to cache response: {}, {}",
+                e,
+                self.inner.request_summary(session, ctx)
+            );
+            // The cache is already disabled: cache_http_task would no-op on
+            // every remaining chunk anyway, so stop here instead of
+            // repeating the same warning per chunk.
+            return Ok(());
+        }
+
+        if extra.is_empty() {
+            return Ok(());
+        }
+        let last = extra.len() - 1;
+        let last_chunk_is_end_of_stream = !matches!(leading, LeadingTask::Unchanged);
+        for (i, chunk) in extra.iter().enumerate() {
+            let end = last_chunk_is_end_of_stream && i == last;
+            let extra_task = HttpTask::Body(Some(chunk.clone()), end);
+            if let Err(e) = self
+                .cache_http_task(session, &extra_task, ctx, serve_from_cache)
+                .await
+            {
+                session.cache.disable(NoCacheReason::StorageError);
+                if serve_from_cache.is_miss_body() {
+                    return Err(e);
+                }
+                warn!(
+                    "Fail to cache emitted response chunk: {}, {}",
+                    e,
+                    self.inner.request_summary(session, ctx)
+                );
+                break;
+            }
+        }
+        Ok(())
+    }
+
     // Decide if local cache can be used according to upstream http header
     // 1. when upstream returns 304, the local cache is refreshed and served fresh
     // 2. when upstream returns certain HTTP error status, the local cache is served stale
@@ -947,6 +1055,218 @@ where
             LockStatus::AgeTimeout => true,
             // software bug, this status should be impossible to reach
             LockStatus::Waiting => panic!("impossible LockStatus::Waiting"),
+        }
+    }
+}
+
+/// What migrating `task`'s end-of-stream flag onto a queued
+/// [`ResponseBodySink`] chunk means for `task` itself. Only meaningful when
+/// there is at least one queued chunk to migrate it onto -- callers skip
+/// calling [`migrate_end_of_stream`] entirely otherwise and use
+/// [`LeadingTask::Unchanged`] directly for that hot, sink-empty path.
+enum LeadingTask {
+    /// `task` was not a true-end-of-stream `Body`/`UpgradedBody`: nothing to
+    /// migrate, feed `task` exactly as-is.
+    Unchanged,
+    /// `task` carried a payload; feed this de-asserted (`end = false`)
+    /// substitute in its place, then the queued chunks -- the LAST of which
+    /// now carries `end = true` instead of `task`.
+    Substitute(HttpTask),
+    /// `task` was a bare end-of-stream marker with no payload of its own
+    /// (`Body(None, true)` / `UpgradedBody(None, true)`): drop it entirely
+    /// and let the last queued chunk carry its meaning instead of also
+    /// emitting a now-redundant marker.
+    Drop,
+}
+
+/// Decide how `task`'s own end-of-stream flag must move to make room for the
+/// chunks a response-body filter queued after it. Only called by
+/// [`HttpProxy::cache_task_and_emitted_chunks`] and `drain_emitted_chunks`
+/// when the sink has at least one chunk queued; see their doc comments for
+/// why the flag cannot simply be duplicated onto both `task` and the chunks.
+fn migrate_end_of_stream(task: &HttpTask) -> LeadingTask {
+    match task {
+        HttpTask::Body(Some(data), true) => {
+            LeadingTask::Substitute(HttpTask::Body(Some(data.clone()), false))
+        }
+        HttpTask::Body(None, true) => LeadingTask::Drop,
+        HttpTask::UpgradedBody(Some(data), true) => {
+            LeadingTask::Substitute(HttpTask::UpgradedBody(Some(data.clone()), false))
+        }
+        HttpTask::UpgradedBody(None, true) => LeadingTask::Drop,
+        _ => LeadingTask::Unchanged,
+    }
+}
+
+/// Drain the chunks `sink` queued and append them to `out_tasks` right after
+/// `task`, migrating `task`'s own end-of-stream flag onto the last of them
+/// exactly as [`HttpProxy::cache_task_and_emitted_chunks`] does for the
+/// cache -- see that function's doc comment for the failure this prevents.
+/// Cheap and branch-free when nothing was queued (the hot path: almost every
+/// call has an empty sink).
+///
+/// Chunks are re-emitted under `task`'s own variant (`Body` stays `Body`,
+/// `UpgradedBody` stays `UpgradedBody`): `Session::write_response_tasks`
+/// tracks `seen_upgraded` off this tag to pick the raw post-upgrade duplex
+/// write path over the normal framed one, so mistagging a chunk here would
+/// misroute its bytes on an upgraded (e.g. WebSocket) connection.
+pub(crate) fn drain_emitted_chunks(
+    task: HttpTask,
+    sink: &mut ResponseBodySink,
+    out_tasks: &mut Vec<HttpTask>,
+) {
+    let extra = sink.take_extra();
+    if extra.is_empty() {
+        out_tasks.push(task);
+        return;
+    }
+
+    let is_upgraded = matches!(task, HttpTask::UpgradedBody(..));
+    let leading = migrate_end_of_stream(&task);
+    let last_chunk_is_end_of_stream = !matches!(leading, LeadingTask::Unchanged);
+    match leading {
+        LeadingTask::Unchanged => out_tasks.push(task),
+        LeadingTask::Substitute(substitute) => out_tasks.push(substitute),
+        LeadingTask::Drop => {}
+    }
+
+    let last = extra.len() - 1;
+    for (i, chunk) in extra.into_iter().enumerate() {
+        let end = last_chunk_is_end_of_stream && i == last;
+        out_tasks.push(if is_upgraded {
+            HttpTask::UpgradedBody(Some(chunk), end)
+        } else {
+            HttpTask::Body(Some(chunk), end)
+        });
+    }
+}
+
+#[cfg(test)]
+mod eos_migration_tests {
+    use super::*;
+
+    fn sink_with(chunks: &[&'static [u8]]) -> ResponseBodySink {
+        let mut sink = ResponseBodySink::new();
+        for c in chunks {
+            sink.push(Bytes::from_static(c)).unwrap();
+        }
+        sink
+    }
+
+    #[test]
+    fn empty_sink_leaves_task_untouched() {
+        let mut sink = ResponseBodySink::new();
+        let mut out = Vec::new();
+        drain_emitted_chunks(
+            HttpTask::Body(Some(Bytes::from_static(b"hello")), true),
+            &mut sink,
+            &mut out,
+        );
+        assert!(
+            matches!(out.as_slice(), [HttpTask::Body(Some(d), true)] if d.as_ref() == b"hello")
+        );
+    }
+
+    #[test]
+    fn non_eos_body_leaves_every_chunk_non_eos() {
+        let mut sink = sink_with(&[b"a", b"b"]);
+        let mut out = Vec::new();
+        drain_emitted_chunks(
+            HttpTask::Body(Some(Bytes::from_static(b"x")), false),
+            &mut sink,
+            &mut out,
+        );
+        match out.as_slice() {
+            [HttpTask::Body(Some(d0), false), HttpTask::Body(Some(d1), false), HttpTask::Body(Some(d2), false)] =>
+            {
+                assert_eq!(d0.as_ref(), b"x");
+                assert_eq!(d1.as_ref(), b"a");
+                assert_eq!(d2.as_ref(), b"b");
+            }
+            other => panic!("unexpected sequence: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eos_body_with_payload_migrates_flag_to_last_chunk() {
+        // This is Critical 1's exact shape: `Body(Some(data), true)` is the
+        // normal single-read last-chunk shape on both H1 and H2, not an edge
+        // case. The original must lose its `true` and gain a `false`, and
+        // exactly one chunk -- the LAST one -- must carry `true` instead.
+        let mut sink = sink_with(&[b"a", b"b"]);
+        let mut out = Vec::new();
+        drain_emitted_chunks(
+            HttpTask::Body(Some(Bytes::from_static(b"x")), true),
+            &mut sink,
+            &mut out,
+        );
+        match out.as_slice() {
+            [HttpTask::Body(Some(d0), false), HttpTask::Body(Some(d1), false), HttpTask::Body(Some(d2), true)] =>
+            {
+                assert_eq!(d0.as_ref(), b"x");
+                assert_eq!(d1.as_ref(), b"a");
+                assert_eq!(d2.as_ref(), b"b");
+            }
+            other => panic!("unexpected sequence: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_eos_marker_is_dropped_and_last_chunk_carries_its_meaning() {
+        // `Body(None, true)` is a pure end-of-stream signal with no payload
+        // of its own: emitting it AND a migrated last chunk would still be
+        // two end-of-stream signals for the cache to choke on, so it must
+        // not appear in the output at all.
+        let mut sink = sink_with(&[b"a", b"b"]);
+        let mut out = Vec::new();
+        drain_emitted_chunks(HttpTask::Body(None, true), &mut sink, &mut out);
+        match out.as_slice() {
+            [HttpTask::Body(Some(d0), false), HttpTask::Body(Some(d1), true)] => {
+                assert_eq!(d0.as_ref(), b"a");
+                assert_eq!(d1.as_ref(), b"b");
+            }
+            other => panic!("unexpected sequence: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upgraded_body_chunks_stay_tagged_upgraded_body() {
+        // `Session::write_response_tasks` picks the raw post-upgrade duplex
+        // write path off this tag; mistagging a chunk as plain `Body` would
+        // misroute its bytes on an upgraded (e.g. WebSocket) connection.
+        let mut sink = sink_with(&[b"a"]);
+        let mut out = Vec::new();
+        drain_emitted_chunks(
+            HttpTask::UpgradedBody(Some(Bytes::from_static(b"x")), true),
+            &mut sink,
+            &mut out,
+        );
+        match out.as_slice() {
+            [HttpTask::UpgradedBody(Some(d0), false), HttpTask::UpgradedBody(Some(d1), true)] => {
+                assert_eq!(d0.as_ref(), b"x");
+                assert_eq!(d1.as_ref(), b"a");
+            }
+            other => panic!("unexpected sequence: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_body_task_with_a_nonempty_sink_still_drains_every_chunk() {
+        // Defensive: `upstream_response_body_filter` (the sink's only
+        // writer) only ever runs for `Body`/`UpgradedBody` input tasks, so a
+        // non-body task should see an empty sink in practice (see the
+        // `from_cache` guard and the early-return discard this module's
+        // callers apply). If it somehow isn't empty, chunks must still be
+        // delivered rather than silently dropped, just without any migrated
+        // end-of-stream (nothing on a `Trailer` to migrate it from).
+        let mut sink = sink_with(&[b"a"]);
+        let mut out = Vec::new();
+        drain_emitted_chunks(HttpTask::Trailer(None), &mut sink, &mut out);
+        match out.as_slice() {
+            [HttpTask::Trailer(None), HttpTask::Body(Some(d), false)] => {
+                assert_eq!(d.as_ref(), b"a");
+            }
+            other => panic!("unexpected sequence: {other:?}"),
         }
     }
 }

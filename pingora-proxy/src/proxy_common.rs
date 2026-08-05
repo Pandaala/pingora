@@ -435,6 +435,82 @@ pub(crate) fn warn_terminate_without_response(session: &Session, hook: &str) {
     }
 }
 
+/// Response-body variant of [`warn_terminate_without_response`]: diagnoses
+/// only the "nothing written" misuse, not an "unfinished body".
+///
+/// The two contracts differ. A request-body terminate (the callers of
+/// [`warn_terminate_without_response`] above) requires the application to
+/// have *finished* the downstream response itself before returning
+/// `Terminate` -- an unfinished body there really is a contract violation.
+/// A response-body terminate (`upstream_response_body_filter` returning via
+/// [`ResponseBodySink::terminate`]) instead fires *from inside* the pump
+/// while it is still mid-body: a header (and normally some body) has already
+/// been written but is never expected to be finished by anything other than
+/// the pump's own `finish_terminated_response`, called on the very next line
+/// after this warning. So `response_body_finished() == Some(false)` is not a
+/// symptom of misuse here -- it is true on *every* response-body terminate,
+/// by construction, which would make the "unfinished body" warning
+/// permanently and spuriously true and teach operators to ignore it.
+pub(crate) fn warn_response_body_terminate_without_response(session: &Session, hook: &str) {
+    if session.response_written().is_none() {
+        warn!(
+            "{hook} returned Terminate without a downstream response having been \
+             written; the client will see a bare connection close"
+        );
+    }
+}
+
+/// Diagnoses [`ResponseBodySink::terminate`](crate::ResponseBodySink::terminate)
+/// firing while the committed downstream response still declares
+/// `content-length`.
+///
+/// The precondition a terminating processor must satisfy (design doc §3.3):
+/// it already declares `changes_body_length() == true`, so
+/// `enforce_stream_processor_framing` (Edgion-side) strips `content-length`
+/// before the response header is written. Nothing on either side of the seam
+/// enforced that declaration until this guard -- a processor that forgets it
+/// commits a response that is about to end short of the promised length,
+/// which h1's `write_body` framing turns into bytes-fewer-than-declared: the
+/// client reads that as a broken connection, not a normal end of stream.
+///
+/// This is a diagnostic, not a refusal. Two things make refusing the
+/// terminate here both structurally awkward and only partially effective:
+/// [`ResponseBodySink::terminate`](crate::ResponseBodySink::terminate) is
+/// deliberately sticky (`reset_batch` does not clear it -- see
+/// `response_body_sink.rs`), so by the time this check runs the decision to
+/// end the response is already the sink's permanent state, not a one-shot
+/// signal that can be "un-set" for this batch alone; and any extra chunks the
+/// same processor pushed into the sink this batch were already written
+/// downstream by `write_response_tasks` before this check ever runs, so
+/// refusing could not undo that half of the leak regardless. Terminate exists
+/// specifically to stop paying for upstream bytes nobody wants (the AI quota
+/// use case this shipped for), so silently keeping the stream open instead of
+/// warning would trade a diagnosable protocol issue for an undiagnosed
+/// ongoing cost, on a path this guard expects to be dead code in practice --
+/// every processor shipped today already declares `changes_body_length()`
+/// correctly.
+pub(crate) fn warn_response_body_terminate_content_length_leak(session: &Session, hook: &str) {
+    let Some(header) = session.response_written() else {
+        return;
+    };
+    if header.headers.contains_key(http::header::CONTENT_LENGTH) {
+        // Same data-plane-reachable rule as `bodyless_contract_violation` above
+        // (proxy_common.rs:316-326): the trigger is an application-contract
+        // violation, but a single mis-declaring processor puts any client
+        // request that reaches the terminate condition (for this fork's
+        // gateway consumer, any client that deliberately exhausts its own
+        // quota) on this path, so no `debug_assert!`/`panic!` here -- do not
+        // re-add one.
+        warn!(
+            "{hook} terminated a response whose committed headers still declare \
+             content-length; the client will see fewer bytes than promised and read \
+             it as a transport failure rather than a clean end of stream. The \
+             terminating response-body processor must declare \
+             changes_body_length() == true."
+        );
+    }
+}
+
 /// Flush and close whatever downstream response the application wrote before
 /// returning [`RequestBodyAction::Terminate`].
 ///

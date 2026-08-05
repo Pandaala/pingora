@@ -20,7 +20,7 @@ use pingora_core::{
     },
     ImmutStr,
 };
-use proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
+use proxy_cache::{drain_emitted_chunks, range_filter::RangeBodyFilter, ServeFromCache};
 use proxy_common::{no_downstream_body_to_read, DownstreamStateMachine, ResponseStateMachine};
 use tokio::sync::oneshot;
 
@@ -334,6 +334,11 @@ where
         // use cache when upstream revalidates (or TODO: error)
         let mut serve_from_cache = ServeFromCache::new();
         let mut range_body_filter = proxy_cache::range_filter::RangeBodyFilter::new();
+        // Shared across every batch drained from upstream for this response;
+        // the per-batch byte budget is reset at each batch boundary (see
+        // `ResponseBodySink::reset_batch`), but a `terminate()` signal stays
+        // sticky for the rest of this response.
+        let mut sink = ResponseBodySink::new();
 
         let mut upstream_custom = true;
         let mut downstream_custom = true;
@@ -411,6 +416,7 @@ where
 
                         /* run filters before sending to downstream */
                         let mut filtered_tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
+                        sink.reset_batch();
                         for mut t in tasks {
                             if self.revalidate_or_stale(session, &mut t, ctx).await {
                                 serve_from_cache.enable();
@@ -426,13 +432,50 @@ where
                                     return Err(e);
                                 }
                             }
-                            filtered_tasks.push(
-                                self.custom_response_filter(session, t, ctx,
-                                    &mut serve_from_cache,
-                                    &mut range_body_filter, false).await?);
+                            self.custom_response_filter(session, t, ctx,
+                                &mut serve_from_cache,
+                                &mut range_body_filter, false,
+                                &mut sink, &mut filtered_tasks).await?;
                             if serve_from_cache.is_miss_header() {
                                 response_state.enable_cached_response();
                             }
+                            if sink.is_terminated() {
+                                // Stop draining this batch right here: later
+                                // tasks in `tasks` are upstream data the
+                                // filter never saw. Matches the h1/h2 pumps;
+                                // the check right below fails the whole
+                                // exchange closed regardless, but there is no
+                                // reason to keep running the filter over data
+                                // that can never reach the client.
+                                break;
+                            }
+                        }
+
+                        if sink.is_terminated() {
+                            // The custom pump has its own join structure and
+                            // implements no terminate propagation; fail closed
+                            // instead of diverging silently, and do it before
+                            // writing anything downstream (matches the h1/h2
+                            // pumps' write-then-check fix for the same
+                            // reason: writing first and only then failing
+                            // closed can hand the client bytes that were
+                            // never supposed to be committed to, and -- when
+                            // `serve_from_cache.is_on()` -- can race a
+                            // concurrently-streaming cache readback the same
+                            // way the h1/h2 cache-streaming fix addressed).
+                            // Checking here, unconditionally, also makes the
+                            // `serve_from_cache` arm below never observe
+                            // `sink.is_terminated()` for this response: that
+                            // arm cannot itself set the flag (it never runs
+                            // `upstream_filter`), and this arm always returns
+                            // before yielding back to `select!` once the flag
+                            // is set, so there is no separate check needed
+                            // there. Mirrors the request-body terminate
+                            // decision in this file.
+                            return Error::e_explain(
+                                InternalError,
+                                "response-body terminate is not supported on custom connector sessions",
+                            );
                         }
 
                         if !serve_from_cache.should_send_to_downstream() {
@@ -458,10 +501,12 @@ where
 
                 task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter, upgraded),
                     if !response_state.cached_done() && !downstream_state.is_errored() && serve_from_cache.is_on() => {
-                    let task = self.custom_response_filter(session, task?, ctx,
+                    let mut cached_tasks = Vec::with_capacity(1);
+                    self.custom_response_filter(session, task?, ctx,
                         &mut serve_from_cache,
-                        &mut range_body_filter, true).await?;
-                    match session.write_response_tasks(vec![task]).await {
+                        &mut range_body_filter, true,
+                        &mut sink, &mut cached_tasks).await?;
+                    match session.write_response_tasks(cached_tasks).await {
                         Ok(b) => response_state.maybe_set_cache_done(b),
                         Err(e) => if serve_from_cache.is_miss() {
                             // give up writing to downstream but wait for upstream cache write to finish
@@ -477,6 +522,15 @@ where
                             return Err(e);
                         }
                     }
+                    // No `sink.is_terminated()` check here (unlike the arm
+                    // above): this arm never runs `upstream_filter` (the only
+                    // thing that can call `sink.terminate()`), so it cannot
+                    // originate a new terminate, and it cannot observe one
+                    // set by an earlier `task = rx.recv()` iteration either
+                    // -- that arm's own check runs immediately after its
+                    // per-task loop and always returns before this pump ever
+                    // yields back to `select!`, so a terminated response
+                    // never survives to give this arm a turn.
                     if response_state.cached_done() {
                         if let Err(e) = session.cache.finish_hit_handler().await {
                             warn!("Error during finish_hit_handler: {}", e);
@@ -562,43 +616,42 @@ where
         serve_from_cache: &mut ServeFromCache,
         range_body_filter: &mut RangeBodyFilter,
         from_cache: bool, // are the task from cache already
-    ) -> Result<HttpTask>
+        sink: &mut ResponseBodySink,
+        out_tasks: &mut Vec<HttpTask>,
+    ) -> Result<()>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
         if !from_cache {
-            self.upstream_filter(session, &mut task, ctx).await?;
+            self.upstream_filter(session, &mut task, sink, ctx).await?;
 
-            // cache the original response before any downstream transformation
-            // requests that bypassed cache still need to run filters to see if the response has become cacheable
-            if session.cache.enabled() || session.cache.bypassing() {
-                if let Err(e) = self
-                    .cache_http_task(session, &task, ctx, serve_from_cache)
-                    .await
-                {
-                    session.cache.disable(NoCacheReason::StorageError);
-                    if serve_from_cache.is_miss_body() {
-                        // if the response stream cache body during miss but write fails, it has to
-                        // give up the entire request
-                        return Err(e);
-                    } else {
-                        // otherwise, continue processing the response
-                        warn!(
-                            "Fail to cache response: {}, {}",
-                            e,
-                            self.inner.request_summary(session, ctx)
-                        );
-                    }
-                }
-            }
+            // Cache the original response (and anything the upstream body
+            // filter queued in `sink` after it) before any downstream
+            // transformation. Requests that bypassed cache still need to run
+            // filters to see if the response has become cacheable.
+            self.cache_task_and_emitted_chunks(session, &task, sink, ctx, serve_from_cache)
+                .await?;
+
             // skip the downstream filtering if these tasks are just for cache admission
             if !serve_from_cache.should_send_to_downstream() {
-                return Ok(task);
+                // The batch this task belongs to is discarded by the pump
+                // below (`continue`, never `write_response_tasks`), so any
+                // chunks this task's filter queued must be discarded here
+                // too: left queued, they would either be mis-attributed to a
+                // LATER task in the same batch (cached a second time, out of
+                // place) once that task's own terminal drain runs, or leak
+                // into the separate serve-from-cache arm, which reuses this
+                // same `sink` for the rest of the response and must never
+                // emit chunks it did not itself produce (see the `from_cache`
+                // guard at the end of this function).
+                sink.take_extra();
+                out_tasks.push(task);
+                return Ok(());
             }
         } // else: cached/local response, no need to trigger upstream filters and caching
 
-        match task {
+        let res: Result<HttpTask> = match task {
             HttpTask::Header(mut header, eos) => {
                 /* Downstream revalidation, only needed when cache is on because otherwise origin
                  * will handle it */
@@ -691,7 +744,26 @@ where
             }
             HttpTask::Done => Ok(task),
             HttpTask::Failed(_) => Ok(task), // Do nothing just pass the error down
+        };
+        let task = res?;
+        if from_cache {
+            // The cache-serving pump arm shares this `sink` with the
+            // upstream-batch arm across the whole response, but never itself
+            // runs the upstream body filter that fills it (`upstream_filter`
+            // is only called above, inside `if !from_cache`). Anything still
+            // queued here belongs to an earlier upstream-batch call within
+            // this same response and must not be replayed into a cache-hit
+            // task -- see the `sink.take_extra()` discard on the early-return
+            // path above for where that would otherwise leak from.
+            out_tasks.push(task);
+        } else {
+            // Extra chunks emitted by the upstream body filter follow the
+            // chunk they were emitted from, preserving order; `task`'s own
+            // end-of-stream flag migrates onto the last of them when there
+            // are any (see `drain_emitted_chunks`).
+            drain_emitted_chunks(task, sink, out_tasks);
         }
+        Ok(())
     }
 
     async fn send_body_to_custom(

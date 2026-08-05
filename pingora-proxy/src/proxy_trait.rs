@@ -577,13 +577,21 @@ pub trait ProxyHttp {
     ///
     /// This function will be called every time a piece of response body is received. The `body` is
     /// **not the entire response body**.
-    fn upstream_response_body_filter(
+    ///
+    /// Mutate `body` in place for the common one-in-one-out case. To emit
+    /// *additional* chunks, or to end the response early, use `sink`. The
+    /// sink's byte budget is per pump batch; see [`crate::ResponseBodySink`].
+    async fn upstream_response_body_filter(
         &self,
         _session: &mut Session,
         _body: &mut Option<Bytes>,
         _end_of_stream: bool,
+        _sink: &mut ResponseBodySink,
         _ctx: &mut Self::CTX,
-    ) -> Result<Option<Duration>> {
+    ) -> Result<Option<Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
         Ok(None)
     }
 

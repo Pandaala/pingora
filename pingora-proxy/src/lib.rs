@@ -85,6 +85,7 @@ mod proxy_h1;
 mod proxy_h2;
 mod proxy_purge;
 mod proxy_trait;
+mod response_body_sink;
 pub mod subrequest;
 
 use subrequest::{BodyMode, Ctx as SubrequestCtx};
@@ -92,6 +93,7 @@ use subrequest::{BodyMode, Ctx as SubrequestCtx};
 pub use proxy_cache::range_filter::{range_header_filter, MultiRangeInfo, RangeType};
 pub use proxy_purge::PurgeStatus;
 pub use proxy_trait::{FailToProxy, ProxyHttp, RequestBodyAction, UpstreamRequestBodyDisposition};
+pub use response_body_sink::{ResponseBodySink, RESPONSE_BODY_EMIT_BUDGET};
 
 pub mod prelude {
     pub use crate::{
@@ -381,6 +383,7 @@ where
         &self,
         session: &mut Session,
         task: &mut HttpTask,
+        sink: &mut ResponseBodySink,
         ctx: &mut SV::CTX,
     ) -> Result<Option<Duration>>
     where
@@ -394,9 +397,11 @@ where
                     .await?;
                 None
             }
-            HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => self
-                .inner
-                .upstream_response_body_filter(session, data, *eos, ctx)?,
+            HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => {
+                self.inner
+                    .upstream_response_body_filter(session, data, *eos, sink, ctx)
+                    .await?
+            }
             HttpTask::Trailer(Some(trailers)) => {
                 self.inner
                     .upstream_response_trailer_filter(session, trailers, ctx)?;
