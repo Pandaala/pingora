@@ -69,6 +69,18 @@
 //! the full argument, including why the caller may only consult this once a
 //! read has actually failed.
 //!
+//! # Dependency on the HTTP/2 stream identifier rules
+//!
+//! [`FrameScanner`] caches a small, fixed number of resolved records keyed by
+//! stream id so that a run of DATA frames does not have to re-lock the shared
+//! map. That is only sound because RFC 9113 §5.1.1 forbids reusing a stream
+//! identifier on a connection: an id names at most one stream for the lifetime
+//! of that connection, so a cached `Arc<StreamRecord>` can never start
+//! referring to a different stream than the one the scanner resolved it for.
+//! Anything that would make ids repeat -- a per-connection id reset, a scanner
+//! shared across connections -- invalidates the cache, not just its
+//! performance.
+//!
 //! # Dependency on `h2` internals
 //!
 //! VERIFIED AGAINST h2 0.4.15 (the version this workspace pins in
@@ -112,10 +124,11 @@ const FLAG_PADDED: u8 = 0x8;
 /// END_STREAM before anything tore that stream down, and how many DATA payload
 /// bytes it vouched for on the way there.
 ///
-/// Both fields stop changing the instant the stream's outcome is decided, i.e.
-/// the instant the entry leaves [`EndStreamWatch::pending`]. Publication is by
-/// the `Release` store on `end_stream`, which is the only field a reader is
-/// allowed to consult first.
+/// Once `end_stream` becomes true, both fields stop changing. A scanner cache
+/// may still add irrelevant bytes to a forgotten, unpublished record, but a
+/// terminal event cannot publish that record after its pending-map entry is
+/// gone. Publication is by the `Release` store on `end_stream`, which is the
+/// only field a reader is allowed to consult first.
 #[derive(Debug, Default)]
 pub(crate) struct StreamRecord {
     /// Set at most once, never cleared.
@@ -146,7 +159,7 @@ impl StreamRecord {
     /// the dropping.
     pub fn vouches_for(&self, body_recv: usize) -> bool {
         // `Acquire` pairs with the `Release` store in
-        // `EndStreamWatch::note_end_stream`, which happens after every
+        // `EndStreamWatch::publish`, which happens after every
         // `data_bytes` update for this stream and under the same lock that
         // removes the entry -- so once this load sees `true`, the count below
         // is final.
@@ -168,6 +181,9 @@ pub(crate) struct EndStreamWatch {
     /// Entries are removed as soon as their outcome is decided, which bounds
     /// this to the streams actually open on the connection.
     pending: Mutex<HashMap<u32, Arc<StreamRecord>>>,
+    /// Changes whenever application-side `forget` removes a live entry, so the
+    /// scanner can lazily discard stale cache entries once per read batch.
+    forget_generation: AtomicUsize,
 }
 
 impl EndStreamWatch {
@@ -211,7 +227,9 @@ impl EndStreamWatch {
     /// long-lived connection does not accumulate entries for streams whose
     /// outcome was never decided on the wire.
     pub fn forget(&self, stream_id: u32) {
-        self.pending.lock().remove(&stream_id);
+        if self.pending.lock().remove(&stream_id).is_some() {
+            self.forget_generation.fetch_add(1, Ordering::Release);
+        }
     }
 
     /// The peer put `payload_bytes` of DATA payload on the wire for
@@ -221,8 +239,8 @@ impl EndStreamWatch {
     /// field and the padding itself are excluded, because `h2` excludes them
     /// too (`frame::Data::payload()` is what ends up in `pending_recv`).
     ///
-    /// A stream whose outcome is already decided has no entry left, so nothing
-    /// after a teardown or after END_STREAM can inflate the count.
+    /// This is the uncached path. A stream whose outcome is already decided has
+    /// no entry left, so this path cannot inflate its count.
     fn note_data(&self, stream_id: u32, payload_bytes: usize) {
         if payload_bytes == 0 {
             return;
@@ -234,17 +252,44 @@ impl EndStreamWatch {
         }
     }
 
-    /// The peer flagged END_STREAM for `stream_id`.
+    /// Resolve a live stream for the scanner's bounded DATA fast path.
+    fn data_record(&self, stream_id: u32) -> Option<Arc<StreamRecord>> {
+        self.pending.lock().get(&stream_id).cloned()
+    }
+
+    fn cached_streams_live(&self, stream_ids: [Option<u32>; 2]) -> [bool; 2] {
+        let pending = self.pending.lock();
+        stream_ids.map(|stream_id| stream_id.is_some_and(|id| pending.contains_key(&id)))
+    }
+
+    /// Finalize `stream_id`: count `payload_bytes` from the terminal frame and
+    /// publish END_STREAM, in one map critical section.
     ///
-    /// The entry is removed at the same time, so a later teardown cannot
+    /// Keeping the terminal frame together matters both for performance (one
+    /// mutex acquisition and lookup instead of two) and publication ordering:
+    /// the payload count is updated before the `Release` store makes
+    /// END_STREAM observable to the application.
+    ///
+    /// The entry is removed as it is published, so a later teardown cannot
     /// retract the record -- and, symmetrically, a teardown seen FIRST removes
     /// the entry so that a later END_STREAM (which would be a protocol
-    /// violation) cannot set it. Removal is also what freezes `data_bytes`:
-    /// after this returns, no `note_data` can find the stream.
-    fn note_end_stream(&self, stream_id: u32) {
+    /// violation) cannot set it. The same removal is what makes an application
+    /// `forget` that won the race win it for good.
+    ///
+    /// This is the ONLY place `end_stream` is ever stored. Removal alone no
+    /// longer freezes `data_bytes`, so the returned [`EndStreamPublished`] must
+    /// be handed to [`FrameScanner::drop_cache_after_publish`] before anything
+    /// else touches the wire.
+    fn publish(&self, stream_id: u32, payload_bytes: usize) -> EndStreamPublished {
         if let Some(record) = self.pending.lock().remove(&stream_id) {
+            if payload_bytes != 0 {
+                record
+                    .data_bytes
+                    .fetch_add(payload_bytes, Ordering::Relaxed);
+            }
             record.end_stream.store(true, Ordering::Release);
         }
+        EndStreamPublished(stream_id)
     }
 
     /// The peer tore down `stream_id` without having flagged END_STREAM.
@@ -271,6 +316,19 @@ impl EndStreamWatch {
         self.pending.lock().retain(|id, _| *id <= last_stream_id);
     }
 }
+
+/// Evidence that [`EndStreamWatch::publish`] ran for a stream, carrying the id
+/// whose scanner cache still has to be dropped.
+///
+/// Publication freezes a record for readers, but only for as long as nothing
+/// keeps writing to it. A cache entry that outlived the `Release` store would
+/// let a later (protocol-violating) frame move `data_bytes` after
+/// [`StreamRecord::vouches_for`] may already have returned `true`. Making the
+/// publication hand back a `#[must_use]` value that only
+/// [`FrameScanner::drop_cache_after_publish`] consumes turns "remember to clear
+/// the cache too" from a comment into something the compiler asks about.
+#[must_use = "publishing END_STREAM must be paired with dropping the scanner cache for that stream"]
+struct EndStreamPublished(u32);
 
 /// Exclusive access to the registration map, held across `h2`'s stream id
 /// allocation. See [`EndStreamWatch::registration`].
@@ -305,6 +363,38 @@ struct FrameScanner {
     /// Length field -- the first payload byte -- has been read. Only then is
     /// the frame's application payload size known.
     padded_data: Option<PaddedData>,
+    /// The last two live streams resolved for non-terminal DATA frames. H2
+    /// stream ids are never reused on a connection, so repeated frames for a
+    /// cached id can update its record without consulting the shared map.
+    ///
+    /// Two is the smallest bound that avoids penalizing the basic multiplexed
+    /// alternating-stream case. A concurrent application `forget` may leave
+    /// an Arc alive and receive irrelevant byte increments, but every terminal
+    /// event still consults the shared map before it can publish END_STREAM.
+    ///
+    /// Slots are claimed by liveness, not recency: a slot is released only when
+    /// its stream ends, is reset, is excluded by a GOAWAY, or is forgotten.
+    /// Two live but idle streams therefore pin both slots and every other
+    /// stream keeps paying the borrowed map lookup for as long as they stay
+    /// open -- plus four predictable branches for the slot scan. That worst
+    /// case is deliberate: it is measured by the benchmark's
+    /// `pinned_slots_1024_frames` pair, and evicting by recency instead would
+    /// reintroduce the per-frame `Arc` clone/drop churn that the fixed bound
+    /// exists to avoid.
+    data_records: [Option<CachedRecord>; 2],
+    forget_generation: usize,
+    /// Benchmark-only A/B switch; never present in production builds.
+    #[cfg(test)]
+    data_cache_disabled: bool,
+    /// Benchmark-only Candidate A switch; never present in production builds.
+    #[cfg(test)]
+    terminal_data_combining_disabled: bool,
+}
+
+#[derive(Debug)]
+struct CachedRecord {
+    stream_id: u32,
+    record: Arc<StreamRecord>,
 }
 
 /// A PADDED DATA frame whose Pad Length field has not been seen yet.
@@ -345,7 +435,124 @@ impl LastStreamId {
 }
 
 impl FrameScanner {
+    fn discard_forgotten_data_records(&mut self, watch: &EndStreamWatch) {
+        let generation = watch.forget_generation.load(Ordering::Acquire);
+        if generation == self.forget_generation {
+            return;
+        }
+
+        let stream_ids = self
+            .data_records
+            .each_ref()
+            .map(|cached| cached.as_ref().map(|cached| cached.stream_id));
+        let live = watch.cached_streams_live(stream_ids);
+        for (cached, live) in self.data_records.iter_mut().zip(live) {
+            if !live {
+                *cached = None;
+            }
+        }
+        self.forget_generation = generation;
+    }
+
+    /// Account for non-terminal DATA, using the bounded two-entry cache for
+    /// repeated or alternating frames from recently active streams.
+    fn note_data(&mut self, stream_id: u32, payload_bytes: usize, watch: &EndStreamWatch) {
+        if payload_bytes == 0 {
+            return;
+        }
+
+        #[cfg(test)]
+        if self.data_cache_disabled {
+            watch.note_data(stream_id, payload_bytes);
+            return;
+        }
+
+        if let Some(cached) = self
+            .data_records
+            .iter()
+            .flatten()
+            .find(|cached| cached.stream_id == stream_id)
+        {
+            cached
+                .record
+                .data_bytes
+                .fetch_add(payload_bytes, Ordering::Relaxed);
+            return;
+        }
+
+        if let Some(slot) = self.data_records.iter().position(Option::is_none) {
+            if let Some(record) = watch.data_record(stream_id) {
+                self.data_records[slot] = Some(CachedRecord { stream_id, record });
+                self.data_records[slot]
+                    .as_ref()
+                    .unwrap()
+                    .record
+                    .data_bytes
+                    .fetch_add(payload_bytes, Ordering::Relaxed);
+            }
+        } else {
+            // Do not churn Arcs when more streams are interleaved than the
+            // fixed cache can hold. The uncached stream keeps the original
+            // one-lock borrowed lookup path until a slot becomes available.
+            watch.note_data(stream_id, payload_bytes);
+        }
+    }
+
+    fn clear_data_state(&mut self, stream_id: u32) {
+        for cached in &mut self.data_records {
+            if cached
+                .as_ref()
+                .is_some_and(|cached| cached.stream_id == stream_id)
+            {
+                *cached = None;
+            }
+        }
+    }
+
+    /// Consume the evidence that a stream was published by dropping the cache
+    /// entry the publication froze. See [`EndStreamPublished`].
+    fn drop_cache_after_publish(&mut self, published: EndStreamPublished) {
+        self.clear_data_state(published.0);
+    }
+
+    /// Publish END_STREAM for `stream_id` -- counting `payload_bytes` from the
+    /// same frame first -- and drop the scanner's cache for it.
+    ///
+    /// This is the only publication path. Publication still goes through the
+    /// shared table, so an application `forget` or a wire teardown that won the
+    /// race prevents it even when the cache is warm.
+    fn publish_end_stream(&mut self, stream_id: u32, payload_bytes: usize, watch: &EndStreamWatch) {
+        #[cfg(test)]
+        if self.terminal_data_combining_disabled {
+            // Candidate A's former two-lock sequence, kept for the benchmark's
+            // A/B control only.
+            watch.note_data(stream_id, payload_bytes);
+            let published = watch.publish(stream_id, 0);
+            self.drop_cache_after_publish(published);
+            return;
+        }
+
+        let published = watch.publish(stream_id, payload_bytes);
+        self.drop_cache_after_publish(published);
+    }
+
+    /// Route one DATA frame to the cached counting path or to publication.
+    fn note_data_frame(
+        &mut self,
+        stream_id: u32,
+        payload_bytes: usize,
+        end_stream: bool,
+        watch: &EndStreamWatch,
+    ) {
+        if end_stream {
+            self.publish_end_stream(stream_id, payload_bytes, watch);
+        } else {
+            self.note_data(stream_id, payload_bytes, watch);
+        }
+    }
+
     fn scan(&mut self, mut bytes: &[u8], watch: &EndStreamWatch) {
+        self.discard_forgotten_data_records(watch);
         while !bytes.is_empty() {
             if self.payload_left > 0 {
                 let skip = self.payload_left.min(bytes.len());
@@ -362,10 +569,7 @@ impl FrameScanner {
                     // is both safe and the conservative direction: undercounting
                     // makes the record fail the equality check, never pass it.
                     let data_len = padded.payload_len.saturating_sub(1 + pad_len);
-                    watch.note_data(padded.stream_id, data_len);
-                    if padded.end_stream {
-                        watch.note_end_stream(padded.stream_id);
-                    }
+                    self.note_data_frame(padded.stream_id, data_len, padded.end_stream, watch);
                 }
                 self.payload_left -= skip;
                 bytes = &bytes[skip..];
@@ -422,23 +626,21 @@ impl FrameScanner {
                         // answers with a connection error and never delivers the
                         // frame. Its END_STREAM flag (if set) signals no valid
                         // end-of-body, so record neither the bytes nor the flag
-                        // -- deliberately NOT falling through to `note_end_stream`
-                        // below.
+                        // -- deliberately NOT falling through to
+                        // `publish_end_stream`.
                     } else {
-                        // Counted BEFORE the flag: `note_end_stream` evicts the
-                        // entry `note_data` writes to.
-                        watch.note_data(stream_id, self.payload_left);
-                        if end_stream {
-                            watch.note_end_stream(stream_id);
-                        }
+                        self.note_data_frame(stream_id, self.payload_left, end_stream, watch);
                     }
                 }
                 FRAME_TYPE_HEADERS if flags & FLAG_END_STREAM != 0 => {
                     // Trailers ending the response. They carry no body bytes,
                     // so the count stands as the DATA frames left it.
-                    watch.note_end_stream(stream_id);
+                    self.publish_end_stream(stream_id, 0, watch);
                 }
-                FRAME_TYPE_RST_STREAM => watch.note_stream_torn_down(stream_id),
+                FRAME_TYPE_RST_STREAM => {
+                    watch.note_stream_torn_down(stream_id);
+                    self.clear_data_state(stream_id);
+                }
                 FRAME_TYPE_GOAWAY => {
                     self.goaway = Some(LastStreamId::default());
                     if self.payload_left == 0 {
@@ -459,7 +661,16 @@ impl FrameScanner {
     /// GOAWAY.
     fn finish_goaway(&mut self, watch: &EndStreamWatch) {
         if let Some(goaway) = self.goaway.take() {
-            watch.note_connection_torn_down(goaway.get().unwrap_or(0));
+            let last_stream_id = goaway.get().unwrap_or(0);
+            watch.note_connection_torn_down(last_stream_id);
+            for cached in &mut self.data_records {
+                if cached
+                    .as_ref()
+                    .is_some_and(|cached| cached.stream_id > last_stream_id)
+                {
+                    *cached = None;
+                }
+            }
         }
     }
 }
@@ -541,7 +752,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EndStreamWatchStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
 
     fn frame(frame_type: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
         let len = payload.len() as u32;
@@ -976,5 +1188,753 @@ mod tests {
             scanner.scan(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, id, b"x"), &watch);
         }
         assert!(watch.pending.lock().is_empty());
+    }
+
+    #[test]
+    fn forget_prevents_publication_with_a_warm_cache() {
+        let watch = EndStreamWatch::default();
+        let record = watch.register(1);
+        let mut scanner = FrameScanner::default();
+
+        let mut warmup = frame(FRAME_TYPE_DATA, 0, 1, b"be");
+        warmup.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, 1, b"fo"));
+        warmup.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, 1, b"re"));
+        scanner.scan(&warmup, &watch);
+        watch.forget(1);
+        scanner.scan(
+            &frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"after"),
+            &watch,
+        );
+
+        assert!(!record.end_stream_observed());
+        assert!(!record.vouches_for(11));
+    }
+
+    #[test]
+    fn a_cached_record_is_frozen_after_end_stream() {
+        let watch = EndStreamWatch::default();
+        let record = watch.register(1);
+        let mut scanner = FrameScanner::default();
+        let mut wire = frame(FRAME_TYPE_DATA, 0, 1, b"a");
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, 1, b"b"));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, 1, b"x"));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"c"));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, 1, b"invalid"));
+        scanner.scan(&wire, &watch);
+
+        assert!(record.vouches_for(4));
+        assert!(!record.vouches_for(11));
+    }
+
+    #[test]
+    fn reset_prevents_publication_with_a_warm_cache() {
+        let watch = EndStreamWatch::default();
+        let record = watch.register(1);
+        let mut scanner = FrameScanner::default();
+        let mut wire = frame(FRAME_TYPE_DATA, 0, 1, b"be");
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, 1, b"fo"));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, 1, b"re"));
+        wire.extend_from_slice(&frame(FRAME_TYPE_RST_STREAM, 0, 1, &[0, 0, 0, 0]));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"invalid"));
+        scanner.scan(&wire, &watch);
+
+        assert!(!record.end_stream_observed());
+    }
+
+    #[test]
+    fn end_stream_before_forget_remains_observed_with_a_warm_cache() {
+        let watch = EndStreamWatch::default();
+        let record = watch.register(1);
+        let mut scanner = FrameScanner::default();
+        let mut wire = frame(FRAME_TYPE_DATA, 0, 1, b"a");
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, 1, b"b"));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"c"));
+        scanner.scan(&wire, &watch);
+        watch.forget(1);
+
+        assert!(record.vouches_for(3));
+    }
+
+    #[test]
+    fn goaway_prunes_only_excluded_cached_records() {
+        let watch = EndStreamWatch::default();
+        let kept = watch.register(1);
+        let excluded = watch.register(3);
+        let mut scanner = FrameScanner::default();
+        let mut wire = frame(FRAME_TYPE_DATA, 0, 1, b"a");
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, 3, b"b"));
+        wire.extend_from_slice(&frame(FRAME_TYPE_GOAWAY, 0, 0, &goaway_payload(1)));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"c"));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b"d"));
+        scanner.scan(&wire, &watch);
+
+        assert!(kept.vouches_for(2));
+        assert!(!excluded.end_stream_observed());
+    }
+
+    #[test]
+    fn interleaved_streams_keep_independent_cached_counts() {
+        let watch = EndStreamWatch::default();
+        let first = watch.register(1);
+        let second = watch.register(3);
+        let mut scanner = FrameScanner::default();
+        let mut wire = frame(FRAME_TYPE_DATA, 0, 1, b"a");
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, 3, b"bb"));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, 1, b"ccc"));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b""));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b""));
+        scanner.scan(&wire, &watch);
+
+        assert!(first.vouches_for(4));
+        assert!(second.vouches_for(2));
+    }
+
+    #[test]
+    fn scanner_cache_retains_at_most_two_forgotten_records() {
+        let watch = EndStreamWatch::default();
+        let mut scanner = FrameScanner::default();
+        let mut records = Vec::new();
+
+        for stream_id in (1..200).step_by(2) {
+            let record = watch.register(stream_id);
+            records.push(Arc::downgrade(&record));
+            let mut wire = frame(FRAME_TYPE_DATA, 0, stream_id, b"a");
+            wire.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, stream_id, b"b"));
+            wire.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, stream_id, b"cached"));
+            scanner.scan(&wire, &watch);
+            watch.forget(stream_id);
+        }
+
+        assert!(watch.pending.lock().is_empty());
+        assert!(
+            records
+                .iter()
+                .filter(|record| record.upgrade().is_some())
+                .count()
+                <= 2
+        );
+    }
+
+    #[test]
+    fn full_cache_reclaims_a_forgotten_record_for_a_new_stream() {
+        let watch = EndStreamWatch::default();
+        let first = watch.register(1);
+        let second = watch.register(3);
+        let first_weak = Arc::downgrade(&first);
+        let second_weak = Arc::downgrade(&second);
+        let mut scanner = FrameScanner::default();
+        let mut warmup = frame(FRAME_TYPE_DATA, 0, 1, b"a");
+        warmup.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, 3, b"b"));
+        scanner.scan(&warmup, &watch);
+        watch.forget(1);
+        watch.forget(3);
+        drop(first);
+        drop(second);
+
+        let replacement = watch.register(5);
+        scanner.scan(&frame(FRAME_TYPE_DATA, 0, 5, b"c"), &watch);
+        assert!(scanner
+            .data_records
+            .iter()
+            .flatten()
+            .any(|cached| cached.stream_id == 5));
+        assert_eq!(
+            [first_weak, second_weak]
+                .iter()
+                .filter(|record| record.upgrade().is_some())
+                .count(),
+            0,
+            "both forgotten slots should have been reclaimed"
+        );
+
+        scanner.scan(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 5, b"d"), &watch);
+        assert!(replacement.vouches_for(2));
+    }
+
+    /// With more live streams than cache slots, the extra ones fall back to the
+    /// borrowed map lookup in `FrameScanner::note_data`'s full-cache branch.
+    /// That branch carries every DATA frame of every stream past the second on
+    /// a multiplexed connection, so its counts must stay exactly as separate as
+    /// the cached ones -- including for the stream that never gets a slot.
+    #[test]
+    fn a_full_cache_still_counts_the_uncached_stream_separately() {
+        let watch = EndStreamWatch::default();
+        let first = watch.register(1);
+        let second = watch.register(3);
+        let third = watch.register(5);
+        let mut scanner = FrameScanner::default();
+
+        // Streams 1 and 3 claim both slots, so every frame for stream 5 misses
+        // a full cache and goes through `EndStreamWatch::note_data`.
+        let mut wire = frame(FRAME_TYPE_DATA, 0, 1, b"a");
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, 3, b"bb"));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, 5, b"ccc"));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, 5, b"dddd"));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, 1, b"e"));
+        scanner.scan(&wire, &watch);
+
+        let cached: Vec<u32> = scanner
+            .data_records
+            .iter()
+            .flatten()
+            .map(|cached| cached.stream_id)
+            .collect();
+        assert_eq!(cached, vec![1, 3], "both slots must be taken by 1 and 3");
+
+        let mut wire = frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 5, b"f");
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b""));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b""));
+        scanner.scan(&wire, &watch);
+
+        assert!(first.vouches_for(2));
+        assert!(second.vouches_for(2));
+        assert!(third.vouches_for(8), "the uncached stream must count 3+4+1");
+        assert!(!third.vouches_for(2));
+    }
+
+    /// The whole two-slot design rests on one claim: a terminal frame ALWAYS
+    /// re-consults the shared map, so an application `forget` wins even while
+    /// the scanner's cache is still warm for that stream. The generation check
+    /// runs once at the top of a read batch, so a `forget` landing after it
+    /// leaves the cache warm for the rest of that batch -- which is precisely
+    /// the window pinned down here.
+    ///
+    /// `forget_prevents_publication_with_a_warm_cache` does NOT cover this: its
+    /// `forget` lands between two `scan` calls, so the next batch's generation
+    /// check has already emptied the slot before the terminal frame arrives.
+    #[test]
+    fn a_mid_batch_forget_still_blocks_a_warm_cache_publication() {
+        let watch = EndStreamWatch::default();
+        let record = watch.register(1);
+        let mut scanner = FrameScanner::default();
+
+        let mut warmup = frame(FRAME_TYPE_DATA, 0, 1, b"be");
+        warmup.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, 1, b"fore"));
+        scanner.scan(&warmup, &watch);
+
+        // Stand in for a batch whose generation check has already run: nothing
+        // will invalidate the slot for the remainder of it.
+        scanner.discard_forgotten_data_records(&watch);
+        watch.forget(1);
+        assert!(
+            scanner
+                .data_records
+                .iter()
+                .flatten()
+                .any(|cached| cached.stream_id == 1),
+            "the cache must still be warm for the window under test"
+        );
+
+        // Stale increments on a forgotten record are tolerated ...
+        scanner.note_data_frame(1, 5, false, &watch);
+        assert_eq!(
+            record.data_bytes.load(Ordering::Relaxed),
+            11,
+            "the stale increment must have reached the record, or this test is \
+             not exercising the warm-cache window it claims to"
+        );
+
+        // ... but the terminal frame must not publish it, and must not add its
+        // own payload to it either: the map lookup is what fails, before any
+        // counting.
+        scanner.note_data_frame(1, 2, true, &watch);
+
+        assert!(!record.end_stream_observed());
+        assert_eq!(record.data_bytes.load(Ordering::Relaxed), 11);
+    }
+
+    /// `Http2Session` forgets on `note_local_reset` and again on `Drop`, so the
+    /// second call routinely finds nothing. It must not advance the generation,
+    /// or every locally reset stream would cost the scanner an extra locked
+    /// liveness sweep on its next read.
+    #[test]
+    fn forgetting_an_absent_stream_does_not_advance_the_generation() {
+        let watch = EndStreamWatch::default();
+        watch.register(1);
+        watch.forget(1);
+        let after_live_removal = watch.forget_generation.load(Ordering::Acquire);
+
+        watch.forget(1);
+        watch.forget(999);
+        assert_eq!(
+            watch.forget_generation.load(Ordering::Acquire),
+            after_live_removal
+        );
+    }
+
+    /// The cache prune lives in `finish_goaway`, which runs when the payload's
+    /// last byte is consumed -- possibly several reads after the header. A warm
+    /// cache must be pruned by the same `last_stream_id` rule whenever that
+    /// lands, not only when the whole frame arrives in one read.
+    #[test]
+    fn a_split_goaway_prunes_a_warm_cache() {
+        for split in 1..16 {
+            let watch = EndStreamWatch::default();
+            let kept = watch.register(1);
+            let excluded = watch.register(3);
+            let mut scanner = FrameScanner::default();
+
+            let mut warmup = frame(FRAME_TYPE_DATA, 0, 1, b"a");
+            warmup.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, 3, b"b"));
+            scanner.scan(&warmup, &watch);
+
+            let mut wire = frame(FRAME_TYPE_GOAWAY, 0, 0, &goaway_payload(1));
+            wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"c"));
+            wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b"d"));
+            for chunk in wire.chunks(split) {
+                scanner.scan(chunk, &watch);
+            }
+
+            assert!(kept.vouches_for(2), "split={split}");
+            assert!(!excluded.end_stream_observed(), "split={split}");
+            assert!(
+                !scanner
+                    .data_records
+                    .iter()
+                    .flatten()
+                    .any(|cached| cached.stream_id == 3),
+                "the excluded stream must not stay cached, split={split}"
+            );
+        }
+    }
+
+    /// A tiny deterministic PRNG, so the differential test below reproduces
+    /// exactly without adding a dev-dependency.
+    struct Xorshift64(u64);
+
+    impl Xorshift64 {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next_u64() % bound as u64) as usize
+        }
+    }
+
+    /// One step of a replayable history. Chopping the wire into explicit chunks
+    /// and interleaving `forget` calls is what lets every scanner configuration
+    /// observe byte-for-byte the same sequence of events.
+    enum Step {
+        Feed(Vec<u8>),
+        Forget(u32),
+    }
+
+    /// Build a randomized but reproducible history: a mix of plain and padded
+    /// DATA (with and without END_STREAM), trailers, RST_STREAM, GOAWAY and an
+    /// ignored frame type, over a small pool of stream ids, split across reads
+    /// at arbitrary offsets with `forget` calls dropped in between.
+    ///
+    /// Returns the steps and the ids to register.
+    fn random_scenario(seed: u64) -> (Vec<Step>, Vec<u32>) {
+        // Mix before forcing the low bit: a bare `seed | 1` would collapse each
+        // even seed onto its odd successor and halve the distinct scenarios.
+        let mut rng = Xorshift64(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let stream_ids: Vec<u32> = (1..=9u32).step_by(2).collect();
+
+        let mut wire = Vec::new();
+        for _ in 0..24 {
+            let stream_id = stream_ids[rng.below(stream_ids.len())];
+            let payload = vec![0x5a; rng.below(6)];
+            match rng.below(10) {
+                0..=5 => {
+                    let flags = if rng.below(4) == 0 {
+                        FLAG_END_STREAM
+                    } else {
+                        0
+                    };
+                    if rng.below(4) == 0 {
+                        let pad = rng.below(4) as u8;
+                        wire.extend_from_slice(&padded_data_frame(flags, stream_id, &payload, pad));
+                    } else {
+                        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, flags, stream_id, &payload));
+                    }
+                }
+                6 => wire.extend_from_slice(&frame(
+                    FRAME_TYPE_HEADERS,
+                    FLAG_END_STREAM | 0x4,
+                    stream_id,
+                    b"\x88",
+                )),
+                7 => wire.extend_from_slice(&frame(FRAME_TYPE_RST_STREAM, 0, stream_id, &[0; 4])),
+                8 => wire.extend_from_slice(&frame(
+                    FRAME_TYPE_GOAWAY,
+                    0,
+                    0,
+                    &goaway_payload(stream_id),
+                )),
+                // CONTINUATION: a type the scanner must skip by length only.
+                _ => wire.extend_from_slice(&frame(0x9, 0, stream_id, &payload)),
+            }
+        }
+
+        let mut steps = Vec::new();
+        let mut rest = wire.as_slice();
+        while !rest.is_empty() {
+            let take = (1 + rng.below(11)).min(rest.len());
+            steps.push(Step::Feed(rest[..take].to_vec()));
+            rest = &rest[take..];
+            if rng.below(6) == 0 {
+                steps.push(Step::Forget(stream_ids[rng.below(stream_ids.len())]));
+            }
+        }
+
+        (steps, stream_ids)
+    }
+
+    /// Replay one history against a fresh watch, returning each registered
+    /// stream's `(end_stream_observed, data_bytes)`.
+    fn replay(steps: &[Step], stream_ids: &[u32], mut scanner: FrameScanner) -> Vec<(bool, usize)> {
+        let watch = EndStreamWatch::default();
+        let records: Vec<_> = stream_ids
+            .iter()
+            .map(|stream_id| watch.register(*stream_id))
+            .collect();
+
+        for step in steps {
+            match step {
+                Step::Feed(chunk) => scanner.scan(chunk, &watch),
+                Step::Forget(stream_id) => watch.forget(*stream_id),
+            }
+        }
+
+        records
+            .iter()
+            .map(|record| {
+                (
+                    record.end_stream_observed(),
+                    record.data_bytes.load(Ordering::Relaxed),
+                )
+            })
+            .collect()
+    }
+
+    /// The scanner cache and the combined terminal path are pure optimizations:
+    /// over ANY frame history they must reach the same verdict as the code they
+    /// replaced. The two benchmark A/B switches make all four configurations
+    /// reachable, so replay one randomized history through each and compare.
+    ///
+    /// `data_bytes` is compared too, not just the published flag. A warm cached
+    /// record CAN legitimately outcount the uncached one, but only for a
+    /// `forget` that lands mid-batch -- and a replayed `Step::Forget` always
+    /// lands on a batch boundary, where the next `scan`'s generation check
+    /// empties the slot before another frame arrives. So the counts must agree
+    /// here, and requiring that is what lets this test see a broken
+    /// `discard_forgotten_data_records`. The genuinely mid-batch window has its
+    /// own test: `a_mid_batch_forget_still_blocks_a_warm_cache_publication`.
+    #[test]
+    fn the_cache_and_the_combined_terminal_path_are_observationally_equivalent() {
+        for seed in 1..=200u64 {
+            let (steps, stream_ids) = random_scenario(seed);
+            let baseline = replay(
+                &steps,
+                &stream_ids,
+                FrameScanner {
+                    data_cache_disabled: true,
+                    terminal_data_combining_disabled: true,
+                    ..FrameScanner::default()
+                },
+            );
+
+            for (name, scanner) in [
+                ("cached+combined", FrameScanner::default()),
+                (
+                    "uncached+combined",
+                    FrameScanner {
+                        data_cache_disabled: true,
+                        ..FrameScanner::default()
+                    },
+                ),
+                (
+                    "cached+legacy-terminal",
+                    FrameScanner {
+                        terminal_data_combining_disabled: true,
+                        ..FrameScanner::default()
+                    },
+                ),
+            ] {
+                let observed = replay(&steps, &stream_ids, scanner);
+                for (index, stream_id) in stream_ids.iter().enumerate() {
+                    assert_eq!(
+                        observed[index].0, baseline[index].0,
+                        "{name}: END_STREAM differs for stream {stream_id} (seed={seed})"
+                    );
+                    assert_eq!(
+                        observed[index].1, baseline[index].1,
+                        "{name}: byte count differs for stream {stream_id} (seed={seed})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Manual release-mode microbenchmark for the incremental scanner cost.
+    ///
+    /// Run with:
+    /// `cargo test -p pingora-core --release benchmark_end_stream_watch -- \
+    ///     --ignored --nocapture --test-threads=1`
+    ///
+    /// This deliberately lives beside the private scanner instead of exposing
+    /// benchmark-only production API.
+    ///
+    /// What is inside the timed region, so the numbers are read correctly:
+    ///
+    /// - The single-stream workloads register one stream PER ITERATION, because
+    ///   their wire ends in END_STREAM and publication evicts the entry. So one
+    ///   `register` (a lock, a HashMap insert and the one `Arc<StreamRecord>`
+    ///   allocation) is amortized over that workload's frames. `headers_end`
+    ///   isolates that floor: it exercises neither DATA optimization, so all
+    ///   variants there measure registration plus frame parsing and nothing
+    ///   else. Subtract it to read the per-request DATA saving in absolute
+    ///   terms.
+    /// - The multi-stream workloads (`alternating_*`, `round_robin_*`) carry no
+    ///   terminal frame and register their streams ONCE, outside the timed
+    ///   region. Registration there would scale with the stream count and
+    ///   dilute exactly the difference being measured. They therefore report
+    ///   steady-state per-frame cost with a warm cache, which is the regime the
+    ///   two-slot cache exists for.
+    ///
+    /// Each variant uses its own watch, but that watch is shared across the
+    /// samples of that variant; HashMap capacity growth is paid during warm-up.
+    #[test]
+    #[ignore = "manual performance measurement"]
+    fn benchmark_end_stream_watch() {
+        const SAMPLES: usize = 7;
+
+        fn report(name: &str, iterations: usize, mut run: impl FnMut()) {
+            for _ in 0..(iterations / 20).max(1) {
+                run();
+            }
+
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                let started = Instant::now();
+                for _ in 0..iterations {
+                    run();
+                }
+                samples.push(started.elapsed().as_secs_f64() * 1e9 / iterations as f64);
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "end_stream_watch_bench {name}: median={:.2} ns/op min={:.2} ns/op iterations={iterations}",
+                samples[SAMPLES / 2], samples[0]
+            );
+        }
+
+        fn data_run(frame_count: usize, payload_len: usize) -> Vec<u8> {
+            let payload = vec![0x5a; payload_len];
+            let mut wire = Vec::with_capacity(frame_count * (FRAME_HEADER_LEN + payload_len));
+            for frame_index in 0..frame_count {
+                let flags = if frame_index + 1 == frame_count {
+                    FLAG_END_STREAM
+                } else {
+                    0
+                };
+                wire.extend_from_slice(&frame(FRAME_TYPE_DATA, flags, 1, &payload));
+            }
+            wire
+        }
+
+        let headers_end = frame(FRAME_TYPE_HEADERS, FLAG_END_STREAM | 0x4, 1, b"\x88");
+        let one_data_end = frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"hello");
+        let response_16k = data_run(64, 16 * 1024);
+        let response_64k = data_run(16, 64 * 1024);
+        let streaming = data_run(1024, 1);
+
+        for (name, wire, iterations) in [
+            ("headers_end", &headers_end, 200_000),
+            ("one_data_end", &one_data_end, 200_000),
+            ("1mib_16k_frames", &response_16k, 10_000),
+            ("1mib_64k_frames", &response_64k, 20_000),
+            ("streaming_1024_frames", &streaming, 2_000),
+        ] {
+            report(&format!("{name}/raw_slice_control"), iterations, || {
+                black_box(black_box(wire).as_slice());
+            });
+
+            let empty_watch = EndStreamWatch::default();
+            let mut empty_scanner = FrameScanner::default();
+            report(&format!("{name}/unregistered"), iterations, || {
+                empty_scanner.scan(black_box(wire), &empty_watch);
+                black_box(&empty_scanner);
+            });
+
+            let watched = EndStreamWatch::default();
+            let mut watched_scanner = FrameScanner::default();
+            report(&format!("{name}/watched"), iterations, || {
+                let record = watched.register(1);
+                watched_scanner.scan(black_box(wire), &watched);
+                black_box(record.end_stream_observed());
+            });
+
+            let no_cache_watch = EndStreamWatch::default();
+            let mut no_cache_scanner = FrameScanner {
+                data_cache_disabled: true,
+                ..FrameScanner::default()
+            };
+            report(&format!("{name}/watched_no_cache"), iterations, || {
+                let record = no_cache_watch.register(1);
+                no_cache_scanner.scan(black_box(wire), &no_cache_watch);
+                black_box(record.end_stream_observed());
+            });
+
+            let legacy_terminal_watch = EndStreamWatch::default();
+            let mut legacy_terminal_scanner = FrameScanner {
+                data_cache_disabled: true,
+                terminal_data_combining_disabled: true,
+                ..FrameScanner::default()
+            };
+            report(&format!("{name}/legacy_terminal"), iterations, || {
+                let record = legacy_terminal_watch.register(1);
+                legacy_terminal_scanner.scan(black_box(wire), &legacy_terminal_watch);
+                black_box(record.end_stream_observed());
+            });
+        }
+
+        // Steady-state multiplexed cost. These wires carry no terminal frame,
+        // so the registrations survive every iteration and can be taken once,
+        // outside the timed region: what is measured is the per-DATA-frame cost
+        // with a warm cache, undiluted by a `register` that would scale with the
+        // stream count.
+        fn round_robin_wire(stream_count: u32) -> Vec<u8> {
+            let mut wire = Vec::new();
+            for frame_index in 0..1024u32 {
+                let stream_id = 1 + 2 * (frame_index % stream_count);
+                wire.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, stream_id, b"x"));
+            }
+            wire
+        }
+
+        for stream_count in [2u32, 3, 8, 32] {
+            let wire = round_robin_wire(stream_count);
+            let name = if stream_count == 2 {
+                "alternating_1024_frames".to_string()
+            } else {
+                format!("round_robin_{stream_count}_streams")
+            };
+
+            let cached_watch = EndStreamWatch::default();
+            let cached_records: Vec<_> = (0..stream_count)
+                .map(|index| cached_watch.register(1 + 2 * index))
+                .collect();
+            let mut cached_scanner = FrameScanner::default();
+            report(&format!("{name}/watched"), 1_000, || {
+                cached_scanner.scan(black_box(&wire), &cached_watch);
+                black_box(&cached_records);
+            });
+
+            let no_cache_watch = EndStreamWatch::default();
+            let no_cache_records: Vec<_> = (0..stream_count)
+                .map(|index| no_cache_watch.register(1 + 2 * index))
+                .collect();
+            let mut no_cache_scanner = FrameScanner {
+                data_cache_disabled: true,
+                ..FrameScanner::default()
+            };
+            report(&format!("{name}/watched_no_cache"), 1_000, || {
+                no_cache_scanner.scan(black_box(&wire), &no_cache_watch);
+                black_box(&no_cache_records);
+            });
+        }
+
+        // Two live but idle streams pin both slots, while all traffic belongs to
+        // a third. The cache can never fill for the hot stream, so this bounds
+        // the worst case the fixed two-slot design admits (see
+        // `FrameScanner::data_records`); it is the one shape where the cache is
+        // pure overhead.
+        let mut pinned = Vec::new();
+        for _ in 0..1024 {
+            pinned.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, 5, b"x"));
+        }
+        let pinned_warmup = {
+            let mut warmup = frame(FRAME_TYPE_DATA, 0, 1, b"x");
+            warmup.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, 3, b"x"));
+            warmup
+        };
+
+        let pinned_watch = EndStreamWatch::default();
+        let pinned_records = [1, 3, 5].map(|id| pinned_watch.register(id));
+        let mut pinned_scanner = FrameScanner::default();
+        pinned_scanner.scan(&pinned_warmup, &pinned_watch);
+        report("pinned_slots_1024_frames/watched", 1_000, || {
+            pinned_scanner.scan(black_box(&pinned), &pinned_watch);
+            black_box(&pinned_records);
+        });
+
+        let pinned_no_cache_watch = EndStreamWatch::default();
+        let pinned_no_cache_records = [1, 3, 5].map(|id| pinned_no_cache_watch.register(id));
+        let mut pinned_no_cache_scanner = FrameScanner {
+            data_cache_disabled: true,
+            ..FrameScanner::default()
+        };
+        report("pinned_slots_1024_frames/watched_no_cache", 1_000, || {
+            pinned_no_cache_scanner.scan(black_box(&pinned), &pinned_no_cache_watch);
+            black_box(&pinned_no_cache_records);
+        });
+
+        // Lock contention is the cost this whole change exists to remove, so
+        // both variants run against a thread churning registrations. Absolute
+        // numbers here move with how much CPU the churn thread gets and are NOT
+        // comparable across machines or runs; only the within-run ratio between
+        // the two variants means anything.
+        let mut streaming_open = Vec::new();
+        for _ in 0..1024 {
+            streaming_open.extend_from_slice(&frame(FRAME_TYPE_DATA, 0, 1, b"x"));
+        }
+
+        fn with_churn(watch: &Arc<EndStreamWatch>, mut run: impl FnMut()) {
+            let keep_churning = Arc::new(AtomicBool::new(true));
+            let churn_watch = watch.clone();
+            let churn_flag = keep_churning.clone();
+            let churner = std::thread::spawn(move || {
+                let mut stream_id = 3u32;
+                while churn_flag.load(Ordering::Acquire) {
+                    let record = churn_watch.register(stream_id);
+                    churn_watch.forget(stream_id);
+                    black_box(record);
+                    stream_id = stream_id.wrapping_add(2).max(3);
+                }
+            });
+            run();
+            keep_churning.store(false, Ordering::Release);
+            churner.join().unwrap();
+        }
+
+        let contended_watch = Arc::new(EndStreamWatch::default());
+        let contended_record = contended_watch.register(1);
+        let mut contended_scanner = FrameScanner::default();
+        with_churn(&contended_watch, || {
+            report(
+                "streaming_1024_frames/concurrent_register_forget",
+                2_000,
+                || {
+                    contended_scanner.scan(black_box(&streaming_open), &contended_watch);
+                    black_box(&contended_record);
+                },
+            );
+        });
+
+        let contended_no_cache_watch = Arc::new(EndStreamWatch::default());
+        let contended_no_cache_record = contended_no_cache_watch.register(1);
+        let mut contended_no_cache_scanner = FrameScanner {
+            data_cache_disabled: true,
+            ..FrameScanner::default()
+        };
+        with_churn(&contended_no_cache_watch, || {
+            report(
+                "streaming_1024_frames/concurrent_register_forget_no_cache",
+                2_000,
+                || {
+                    contended_no_cache_scanner
+                        .scan(black_box(&streaming_open), &contended_no_cache_watch);
+                    black_box(&contended_no_cache_record);
+                },
+            );
+        });
     }
 }
