@@ -18,20 +18,25 @@
 //! case. When it needs to emit *additional* chunks, or to end the response
 //! early, it goes through this sink.
 //!
-//! The byte budget is per pump batch, not per chunk: the pump coalesces the
+//! The byte budget counts only additional chunks accepted by
+//! [`ResponseBodySink::push`]. It does not account for replacing the current
+//! chunk with a larger one; filters that expand a chunk in place must enforce
+//! their own output bound.
+//!
+//! The sink budget is per pump batch, not per chunk: the pump coalesces the
 //! upstream tasks currently available (sized by, but not strictly capped at,
 //! `TASK_BUFFER_SIZE` — a fast producer can keep refilling while the drain loop
-//! runs) and writes them downstream as a unit, so the batch is what bounds
-//! resident memory. The pump calls [`ResponseBodySink::reset_batch`] once per
-//! batch. Because the batch size is scheduling-dependent, the effective budget a
-//! single filter observes can vary between runs; emit chunks well under the
-//! budget rather than relying on the exact per-batch limit.
+//! runs) and writes them downstream as a unit, so the budget bounds queued sink
+//! output for that batch. The pump calls [`ResponseBodySink::reset_batch`] once
+//! per batch. Because the batch size is scheduling-dependent, the effective
+//! budget a single filter observes can vary between runs; emit chunks well
+//! under the budget rather than relying on the exact per-batch limit.
 
 use bytes::Bytes;
 use pingora_error::{Error, ErrorType::InternalError, Result};
 
 /// Maximum bytes a filter may emit through the sink within one pump batch.
-/// Matches the hard cap on plugin-initiated outbound response bodies.
+/// In-place growth of the current chunk is outside this limit.
 pub const RESPONSE_BODY_EMIT_BUDGET: usize = 1024 * 1024;
 
 /// Extra chunks and the terminate signal produced by a response-body filter.

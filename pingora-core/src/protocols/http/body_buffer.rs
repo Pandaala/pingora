@@ -197,6 +197,15 @@ impl FixedBuffer {
 /// Storage policy (memory / file) and whether replay returns the captured original or a
 /// rewritten body are entirely the impl's choice.
 ///
+/// Capacity policy is deliberately owned by the application that registers the
+/// buffer, not by Pingora core. Core cannot infer whether an implementation retains
+/// chunks in memory, spills them to disk, or writes them to another bounded store, so
+/// it cannot choose a meaningful universal byte limit. The registering application
+/// must enforce limits appropriate to its storage and owns the over-limit response
+/// (for example 413) plus any protocol-specific handling of unread downstream bytes.
+/// [`InMemoryRequestBodyBuffer`] is an unbounded reference implementation, not a
+/// production capacity policy.
+///
 /// Scope: capture happens only through `Session::read_request_body` /
 /// `read_body_bytes` (the app draining the body in `request_filter`). Rewrite is therefore
 /// only possible for captured bodies; the capture path is supported only for requests that
