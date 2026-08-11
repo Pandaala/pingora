@@ -277,10 +277,10 @@ impl EndStreamWatch {
     /// `forget` that won the race win it for good.
     ///
     /// This is the ONLY place `end_stream` is ever stored. Removal alone no
-    /// longer freezes `data_bytes`, so the returned [`EndStreamPublished`] must
+    /// longer freezes `data_bytes`, so the returned [`TerminalFrameHandled`] must
     /// be handed to [`FrameScanner::drop_cache_after_publish`] before anything
     /// else touches the wire.
-    fn publish(&self, stream_id: u32, payload_bytes: usize) -> EndStreamPublished {
+    fn publish(&self, stream_id: u32, payload_bytes: usize) -> TerminalFrameHandled {
         if let Some(record) = self.pending.lock().remove(&stream_id) {
             if payload_bytes != 0 {
                 record
@@ -289,7 +289,7 @@ impl EndStreamWatch {
             }
             record.end_stream.store(true, Ordering::Release);
         }
-        EndStreamPublished(stream_id)
+        TerminalFrameHandled(stream_id)
     }
 
     /// The peer tore down `stream_id` without having flagged END_STREAM.
@@ -317,18 +317,24 @@ impl EndStreamWatch {
     }
 }
 
-/// Evidence that [`EndStreamWatch::publish`] ran for a stream, carrying the id
-/// whose scanner cache still has to be dropped.
+/// Evidence that [`EndStreamWatch::publish`] handled a terminal frame for a
+/// stream, carrying the id whose scanner cache still has to be dropped.
 ///
-/// Publication freezes a record for readers, but only for as long as nothing
-/// keeps writing to it. A cache entry that outlived the `Release` store would
-/// let a later (protocol-violating) frame move `data_bytes` after
-/// [`StreamRecord::vouches_for`] may already have returned `true`. Making the
-/// publication hand back a `#[must_use]` value that only
-/// [`FrameScanner::drop_cache_after_publish`] consumes turns "remember to clear
-/// the cache too" from a comment into something the compiler asks about.
-#[must_use = "publishing END_STREAM must be paired with dropping the scanner cache for that stream"]
-struct EndStreamPublished(u32);
+/// Deliberately NOT "END_STREAM was published": `publish` hands this back even
+/// when it lost the race to `forget`, a RST_STREAM or a GOAWAY and set nothing.
+/// Dropping the cache entry is required either way -- a terminal frame that
+/// lost the race must still evict a slot that would otherwise keep counting
+/// into a record nobody will ever look at again.
+///
+/// Where publication DID happen, the eviction is what keeps the record frozen:
+/// a cache entry outliving the `Release` store would let a later
+/// (protocol-violating) frame move `data_bytes` after
+/// [`StreamRecord::vouches_for`] may already have returned `true`. The
+/// `#[must_use]` is a speed bump rather than a proof -- `let _ = ...` still
+/// satisfies it -- but with publication reachable from exactly one place it is
+/// enough to keep the pair from drifting apart unnoticed.
+#[must_use = "handling a terminal frame must be paired with dropping the scanner cache for that stream"]
+struct TerminalFrameHandled(u32);
 
 /// Exclusive access to the registration map, held across `h2`'s stream id
 /// allocation. See [`EndStreamWatch::registration`].
@@ -509,9 +515,9 @@ impl FrameScanner {
         }
     }
 
-    /// Consume the evidence that a stream was published by dropping the cache
-    /// entry the publication froze. See [`EndStreamPublished`].
-    fn drop_cache_after_publish(&mut self, published: EndStreamPublished) {
+    /// Consume the evidence that a terminal frame was handled by dropping the
+    /// cache entry for its stream. See [`TerminalFrameHandled`].
+    fn drop_cache_after_publish(&mut self, published: TerminalFrameHandled) {
         self.clear_data_state(published.0);
     }
 

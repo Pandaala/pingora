@@ -628,7 +628,29 @@ pub trait ProxyHttp {
         Ok(())
     }
 
-    /// Similar to [Self::response_filter()] but for response body chunks
+    /// Similar to [Self::response_filter()] but for response body chunks.
+    ///
+    /// # Length-changing filters
+    ///
+    /// Avoid using this hook for filters that can change the response body
+    /// length. It runs after cache conditional and Range selection and may run
+    /// after the downstream response header has been committed. Pingora cannot
+    /// currently use a mutation made here to repair `Content-Length`, Range,
+    /// validators, or other representation metadata. A length-changing filter
+    /// can therefore produce invalid downstream framing, especially for a
+    /// cached response.
+    ///
+    /// Prefer [`Self::upstream_response_body_filter`] when the transformed body
+    /// should become the representation admitted to cache. That hook is async
+    /// and also supports bounded additional output through
+    /// [`crate::ResponseBodySink`]. The application must reconcile the
+    /// corresponding response headers in [`Self::upstream_response_filter`]
+    /// before changing the body length.
+    ///
+    /// This hook is not deprecated because it has distinct semantics: it runs
+    /// after caching and is therefore the downstream per-request filter for
+    /// both live responses and cache hits. Use it only for observation or for
+    /// transformations whose framing and representation metadata remain valid.
     fn response_body_filter(
         &self,
         _session: &mut Session,
