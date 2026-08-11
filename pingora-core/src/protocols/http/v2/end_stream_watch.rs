@@ -407,14 +407,23 @@ impl FrameScanner {
             match frame_type {
                 FRAME_TYPE_DATA => {
                     let end_stream = flags & FLAG_END_STREAM != 0;
-                    if flags & FLAG_PADDED != 0 && self.payload_left > 0 {
-                        // Both the byte count and the flag have to wait for the
-                        // Pad Length field in the payload.
-                        self.padded_data = Some(PaddedData {
-                            stream_id,
-                            payload_len: self.payload_left,
-                            end_stream,
-                        });
+                    if flags & FLAG_PADDED != 0 {
+                        if self.payload_left > 0 {
+                            // Both the byte count and the flag have to wait for
+                            // the Pad Length field in the payload.
+                            self.padded_data = Some(PaddedData {
+                                stream_id,
+                                payload_len: self.payload_left,
+                                end_stream,
+                            });
+                        }
+                        // A PADDED DATA frame with a zero-length payload is
+                        // malformed: the Pad Length octet is missing, so `h2`
+                        // answers with a connection error and never delivers the
+                        // frame. Its END_STREAM flag (if set) signals no valid
+                        // end-of-body, so record neither the bytes nor the flag
+                        // -- deliberately NOT falling through to `note_end_stream`
+                        // below.
                     } else {
                         // Counted BEFORE the flag: `note_end_stream` evicts the
                         // entry `note_data` writes to.
@@ -634,6 +643,31 @@ mod tests {
         wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"ab"));
         scanner.scan(&wire, &watch);
         assert!(record.vouches_for(2));
+    }
+
+    /// A PADDED DATA frame with a zero-length payload is malformed: the Pad
+    /// Length octet is missing, and h2 answers it with a connection error. Its
+    /// END_STREAM flag must therefore never be recorded as a real end of body,
+    /// or a peer could claim a complete body it never sent.
+    #[test]
+    fn empty_padded_data_frame_does_not_record_end_stream() {
+        let watch = EndStreamWatch::default();
+        let record = watch.register(1);
+        let mut scanner = FrameScanner::default();
+        let wire = frame(FRAME_TYPE_DATA, FLAG_PADDED | FLAG_END_STREAM, 1, b"");
+        scanner.scan(&wire, &watch);
+        assert!(
+            !record.vouches_for(0),
+            "a malformed padded frame must not vouch for an end of body"
+        );
+
+        // A well-formed empty final DATA frame still does.
+        let watch = EndStreamWatch::default();
+        let record = watch.register(1);
+        let mut scanner = FrameScanner::default();
+        let wire = frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"");
+        scanner.scan(&wire, &watch);
+        assert!(record.vouches_for(0));
     }
 
     /// Trailers carry the END_STREAM but no body bytes, so the count must be

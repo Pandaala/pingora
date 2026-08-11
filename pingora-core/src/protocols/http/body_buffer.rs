@@ -95,6 +95,13 @@ impl RegisteredRequestBodyBuffer {
         Ok(())
     }
 
+    /// Return the next replay chunk, or `None` at replay EOF.
+    ///
+    /// Delivery contract: the chunk returned by one call is committed (its
+    /// cursor advanced) at the *start* of the following call, on the assumption
+    /// that it was fully handed off. A caller that does not forward a returned
+    /// chunk must rewind via [`Self::begin_replay`] before reading again; calling
+    /// `next_chunk` again instead silently skips the unforwarded chunk.
     pub(crate) async fn next_chunk(&mut self) -> Result<Option<Bytes>> {
         if self.state != RequestBodyBufferState::Replaying {
             return Error::e_explain(
@@ -192,7 +199,8 @@ impl FixedBuffer {
 ///
 /// Scope: capture happens only through `Session::read_request_body` /
 /// `read_body_bytes` (the app draining the body in `request_filter`). Rewrite is therefore
-/// capture path is supported only for requests that *have* a body. An application that
+/// only possible for captured bodies; the capture path is supported only for requests that
+/// *have* a body. An application that
 /// needs to inject a body into a request the client sent empty must finalize the buffer
 /// itself and register it through `set_bodyless_request_replay_buffer`; that separate path
 /// never reads from the downstream transport. A request whose framing merely *permits*

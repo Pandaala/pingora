@@ -18,7 +18,6 @@ use futures::StreamExt;
 use super::*;
 use crate::proxy_cache::{drain_emitted_chunks, range_filter::RangeBodyFilter, ServeFromCache};
 use crate::proxy_common::*;
-use pingora_cache::CachePhase;
 use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
 
 fn apply_upstream_body_disposition(
@@ -207,8 +206,9 @@ where
                             // response reads and request-body writes.
                             None
                         }
-                        Ok(DownstreamRequestOutcome::Complete(reuse)) => {
-                            Some(upstream.await.map(|upstream| (DownstreamRequestOutcome::Complete(reuse), upstream)))
+                        Ok(outcome @ (DownstreamRequestOutcome::Complete(_)
+                            | DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(_))) => {
+                            Some(upstream.await.map(|upstream| (outcome, upstream)))
                         }
                         Err(e) => Some(Err(e)),
                     }
@@ -242,6 +242,10 @@ where
             Some(Ok((DownstreamRequestOutcome::Complete(downstream_can_reuse), _upstream))) => {
                 (downstream_can_reuse, true, None)
             }
+            Some(Ok((
+                DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(downstream_can_reuse),
+                _upstream,
+            ))) => (downstream_can_reuse, false, None),
             Some(Err(e)) => (false, false, Some(e)),
         }
     }
@@ -465,6 +469,9 @@ where
         // `ResponseBodySink::reset_batch`), but a `terminate()` signal stays
         // sticky for the rest of this response.
         let mut sink = ResponseBodySink::new();
+        let mut suppress_downstream_body = false;
+        let mut filtered_terminal_header = None;
+        let mut upstream_reusable = true;
 
         /* duplex mode without caching
          * Read body from downstream while reading response from upstream
@@ -623,11 +630,16 @@ where
                                 break; // upstream closed
                             }
                         }
+                        let source_done = tasks.iter().any(HttpTask::is_end);
 
                         /* run filters before sending to downstream */
                         let mut filtered_tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
                         sink.reset_batch();
-                        for mut t in tasks {
+                        // Keep the batch iterator alive past the loop so a
+                        // terminate `break` below can still inspect the tasks it
+                        // leaves undrained (see the terminate branch after it).
+                        let mut tasks = tasks.into_iter();
+                        for mut t in tasks.by_ref() {
                             if self.revalidate_or_stale(session, &mut t, ctx).await {
                                 serve_from_cache.enable();
                                 response_state.enable_cached_response();
@@ -641,6 +653,9 @@ where
                             self.h1_response_filter(session, t, ctx,
                                 &mut serve_from_cache,
                                 &mut range_body_filter, false,
+                                &mut suppress_downstream_body,
+                                &mut filtered_terminal_header,
+                                &mut upstream_reusable,
                                 &mut sink, &mut filtered_tasks).await?;
                             if serve_from_cache.is_miss_header() {
                                 response_state.enable_cached_response();
@@ -661,6 +676,20 @@ where
                                 // chunks 2..N -- origin bytes the filter
                                 // never saw -- through to the client below.
                                 break;
+                            }
+                        }
+
+                        // A terminate `break` above leaves the rest of the batch
+                        // undrained; those tasks are dropped (the response ends
+                        // as a clean terminate). A trailing upstream
+                        // `HttpTask::Failed` would otherwise vanish silently, so
+                        // surface it for observability. Log-only: the tasks are
+                        // still dropped and the terminate outcome is unchanged.
+                        if sink.is_terminated() {
+                            for dropped in tasks.by_ref() {
+                                if let HttpTask::Failed(e) = &dropped {
+                                    warn!("dropping upstream error after response terminate: {e}");
+                                }
                             }
                         }
 
@@ -699,8 +728,33 @@ where
 
                         // set to downstream
                         let upgraded = session.was_upgraded();
-                        let response_done = session.write_response_tasks(filtered_tasks).await?;
-                        if sink.is_terminated() {
+                        session.write_response_tasks(filtered_tasks).await?;
+                        // Run the terminate wrap-up only when the source has NOT
+                        // already ended in this batch. When it has, EOS migrated
+                        // onto the last extra chunk just written, so the response
+                        // finished on both sides: forcing `set_keepalive(None)`
+                        // and returning `Terminate` (which the caller treats as
+                        // `release_cache_on_terminate` / `InternalError` and
+                        // marks both connections non-reusable) would needlessly
+                        // burn both connections. Fall through to the normal
+                        // clean-completion path instead, which latches
+                        // `upstream_done()` from the same `source_done`.
+                        //
+                        // Gate on `source_done` (an `is_end` task really arrived)
+                        // rather than on what `write_response_tasks` returns:
+                        // H1's writer answers `end_stream || body_writer
+                        // .finished()`, which is also true once a
+                        // `Content-Length` body has merely written its declared
+                        // bytes. Using that looser signal would skip the wrap-up
+                        // while `terminate` stays sticky across `reset_batch` and
+                        // `upstream_done()` never latches, leaving the pump
+                        // looping and re-invoking the body filter on a response
+                        // the filter already ended.
+                        //
+                        // This is distinct from the natural Header-EOS boundary,
+                        // which `terminal_upstream_body_filter` already handles
+                        // via `sink.consume_terminate()`.
+                        if sink.is_terminated() && !source_done {
                             // The filter ended the response. `serve_from_cache`
                             // is not "on" here (the check above returns before
                             // this point otherwise), so this batch is the one
@@ -729,7 +783,7 @@ where
                             trace!("reset downstream state on upgrade");
                             downstream_state.reset();
                         }
-                        response_state.maybe_set_upstream_done(response_done);
+                        response_state.maybe_set_upstream_done(source_done);
                         // unsuccessful upgrade response (or end of upstream upgraded conn,
                         // which forces the body reader to complete) may force the request done
                         downstream_state.maybe_finished(session.is_body_done());
@@ -742,15 +796,20 @@ where
                 task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter, upgraded),
                     if !response_state.cached_done() && !downstream_state.is_errored() && serve_from_cache.is_on() => {
 
+                    let task = task?;
+                    let cache_source_done = task.is_end();
                     let mut cached_tasks = Vec::with_capacity(1);
-                    self.h1_response_filter(session, task?, ctx,
+                    self.h1_response_filter(session, task, ctx,
                         &mut serve_from_cache,
                         &mut range_body_filter, true,
+                        &mut suppress_downstream_body,
+                        &mut filtered_terminal_header,
+                        &mut upstream_reusable,
                         &mut sink, &mut cached_tasks).await?;
                     debug!("serve_from_cache task {cached_tasks:?}");
 
                     match session.write_response_tasks(cached_tasks).await {
-                        Ok(b) => response_state.maybe_set_cache_done(b),
+                        Ok(_) => response_state.maybe_set_cache_done(cache_source_done),
                         Err(e) => if serve_from_cache.is_miss() {
                             // give up writing to downstream but wait for upstream cache write to finish
                             downstream_state.to_errored();
@@ -831,9 +890,14 @@ where
                 }
             }
         }
-        Ok(DownstreamRequestOutcome::Complete(reuse_downstream))
+        Ok(if upstream_reusable {
+            DownstreamRequestOutcome::Complete(reuse_downstream)
+        } else {
+            DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(reuse_downstream)
+        })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn h1_response_filter(
         &self,
         session: &mut Session,
@@ -842,6 +906,9 @@ where
         serve_from_cache: &mut ServeFromCache,
         range_body_filter: &mut RangeBodyFilter,
         from_cache: bool, // are the task from cache already
+        suppress_downstream_body: &mut bool,
+        filtered_terminal_header: &mut Option<Box<ResponseHeader>>,
+        upstream_reusable: &mut bool,
         sink: &mut ResponseBodySink,
         out_tasks: &mut Vec<HttpTask>,
     ) -> Result<()>
@@ -849,21 +916,42 @@ where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
+        let terminal_header = !from_cache
+            && matches!(
+                &task,
+                HttpTask::Header(header, true) if !header.status.is_informational()
+            );
+        let filter_downstream_body = terminal_header
+            || matches!(&task, HttpTask::Body(..) | HttpTask::UpgradedBody(..))
+            || (from_cache && matches!(&task, HttpTask::Done));
+
+        let mut terminal_cacheability = None;
+
         // skip caching if already served from cache
         if !from_cache {
             if let Some(duration) = self.upstream_filter(session, &mut task, sink, ctx).await? {
                 trace!("delaying upstream response for {duration:?}");
                 time::sleep(duration).await;
             }
+            if terminal_header {
+                let HttpTask::Header(header, _) = &task else {
+                    unreachable!("terminal task must be a header")
+                };
+                terminal_cacheability =
+                    self.response_cacheability_before_downstream_filter(session, header, ctx)?;
+            }
 
             // Cache the original response (and anything the upstream body
             // filter queued in `sink` after it) before any downstream
             // transformation. Requests that bypassed cache still need to run
             // filters to see if the response has become cacheable.
-            self.cache_task_and_emitted_chunks(session, &task, sink, ctx, serve_from_cache)
-                .await?;
+            if !terminal_header {
+                self.cache_task_and_emitted_chunks(session, &task, sink, ctx, serve_from_cache)
+                    .await?;
+                self.track_predicted_uncacheable_response(session, &task, sink);
+            }
 
-            if !serve_from_cache.should_send_to_downstream() {
+            if !terminal_header && !serve_from_cache.should_send_to_downstream() {
                 // The batch this task belongs to is discarded by the pump
                 // below (`continue`, never `write_response_tasks`), so any
                 // chunks this task's filter queued must be discarded here
@@ -883,6 +971,7 @@ where
                 // pump stay a simple `.await?` instead of inspecting what was
                 // just pushed.
                 if let HttpTask::Failed(e) = task {
+                    abort_cache_after_response_source_failure(session, false);
                     return Err(e);
                 }
                 out_tasks.push(task);
@@ -890,111 +979,133 @@ where
             }
         } // else: cached/local response, no need to trigger upstream filters and caching
 
-        // normally max file size is tracked in cache_http_task filters (when cache enabled),
-        // we will track it in these filters before sending to downstream on specific conditions
-        // when cache is disabled
-        let track_max_cache_size = matches!(
-            session.cache.phase(),
-            CachePhase::Disabled(NoCacheReason::PredictedResponseTooLarge)
-        );
+        if *suppress_downstream_body && is_downstream_followup(&task) {
+            // Cache admission already observed this task's queued chunks.
+            sink.take_extra();
+            if matches!(task, HttpTask::Failed(_)) {
+                *upstream_reusable = false;
+                abort_cache_after_response_source_failure(session, from_cache);
+            }
+            return Ok(());
+        }
 
-        let res = match task {
+        let res: Result<HttpTask> = match task {
             HttpTask::Header(mut header, end) => {
-                /* Downstream revalidation/range, only needed when cache modified headers because otherwise origin
-                 * will handle it */
-                if session.upstream_headers_mutated_for_cache() {
-                    self.downstream_response_conditional_filter(
-                        serve_from_cache,
+                let cache_header = terminal_header.then(|| header.clone());
+                if !from_cache {
+                    proxy_cache::strip_terminal_synthetic_wire_marker(&mut header);
+                }
+                let terminal_synthetic_entity = proxy_cache::is_terminal_synthetic_entity(&header);
+                let substituted = if from_cache {
+                    filtered_terminal_header
+                        .take()
+                        .map(|filtered_header| header = filtered_header)
+                        .is_some()
+                } else {
+                    false
+                };
+                if !substituted {
+                    /* Downstream revalidation/range, only needed when cache modified headers because otherwise origin
+                     * will handle it */
+                    if session.upstream_headers_mutated_for_cache() {
+                        self.downstream_response_conditional_filter(
+                            serve_from_cache,
+                            session,
+                            &mut header,
+                            ctx,
+                        );
+                        // A terminal header describes no upstream body, so its
+                        // Content-Length cannot range the body generated below.
+                        let skip_range = if from_cache {
+                            terminal_synthetic_entity
+                        } else {
+                            terminal_header
+                        };
+                        if !skip_range && !session.ignore_downstream_range {
+                            let range_type =
+                                self.inner.range_header_filter(session, &mut header, ctx);
+                            range_body_filter.set(range_type);
+                        }
+                    }
+                    self.inner
+                        .response_filter(session, &mut header, ctx)
+                        .await?;
+                }
+
+                // H1 upstreams may answer with HTTP/0.9 or HTTP/1.0, but this
+                // header is prepared for HTTP/1.1 downstream reuse.
+                header.set_version(Version::HTTP_11);
+
+                if terminal_header {
+                    if let Some(duration) = self
+                        .terminal_upstream_body_filter(session, sink, ctx)
+                        .await?
+                    {
+                        trace!("delaying terminal upstream response for {duration:?}");
+                        time::sleep(duration).await;
+                    }
+                    let mut cache_header =
+                        cache_header.expect("terminal header must retain its cache representation");
+                    reconcile_terminal_cache_header(&mut cache_header, sink);
+                    reconcile_terminal_cache_header(&mut header, sink);
+                    proxy_cache::mark_terminal_synthetic_entity(&mut cache_header);
+                    *filtered_terminal_header = Some(header.clone());
+                    let cache_task = HttpTask::Header(cache_header, true);
+                    self.track_predicted_uncacheable_response(session, &cache_task, sink);
+                    self.cache_task_and_emitted_chunks_with_decision(
                         session,
-                        &mut header,
+                        &cache_task,
+                        sink,
+                        terminal_cacheability,
                         ctx,
-                    );
-                    if !session.ignore_downstream_range {
-                        let range_type = self.inner.range_header_filter(session, &mut header, ctx);
-                        range_body_filter.set(range_type);
+                        serve_from_cache,
+                    )
+                    .await?;
+                    if !serve_from_cache.should_send_to_downstream() {
+                        sink.take_extra();
+                        return Ok(());
                     }
                 }
 
-                // TODO: just set version to Version::HTTP_11 unconditionally here,
-                // (with another todo being an option to faithfully proxy the <1.1 responses)
-                // as we are already trying to mutate this for HTTP/1.1 downstream reuse
+                if downstream_response_body_forbidden(session, &header) {
+                    sink.take_extra();
+                    header.remove_header(&http::header::TRANSFER_ENCODING);
+                    if header.status.is_informational() || header.status.as_u16() == 204 {
+                        header.remove_header(&http::header::CONTENT_LENGTH);
+                    }
+                }
+                if !header.status.is_informational() {
+                    *suppress_downstream_body =
+                        terminal_header || downstream_response_body_forbidden(session, &header);
+                }
 
-                /* Convert HTTP 1.0 style response to chunked encoding so that we don't
-                 * have to close the downstream connection */
-                // these status codes / method cannot have body, so no need to add chunked encoding
-                let no_body = session.req_header().method == http::method::Method::HEAD
-                    || matches!(header.status.as_u16(), 204 | 304);
-                if !no_body
-                    && !header.status.is_informational()
+                if !*suppress_downstream_body
                     && header
                         .headers
                         .get(http::header::TRANSFER_ENCODING)
                         .is_none()
                     && header.headers.get(http::header::CONTENT_LENGTH).is_none()
-                    && !end
+                    && (!end || !sink.peek_extra().is_empty())
                 {
-                    // Upgrade the http version to 1.1 because 1.0/0.9 doesn't support chunked
                     header.set_version(Version::HTTP_11);
                     header.insert_header(http::header::TRANSFER_ENCODING, "chunked")?;
                 }
 
-                match self.inner.response_filter(session, &mut header, ctx).await {
-                    Ok(_) => Ok(HttpTask::Header(header, end)),
-                    Err(e) => Err(e),
-                }
+                Ok(HttpTask::Header(header, end || *suppress_downstream_body))
             }
             HttpTask::Body(data, end) => {
-                if track_max_cache_size {
-                    session
-                        .cache
-                        .track_body_bytes_for_max_file_size(data.as_ref().map_or(0, |d| d.len()));
-                }
-
-                // before it can mark it as cacheable again.
-                let mut data = range_body_filter.filter_body(data);
-                if let Some(duration) = self
-                    .inner
-                    .response_body_filter(session, &mut data, end, ctx)?
-                {
-                    trace!("delaying downstream response for {:?}", duration);
-                    time::sleep(duration).await;
-                }
+                let data = range_body_filter.filter_body(data);
 
                 Ok(HttpTask::Body(data, end))
             }
-            HttpTask::UpgradedBody(mut data, end) => {
-                if track_max_cache_size {
-                    session
-                        .cache
-                        .track_body_bytes_for_max_file_size(data.as_ref().map_or(0, |d| d.len()));
-                }
-
-                // range doesn't apply to upgraded body
-                if let Some(duration) = self
-                    .inner
-                    .response_body_filter(session, &mut data, end, ctx)?
-                {
-                    trace!("delaying downstream upgraded response for {:?}", duration);
-                    time::sleep(duration).await;
-                }
-
-                Ok(HttpTask::UpgradedBody(data, end))
-            }
+            HttpTask::UpgradedBody(data, end) => Ok(HttpTask::UpgradedBody(data, end)),
             HttpTask::Trailer(h) => Ok(HttpTask::Trailer(h)), // TODO: support trailers for h1
+            HttpTask::Done if from_cache => Ok(HttpTask::Body(None, true)),
             HttpTask::Done => Ok(task),
             HttpTask::Failed(_) => Ok(task), // Do nothing just pass the error down
         };
-        // On end, check if the response (based on file size) can be considered cacheable again
-        if let Ok(task) = res.as_ref() {
-            if track_max_cache_size
-                && task.is_end()
-                && !matches!(task, HttpTask::Failed(_))
-                && !session.cache.exceeded_max_file_size()
-            {
-                session.cache.response_became_cacheable();
-            }
-        }
         let task = res?;
+        let start = out_tasks.len();
         if from_cache {
             // The cache-serving pump arm shares this `sink` with the
             // upstream-batch arm across the whole response, but never itself
@@ -1011,6 +1122,20 @@ where
             // end-of-stream flag migrates onto the last of them when there
             // are any (see `drain_emitted_chunks`).
             drain_emitted_chunks(task, sink, out_tasks);
+        }
+        if terminal_header {
+            let downstream_body_forbidden = match &out_tasks[start] {
+                HttpTask::Header(header, _) => downstream_response_body_forbidden(session, header),
+                _ => unreachable!("terminal response must start with a header"),
+            };
+            if !downstream_body_forbidden {
+                self.downstream_response_body_filter_tasks(session, &mut out_tasks[start..], ctx)
+                    .await?;
+            }
+            reconcile_terminal_response_tasks(out_tasks, start, downstream_body_forbidden)?;
+        } else if filter_downstream_body {
+            self.downstream_response_body_filter_tasks(session, &mut out_tasks[start..], ctx)
+                .await?;
         }
         Ok(())
     }
@@ -1051,6 +1176,16 @@ where
             // arm) and the request then retried, and latching first would
             // suppress the hook forever -- zero completed invocations for a
             // trailer-bearing request.
+            //
+            // Consequence: the `?` above propagates an `Err` before this line,
+            // so the latch is set only on the `Ok` path. If the hook returns a
+            // *retryable* error, the retried attempt re-invokes it. The "at
+            // most once per downstream request" guarantee therefore holds only
+            // for a hook that either succeeds or fails non-retryably; a
+            // side-effecting hook that errors retryably may run again on the
+            // retry. This is intentional -- latching before `Err` would skip
+            // the filter on the retried upstream request, breaking retry
+            // correctness.
             session.request_trailer_filter_fired = true;
             if action == RequestBodyAction::Terminate {
                 warn_terminate_without_response(session, "request_trailer_filter");
@@ -1112,6 +1247,17 @@ where
             } else {
                 tx.send(HttpTask::Body(data, upstream_end_of_body));
             }
+        } else if data.as_ref().is_some_and(|d| !d.is_empty()) {
+            // No permit and non-empty data: a request-body filter attached
+            // bytes to this final event, but the upstream exchange is already
+            // complete so nothing can be written. Under Ordinary/Streamed the
+            // bytes are silently dropped here (only Bodyless fails closed
+            // above); surface the drop so it is not an invisible heisenbug.
+            warn!(
+                "request body filter attached {} bytes to a final event with no upstream permit; \
+                 dropping (upstream exchange already complete)",
+                data.as_ref().map_or(0, |d| d.len())
+            );
         }
 
         Ok(DownstreamRequestOutcome::Complete(end_of_body))

@@ -156,7 +156,13 @@ pub(crate) fn declared_body_length(headers: &http::HeaderMap) -> Option<usize> {
     headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<usize>().ok())
+        // Digits only, staying at least as strict as h2's own `parse_u64`,
+        // which rejects `+5` and surrounding whitespace and kills such a stream
+        // with PROTOCOL_ERROR before it reaches here. `usize::parse` is laxer,
+        // so reject any non-digit byte first. An empty value has no digits and
+        // yields `None`, exactly as before.
+        .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|v| v.parse::<usize>().ok())
         .filter(|len| *len > 0)
 }
 
@@ -503,6 +509,17 @@ impl HttpSession {
             // Establish the trailer fact exactly once: it is never cleared
             // again within this request.
             if !self.trailers_polled {
+                // Latched BEFORE the await, which is safe only because the await
+                // cannot be cancelled mid-poll here: `data()` returns `None`
+                // (this `else` branch) exclusively after END_STREAM was
+                // observed, at which point the trailers -- or the stream error
+                // -- are already queued in h2, so `trailers()` is immediately
+                // Ready and completes within this poll. Were it ever pending,
+                // cancellation between this store and the await completing would
+                // lose the trailer fact forever. Re-verify this invariant if the
+                // h2 dependency is upgraded; if it no longer holds, latch after a
+                // successful await instead (as `send_body_to2` in proxy_h2.rs
+                // does for the same hazard).
                 self.trailers_polled = true;
                 let trailers = match self.request_body_reader.trailers().await {
                     Ok(trailers) => trailers,

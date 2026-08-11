@@ -21,7 +21,10 @@ use pingora_core::{
     ImmutStr,
 };
 use proxy_cache::{drain_emitted_chunks, range_filter::RangeBodyFilter, ServeFromCache};
-use proxy_common::{no_downstream_body_to_read, DownstreamStateMachine, ResponseStateMachine};
+use proxy_common::{
+    no_downstream_body_to_read, release_cache_on_terminate, DownstreamRequestOutcome,
+    DownstreamStateMachine, ResponseStateMachine,
+};
 use tokio::sync::oneshot;
 
 use super::*;
@@ -31,7 +34,7 @@ where
     C: custom::Connector,
 {
     /// Proxy to a custom protocol upstream.
-    /// Returns (reuse_server, error)
+    /// Returns (reuse_server, reuse_upstream, error)
     pub(crate) async fn proxy_to_custom_upstream(
         &self,
         session: &mut Session,
@@ -39,7 +42,7 @@ where
         reused: bool,
         peer: &HttpPeer,
         ctx: &mut SV::CTX,
-    ) -> (bool, Option<Box<Error>>)
+    ) -> (bool, bool, Option<Box<Error>>)
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
@@ -54,28 +57,28 @@ where
             .connected_to_upstream(session, reused, peer, raw, client_session.digest(), ctx)
             .await
         {
-            return (false, Some(e));
+            return (false, false, Some(e));
         }
 
-        let (server_session_reuse, error) = self
+        let (server_session_reuse, upstream_session_reuse, error) = self
             .custom_proxy_down_to_up(session, client_session, peer, ctx)
             .await;
 
         // Parity with H1/H2: custom upstreams don't report payload bytes; record 0.
         session.set_upstream_body_bytes_received(0);
 
-        (server_session_reuse, error)
+        (server_session_reuse, upstream_session_reuse, error)
     }
 
     /// Handle custom protocol proxying from downstream to upstream.
-    /// Returns (reuse_server, error)
+    /// Returns (reuse_server, reuse_upstream, error)
     async fn custom_proxy_down_to_up(
         &self,
         session: &mut Session,
         client_session: &mut C::Session,
         peer: &HttpPeer,
         ctx: &mut SV::CTX,
-    ) -> (bool, Option<Box<Error>>)
+    ) -> (bool, bool, Option<Box<Error>>)
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
@@ -84,6 +87,7 @@ where
 
         if session.as_ref().request_body_buffer_registered() {
             return (
+                false,
                 false,
                 Some(Error::explain(
                     InternalError,
@@ -107,7 +111,7 @@ where
         {
             Ok(_) => { /* continue */ }
             Err(e) => {
-                return (false, Some(e));
+                return (false, true, Some(e));
             }
         }
 
@@ -119,6 +123,7 @@ where
         if body_disposition != UpstreamRequestBodyDisposition::Ordinary {
             return (
                 false,
+                true,
                 Some(
                     Error::explain(
                         InternalError,
@@ -135,7 +140,7 @@ where
 
         let req = Box::new(req);
         if let Err(e) = client_session.write_request_header(req, body_empty).await {
-            return (false, Some(e.into_up()));
+            return (false, false, Some(e.into_up()));
         }
 
         client_session.set_read_timeout(peer.options.read_timeout);
@@ -158,6 +163,7 @@ where
         else {
             return (
                 false,
+                false,
                 Some(Error::explain(
                     ReadError,
                     "can't extract custom reader from upstream",
@@ -168,6 +174,7 @@ where
         let Some(mut upstream_custom_message_writer) = client_session.take_custom_message_writer()
         else {
             return (
+                false,
                 false,
                 Some(Error::explain(
                     WriteError,
@@ -184,7 +191,7 @@ where
         let mut downstream_custom_message_reader = match session.downstream_custom_message() {
             Ok(Some(rx)) => rx,
             Ok(None) => Box::new(futures::stream::empty::<Result<Bytes>>()),
-            Err(err) => return (false, Some(err)),
+            Err(err) => return (false, false, Some(err)),
         };
 
         // Downstream writer
@@ -248,7 +255,7 @@ where
             )
             .await
         {
-            return (false, Some(e));
+            return (false, false, Some(e));
         }
 
         /* read downstream body and upstream response at the same time */
@@ -279,14 +286,31 @@ where
         }
 
         match ret {
-            Ok((downstream_can_reuse, _upstream, _custom_up_down, _custom_down_up)) => {
-                (downstream_can_reuse, None)
+            Ok((
+                DownstreamRequestOutcome::Complete(downstream_can_reuse),
+                _upstream,
+                _custom_up_down,
+                _custom_down_up,
+            )) => (downstream_can_reuse, true, None),
+            Ok((
+                DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(downstream_can_reuse),
+                _upstream,
+                _custom_up_down,
+                _custom_down_up,
+            )) => (downstream_can_reuse, false, None),
+            // Unreachable by construction: the custom pump fails closed on
+            // terminate (see the error return in `custom_bidirection_down_to_up`)
+            // rather than propagating this outcome. Keep the explicit arm so
+            // the match remains exhaustive without a catch-all.
+            Ok((DownstreamRequestOutcome::Terminate, _, _, _)) => {
+                release_cache_on_terminate(session);
+                (false, false, None)
             }
-            Err(e) => (false, Some(e)),
+            Err(e) => (false, false, Some(e)),
         }
     }
 
-    // returns whether server (downstream) session can be reused
+    // Returns the downstream completion and upstream reuse outcome separately.
     #[allow(clippy::too_many_arguments)]
     async fn custom_bidirection_down_to_up(
         &self,
@@ -304,7 +328,7 @@ where
         )>,
         downstream_custom_final_hop: bool,
         cancel_downstream_reader_tx: oneshot::Sender<()>,
-    ) -> Result<bool>
+    ) -> Result<DownstreamRequestOutcome>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
@@ -339,6 +363,9 @@ where
         // `ResponseBodySink::reset_batch`), but a `terminate()` signal stays
         // sticky for the rest of this response.
         let mut sink = ResponseBodySink::new();
+        let mut suppress_downstream_body = false;
+        let mut filtered_terminal_header = None;
+        let mut upstream_reusable = true;
 
         let mut upstream_custom = true;
         let mut downstream_custom = true;
@@ -413,6 +440,7 @@ where
                         while let Ok(task) = rx.try_recv() {
                             tasks.push(task);
                         }
+                        let source_done = tasks.iter().any(HttpTask::is_end);
 
                         /* run filters before sending to downstream */
                         let mut filtered_tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
@@ -435,6 +463,9 @@ where
                             self.custom_response_filter(session, t, ctx,
                                 &mut serve_from_cache,
                                 &mut range_body_filter, false,
+                                &mut suppress_downstream_body,
+                                &mut filtered_terminal_header,
+                                &mut upstream_reusable,
                                 &mut sink, &mut filtered_tasks).await?;
                             if serve_from_cache.is_miss_header() {
                                 response_state.enable_cached_response();
@@ -484,7 +515,7 @@ where
                         }
 
                         let upgraded = session.was_upgraded();
-                        let response_done = session.write_response_tasks(filtered_tasks).await?;
+                        session.write_response_tasks(filtered_tasks).await?;
                         if !upgraded && session.was_upgraded() && downstream_state.can_poll() {
                             // just upgraded, the downstream state should be reset to continue to
                             // poll body
@@ -492,7 +523,7 @@ where
                             downstream_state.reset();
                         }
 
-                        response_state.maybe_set_upstream_done(response_done);
+                        response_state.maybe_set_upstream_done(source_done);
                     } else {
                         debug!("empty upstream event");
                         response_state.maybe_set_upstream_done(true);
@@ -501,13 +532,18 @@ where
 
                 task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter, upgraded),
                     if !response_state.cached_done() && !downstream_state.is_errored() && serve_from_cache.is_on() => {
+                    let task = task?;
+                    let cache_source_done = task.is_end();
                     let mut cached_tasks = Vec::with_capacity(1);
-                    self.custom_response_filter(session, task?, ctx,
+                    self.custom_response_filter(session, task, ctx,
                         &mut serve_from_cache,
                         &mut range_body_filter, true,
+                        &mut suppress_downstream_body,
+                        &mut filtered_terminal_header,
+                        &mut upstream_reusable,
                         &mut sink, &mut cached_tasks).await?;
                     match session.write_response_tasks(cached_tasks).await {
-                        Ok(b) => response_state.maybe_set_cache_done(b),
+                        Ok(_) => response_state.maybe_set_cache_done(cache_source_done),
                         Err(e) => if serve_from_cache.is_miss() {
                             // give up writing to downstream but wait for upstream cache write to finish
                             downstream_state.to_errored();
@@ -605,9 +641,14 @@ where
                 }
             }
         }
-        Ok(reuse_downstream)
+        Ok(if upstream_reusable {
+            DownstreamRequestOutcome::Complete(reuse_downstream)
+        } else {
+            DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(reuse_downstream)
+        })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn custom_response_filter(
         &self,
         session: &mut Session,
@@ -616,6 +657,9 @@ where
         serve_from_cache: &mut ServeFromCache,
         range_body_filter: &mut RangeBodyFilter,
         from_cache: bool, // are the task from cache already
+        suppress_downstream_body: &mut bool,
+        filtered_terminal_header: &mut Option<Box<ResponseHeader>>,
+        upstream_reusable: &mut bool,
         sink: &mut ResponseBodySink,
         out_tasks: &mut Vec<HttpTask>,
     ) -> Result<()>
@@ -623,18 +667,41 @@ where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
+        let terminal_header = !from_cache
+            && matches!(
+                &task,
+                HttpTask::Header(header, true) if !header.status.is_informational()
+            );
+        let filter_downstream_body = terminal_header
+            || matches!(&task, HttpTask::Body(..) | HttpTask::UpgradedBody(..))
+            || (from_cache && matches!(&task, HttpTask::Done));
+        let mut terminal_cacheability = None;
+
         if !from_cache {
-            self.upstream_filter(session, &mut task, sink, ctx).await?;
+            if let Some(duration) = self.upstream_filter(session, &mut task, sink, ctx).await? {
+                trace!("delaying upstream response for {duration:?}");
+                time::sleep(duration).await;
+            }
+            if terminal_header {
+                let HttpTask::Header(header, _) = &task else {
+                    unreachable!("terminal task must be a header")
+                };
+                terminal_cacheability =
+                    self.response_cacheability_before_downstream_filter(session, header, ctx)?;
+            }
 
             // Cache the original response (and anything the upstream body
             // filter queued in `sink` after it) before any downstream
             // transformation. Requests that bypassed cache still need to run
             // filters to see if the response has become cacheable.
-            self.cache_task_and_emitted_chunks(session, &task, sink, ctx, serve_from_cache)
-                .await?;
+            if !terminal_header {
+                self.cache_task_and_emitted_chunks(session, &task, sink, ctx, serve_from_cache)
+                    .await?;
+                self.track_predicted_uncacheable_response(session, &task, sink);
+            }
 
             // skip the downstream filtering if these tasks are just for cache admission
-            if !serve_from_cache.should_send_to_downstream() {
+            if !terminal_header && !serve_from_cache.should_send_to_downstream() {
                 // The batch this task belongs to is discarded by the pump
                 // below (`continue`, never `write_response_tasks`), so any
                 // chunks this task's filter queued must be discarded here
@@ -646,71 +713,127 @@ where
                 // emit chunks it did not itself produce (see the `from_cache`
                 // guard at the end of this function).
                 sink.take_extra();
+                if let HttpTask::Failed(error) = task {
+                    abort_cache_after_response_source_failure(session, false);
+                    return Err(error);
+                }
                 out_tasks.push(task);
                 return Ok(());
             }
         } // else: cached/local response, no need to trigger upstream filters and caching
 
+        if *suppress_downstream_body && is_downstream_followup(&task) {
+            // Cache admission already observed this task's queued chunks.
+            sink.take_extra();
+            if matches!(task, HttpTask::Failed(_)) {
+                *upstream_reusable = false;
+                abort_cache_after_response_source_failure(session, from_cache);
+            }
+            return Ok(());
+        }
+
         let res: Result<HttpTask> = match task {
             HttpTask::Header(mut header, eos) => {
-                /* Downstream revalidation, only needed when cache is on because otherwise origin
-                 * will handle it */
-                // TODO: if cache is disabled during response phase, we should still do the filter
-                if session.cache.enabled() {
-                    self.downstream_response_conditional_filter(
-                        serve_from_cache,
+                let cache_header = terminal_header.then(|| header.clone());
+                if !from_cache {
+                    proxy_cache::strip_terminal_synthetic_wire_marker(&mut header);
+                }
+                let terminal_synthetic_entity = proxy_cache::is_terminal_synthetic_entity(&header);
+                let substituted = if from_cache {
+                    filtered_terminal_header
+                        .take()
+                        .map(|filtered_header| header = filtered_header)
+                        .is_some()
+                } else {
+                    false
+                };
+                if !substituted {
+                    /* Downstream revalidation, only needed when cache is on because otherwise origin
+                     * will handle it */
+                    // TODO: if cache is disabled during response phase, we should still do the filter
+                    if session.cache.enabled() {
+                        self.downstream_response_conditional_filter(
+                            serve_from_cache,
+                            session,
+                            &mut header,
+                            ctx,
+                        );
+                        // A terminal header describes no upstream body, so its
+                        // Content-Length cannot range the body generated below.
+                        let skip_range = if from_cache {
+                            terminal_synthetic_entity
+                        } else {
+                            terminal_header
+                        };
+                        if !skip_range && !session.ignore_downstream_range {
+                            let range_type =
+                                self.inner.range_header_filter(session, &mut header, ctx);
+                            range_body_filter.set(range_type);
+                        }
+                    }
+                    self.inner
+                        .response_filter(session, &mut header, ctx)
+                        .await?;
+                }
+                if terminal_header {
+                    if let Some(duration) = self
+                        .terminal_upstream_body_filter(session, sink, ctx)
+                        .await?
+                    {
+                        trace!("delaying terminal upstream response for {duration:?}");
+                        time::sleep(duration).await;
+                    }
+                    let mut cache_header =
+                        cache_header.expect("terminal header must retain its cache representation");
+                    reconcile_terminal_cache_header(&mut cache_header, sink);
+                    reconcile_terminal_cache_header(&mut header, sink);
+                    proxy_cache::mark_terminal_synthetic_entity(&mut cache_header);
+                    *filtered_terminal_header = Some(header.clone());
+                    let cache_task = HttpTask::Header(cache_header, true);
+                    self.track_predicted_uncacheable_response(session, &cache_task, sink);
+                    self.cache_task_and_emitted_chunks_with_decision(
                         session,
-                        &mut header,
+                        &cache_task,
+                        sink,
+                        terminal_cacheability,
                         ctx,
-                    );
-                    if !session.ignore_downstream_range {
-                        let range_type = self.inner.range_header_filter(session, &mut header, ctx);
-                        range_body_filter.set(range_type);
+                        serve_from_cache,
+                    )
+                    .await?;
+                    if !serve_from_cache.should_send_to_downstream() {
+                        sink.take_extra();
+                        return Ok(());
                     }
                 }
-
-                self.inner
-                    .response_filter(session, &mut header, ctx)
-                    .await?;
+                if downstream_response_body_forbidden(session, &header) {
+                    sink.take_extra();
+                    header.remove_header(&http::header::TRANSFER_ENCODING);
+                    if header.status.is_informational() || header.status.as_u16() == 204 {
+                        header.remove_header(&http::header::CONTENT_LENGTH);
+                    }
+                }
+                if !header.status.is_informational() {
+                    *suppress_downstream_body =
+                        terminal_header || downstream_response_body_forbidden(session, &header);
+                }
                 /* Downgrade the version so that write_response_header won't panic */
                 header.set_version(Version::HTTP_11);
 
                 // these status codes / method cannot have body, so no need to add chunked encoding
-                let no_body = session.req_header().method == "HEAD"
-                    || matches!(header.status.as_u16(), 204 | 304);
-
                 /* Add chunked header to tell downstream to use chunked encoding
                  * during the absent of content-length */
-                if !no_body
-                    && !header.status.is_informational()
+                if !downstream_response_body_forbidden(session, &header)
                     && header.headers.get(http::header::CONTENT_LENGTH).is_none()
                 {
                     header.insert_header(http::header::TRANSFER_ENCODING, "chunked")?;
                 }
-                Ok(HttpTask::Header(header, eos))
+                Ok(HttpTask::Header(header, eos || *suppress_downstream_body))
             }
             HttpTask::Body(data, eos) => {
-                let mut data = range_body_filter.filter_body(data);
-                if let Some(duration) = self
-                    .inner
-                    .response_body_filter(session, &mut data, eos, ctx)?
-                {
-                    trace!("delaying response for {duration:?}");
-                    time::sleep(duration).await;
-                }
+                let data = range_body_filter.filter_body(data);
                 Ok(HttpTask::Body(data, eos))
             }
-            HttpTask::UpgradedBody(mut data, eos) => {
-                // range body filter doesn't apply to upgraded body
-                if let Some(duration) = self
-                    .inner
-                    .response_body_filter(session, &mut data, eos, ctx)?
-                {
-                    trace!("delaying upgraded response for {duration:?}");
-                    time::sleep(duration).await;
-                }
-                Ok(HttpTask::UpgradedBody(data, eos))
-            }
+            HttpTask::UpgradedBody(data, eos) => Ok(HttpTask::UpgradedBody(data, eos)),
             HttpTask::Trailer(mut trailers) => {
                 let trailer_buffer = match trailers.as_mut() {
                     Some(trailers) => {
@@ -742,10 +865,12 @@ where
                     Ok(HttpTask::Trailer(trailers))
                 }
             }
+            HttpTask::Done if from_cache => Ok(HttpTask::Body(None, true)),
             HttpTask::Done => Ok(task),
             HttpTask::Failed(_) => Ok(task), // Do nothing just pass the error down
         };
         let task = res?;
+        let start = out_tasks.len();
         if from_cache {
             // The cache-serving pump arm shares this `sink` with the
             // upstream-batch arm across the whole response, but never itself
@@ -762,6 +887,20 @@ where
             // end-of-stream flag migrates onto the last of them when there
             // are any (see `drain_emitted_chunks`).
             drain_emitted_chunks(task, sink, out_tasks);
+        }
+        if terminal_header {
+            let downstream_body_forbidden = match &out_tasks[start] {
+                HttpTask::Header(header, _) => downstream_response_body_forbidden(session, header),
+                _ => unreachable!("terminal response must start with a header"),
+            };
+            if !downstream_body_forbidden {
+                self.downstream_response_body_filter_tasks(session, &mut out_tasks[start..], ctx)
+                    .await?;
+            }
+            reconcile_terminal_response_tasks(out_tasks, start, downstream_body_forbidden)?;
+        } else if filter_downstream_body {
+            self.downstream_response_body_filter_tasks(session, &mut out_tasks[start..], ctx)
+                .await?;
         }
         Ok(())
     }

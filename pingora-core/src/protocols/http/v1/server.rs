@@ -330,6 +330,14 @@ impl HttpSession {
                         // own transport facts.
                         self.request_headers_end_stream = None;
                         self.response_written = None;
+                        // Reset the per-request early-body-buffer state too, so a reused
+                        // ServerSession struct can use the capture feature again on the
+                        // next request instead of inheriting request 1's sticky flags.
+                        self.early_body_buffer_released = false;
+                        self.early_body_buffer_discarded = false;
+                        self.early_body_capture_poisoned = false;
+                        self.body_bytes_read = 0;
+                        self.read_deadline = None;
                         self.respect_keepalive();
 
                         // Disable keepalive if both Transfer-Encoding and Content-Length were present
@@ -568,6 +576,10 @@ impl HttpSession {
 
     /// Drain the request body. `Ok(())` when there is no (more) body to read.
     pub async fn drain_request_body(&mut self) -> Result<()> {
+        // Clear any read deadline armed by an earlier (possibly long-cancelled) read
+        // so the end-of-request drain gets a fresh `read_timeout` per read instead of
+        // failing the first pending read instantly with ReadTimedout.
+        self.read_deadline = None;
         if self.is_body_done() {
             return Ok(());
         }
@@ -1073,13 +1085,25 @@ impl HttpSession {
 
     fn init_body_reader(&mut self) {
         if self.body_reader.need_init() {
+            // No request has been read yet (no preread body captured), so there is
+            // nothing to initialize the body reader from. Return early instead of
+            // unwrapping, so the read-only accessors (`is_body_done`,
+            // `is_body_empty`, `request_headers_end_stream`,
+            // `request_trailers_present`) answer conservatively instead of
+            // panicking. Actually reading a body before `read_request` still
+            // panics one frame down in `BodyReader::read_body`, which is
+            // unchanged: that is a caller sequencing error, not an accessor.
+            let Some(preread_body) = self.preread_body.as_ref() else {
+                return;
+            };
+
             // reset retry buffer
             if let Some(buffer) = self.retry_buffer.as_mut() {
                 buffer.clear();
             }
 
             // follow https://datatracker.ietf.org/doc/html/rfc9112#section-6.3
-            let preread_body = self.preread_body.as_ref().unwrap().get(&self.buf[..]);
+            let preread_body = preread_body.get(&self.buf[..]);
 
             if self.was_upgraded() {
                 // if upgraded _post_ 101 (and body was not init yet)

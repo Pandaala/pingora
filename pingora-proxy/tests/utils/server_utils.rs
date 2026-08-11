@@ -15,6 +15,7 @@
 #[cfg(feature = "any_tls")]
 use super::cert;
 use async_trait::async_trait;
+use bytes::Bytes;
 use clap::Parser;
 use http::header::{ACCEPT_ENCODING, CONTENT_LENGTH, TRANSFER_ENCODING, VARY};
 use http::HeaderValue;
@@ -43,7 +44,7 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::utils::tls::CertKey;
 use pingora_error::{Error, ErrorSource, ErrorType::*, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
-use pingora_proxy::{FailToProxy, ProxyHttp, Session};
+use pingora_proxy::{FailToProxy, ProxyHttp, ResponseBodySink, Session};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::thread;
@@ -314,6 +315,25 @@ impl ProxyHttp for ExampleProxyHttp {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         response_filter_common(session, upstream_response, ctx)
+    }
+
+    async fn upstream_response_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        sink: &mut ResponseBodySink,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        if session.get_header_bytes("x-bodyless-replace") == b"true"
+            && end_of_stream
+            && body.is_none()
+        {
+            *body = Some(Bytes::from_static(b"generated"));
+            sink.push(Bytes::from_static(b"-extra"))?;
+            sink.terminate();
+        }
+        Ok(None)
     }
 
     async fn upstream_peer(

@@ -20,7 +20,7 @@ mod utils;
 
 use bytes::Bytes;
 use http::{Response, StatusCode};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use utils::server_utils::init;
@@ -83,6 +83,80 @@ async fn post_through_proxy(port: u16) -> reqwest::Result<reqwest::Response> {
         .timeout(Duration::from_secs(10))
         .send()
         .await
+}
+
+async fn spawn_h2_header_only_origin() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (io, _) = listener.accept().await.unwrap();
+        let mut conn = h2::server::handshake(io).await.unwrap();
+        let (_req, mut send_resp) = conn.accept().await.unwrap().unwrap();
+        let response = Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(())
+            .unwrap();
+        send_resp.send_response(response, true).unwrap();
+        while conn.accept().await.is_some() {}
+    });
+    port
+}
+
+async fn spawn_h2_declared_empty_but_open_origin() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (io, _) = listener.accept().await.unwrap();
+        let mut conn = h2::server::handshake(io).await.unwrap();
+        let (_req, mut send_resp) = conn.accept().await.unwrap().unwrap();
+        let response = Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header(http::header::CONTENT_LENGTH, "0")
+            .body(())
+            .unwrap();
+        let mut body = send_resp.send_response(response, false).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        body.send_data(Bytes::new(), true).unwrap();
+        while conn.accept().await.is_some() {}
+    });
+    port
+}
+
+#[tokio::test]
+async fn h2_header_end_stream_runs_terminal_body_hook() {
+    init();
+    let port = spawn_h2_header_only_origin().await;
+    let response = reqwest::Client::new()
+        .get("http://127.0.0.1:6147/bodyless")
+        .header("x-h2", "true")
+        .header("x-port", port.to_string())
+        .header("x-bodyless-replace", "true")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.text().await.unwrap(), "generated-extra");
+}
+
+#[tokio::test]
+async fn h2_content_length_zero_does_not_replace_the_real_end_stream_bit() {
+    init();
+    let port = spawn_h2_declared_empty_but_open_origin().await;
+    let start = Instant::now();
+    let response = reqwest::Client::new()
+        .get("http://127.0.0.1:6147/bodyless")
+        .header("x-h2", "true")
+        .header("x-port", port.to_string())
+        .header("x-bodyless-replace", "true")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.text().await.unwrap(), "");
+    assert!(
+        start.elapsed() >= Duration::from_millis(40),
+        "Content-Length: 0 incorrectly finalized an H2 stream before END_STREAM"
+    );
 }
 
 /// The end-to-end outcome the read-half fix alone does not pin down: the

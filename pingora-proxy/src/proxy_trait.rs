@@ -576,11 +576,19 @@ pub trait ProxyHttp {
     /// Similar to [Self::upstream_response_filter()] but for response body
     ///
     /// This function will be called every time a piece of response body is received. The `body` is
-    /// **not the entire response body**.
+    /// **not the entire response body**. When a complete response ends on its
+    /// header task, the hook is called once with `body = None` and
+    /// `end_of_stream = true`. Informational and upgraded responses do not use
+    /// that synthetic terminal call.
     ///
     /// Mutate `body` in place for the common one-in-one-out case. To emit
     /// *additional* chunks, or to end the response early, use `sink`. The
     /// sink's byte budget is per pump batch; see [`crate::ResponseBodySink`].
+    /// Output from a synthetic terminal call is discarded when the downstream
+    /// request method or the filtered response status forbids a body.
+    /// Internal cache-control responses consumed by revalidation or stale
+    /// serving are not forwarded response representations and do not receive
+    /// this synthetic body event.
     async fn upstream_response_body_filter(
         &self,
         _session: &mut Session,

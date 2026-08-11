@@ -18,17 +18,80 @@ use http::{Method, StatusCode};
 use pingora_cache::key::CacheHashKey;
 use pingora_cache::lock::LockStatus;
 use pingora_cache::max_file_size::ERR_RESPONSE_TOO_LARGE;
-use pingora_cache::{ForcedFreshness, HitHandler, HitStatus, RespCacheable::*};
+use pingora_cache::{
+    CachePhase, ForcedFreshness, HitHandler, HitStatus, RespCacheable, RespCacheable::*,
+};
 use pingora_core::protocols::http::conditional_filter::to_304;
 use pingora_core::protocols::http::v1::common::header_value_content_length;
 use pingora_core::ErrorType;
 use range_filter::RangeBodyFilter;
 use std::time::SystemTime;
 
+const TERMINAL_SYNTHETIC_CACHE_MARKER: &str = "x-pingora-internal-terminal-synthetic";
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TerminalSyntheticEntity;
+
+pub(crate) fn mark_terminal_synthetic_entity(header: &mut ResponseHeader) {
+    header.extensions.insert(TerminalSyntheticEntity);
+}
+
+pub(crate) fn is_terminal_synthetic_entity(header: &ResponseHeader) -> bool {
+    header.extensions.get::<TerminalSyntheticEntity>().is_some()
+}
+
+pub(crate) fn strip_terminal_synthetic_wire_marker(header: &mut ResponseHeader) {
+    header.remove_header(TERMINAL_SYNTHETIC_CACHE_MARKER);
+}
+
+fn take_terminal_synthetic_wire_marker(header: &mut ResponseHeader) -> bool {
+    header
+        .remove_header(TERMINAL_SYNTHETIC_CACHE_MARKER)
+        .is_some()
+}
+
+fn persist_terminal_synthetic_wire_marker(header: &mut ResponseHeader, terminal: bool) {
+    strip_terminal_synthetic_wire_marker(header);
+    if terminal {
+        header
+            .insert_header(TERMINAL_SYNTHETIC_CACHE_MARKER, "1")
+            .expect("the static terminal synthetic cache marker must be a valid header");
+    }
+}
+
 impl<SV, C> HttpProxy<SV, C>
 where
     C: custom::Connector,
 {
+    pub(crate) fn track_predicted_uncacheable_response(
+        &self,
+        session: &mut Session,
+        task: &HttpTask,
+        sink: &ResponseBodySink,
+    ) {
+        if !matches!(
+            session.cache.phase(),
+            CachePhase::Disabled(NoCacheReason::PredictedResponseTooLarge)
+        ) {
+            return;
+        }
+
+        let task_bytes = match task {
+            HttpTask::Body(Some(data), _) | HttpTask::UpgradedBody(Some(data), _) => data.len(),
+            _ => 0,
+        };
+        let emitted_bytes = sink.peek_extra().iter().map(Bytes::len).sum::<usize>();
+        session
+            .cache
+            .track_body_bytes_for_max_file_size(task_bytes + emitted_bytes);
+        if task.is_end()
+            && !matches!(task, HttpTask::Failed(_))
+            && !session.cache.exceeded_max_file_size()
+        {
+            session.cache.response_became_cacheable();
+        }
+    }
+
     // return bool: server_session can be reused, and error if any
     pub(crate) async fn proxy_cache(
         self: &Arc<Self>,
@@ -274,6 +337,7 @@ where
 
         let seekable = session.cache.hit_handler().can_seek();
         let mut header = cache_hit_header(&session.cache);
+        let terminal_synthetic_entity = is_terminal_synthetic_entity(&header);
 
         let req = session.req_header();
 
@@ -295,19 +359,31 @@ where
         let header_only = not_modified || req.method == http::method::Method::HEAD;
 
         // process range header if the cache storage supports seek
-        let range_type = if seekable && !session.ignore_downstream_range {
-            self.inner.range_header_filter(session, &mut header, ctx)
-        } else {
-            RangeType::None
-        };
+        let range_type =
+            if seekable && !terminal_synthetic_entity && !session.ignore_downstream_range {
+                self.inner.range_header_filter(session, &mut header, ctx)
+            } else {
+                RangeType::None
+            };
 
         // return a 416 with an empty body for simplicity
-        let header_only = header_only || matches!(range_type, RangeType::Invalid);
+        let mut header_only = header_only || matches!(range_type, RangeType::Invalid);
         debug!("header: {header:?}");
 
         // TODO: use ProxyUseCache to replace the logic below
         match self.inner.response_filter(session, &mut header, ctx).await {
             Ok(_) => {
+                let filtered_body_forbidden = downstream_response_body_forbidden(session, &header);
+                if filtered_body_forbidden
+                    && (header.status.is_informational()
+                        || matches!(header.status.as_u16(), 204 | 304))
+                {
+                    header.remove_header(&http::header::TRANSFER_ENCODING);
+                    if header.status.is_informational() || header.status.as_u16() == 204 {
+                        header.remove_header(&http::header::CONTENT_LENGTH);
+                    }
+                }
+                header_only |= filtered_body_forbidden;
                 if let Err(e) = session
                     .downstream_modules_ctx
                     .response_header_filter(&mut header, header_only)
@@ -544,6 +620,7 @@ where
         &self,
         session: &mut Session,
         task: &HttpTask,
+        response_cacheability: Option<RespCacheable>,
         ctx: &mut SV::CTX,
         serve_from_cache: &mut ServeFromCache,
     ) -> Result<()>
@@ -565,8 +642,33 @@ where
                 {
                     return Ok(());
                 }
-                match self.inner.response_cache_filter(session, header, ctx)? {
-                    Cacheable(meta) => {
+                let precomputed_cacheability = response_cacheability.is_some();
+                let cacheability = match response_cacheability {
+                    Some(cacheability) => cacheability,
+                    None => self.inner.response_cache_filter(session, header, ctx)?,
+                };
+                match cacheability {
+                    Cacheable(mut meta) => {
+                        // Never trust an origin-provided copy of the private
+                        // wire marker. Only the typed extension set by the
+                        // terminal pump may persist it into cache metadata.
+                        persist_terminal_synthetic_wire_marker(
+                            meta.response_header_mut(),
+                            is_terminal_synthetic_entity(header),
+                        );
+                        if precomputed_cacheability {
+                            if let Some(content_length) =
+                                header.headers.get(http::header::CONTENT_LENGTH)
+                            {
+                                meta.response_header_mut().insert_header(
+                                    http::header::CONTENT_LENGTH,
+                                    content_length.clone(),
+                                )?;
+                            } else {
+                                meta.response_header_mut()
+                                    .remove_header(&http::header::CONTENT_LENGTH);
+                            }
+                        }
                         let mut fill_cache = true;
                         if session.cache.bypassing() {
                             // The cache might have been bypassed because the response exceeded the
@@ -759,25 +861,81 @@ where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
+        self.cache_task_and_emitted_chunks_with_decision(
+            session,
+            task,
+            sink,
+            None,
+            ctx,
+            serve_from_cache,
+        )
+        .await
+    }
+
+    pub(crate) fn response_cacheability_before_downstream_filter(
+        &self,
+        session: &Session,
+        header: &ResponseHeader,
+        ctx: &mut SV::CTX,
+    ) -> Result<Option<RespCacheable>>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        if !(session.cache.enabled() || session.cache.bypassing()) {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.inner.response_cache_filter(session, header, ctx)?,
+        ))
+    }
+
+    pub(crate) async fn cache_task_and_emitted_chunks_with_decision(
+        &self,
+        session: &mut Session,
+        task: &HttpTask,
+        sink: &ResponseBodySink,
+        response_cacheability: Option<RespCacheable>,
+        ctx: &mut SV::CTX,
+        serve_from_cache: &mut ServeFromCache,
+    ) -> Result<()>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
         if !(session.cache.enabled() || session.cache.bypassing()) {
             return Ok(());
         }
 
         let extra = sink.peek_extra();
-        let leading = if extra.is_empty() {
-            LeadingTask::Unchanged
-        } else {
+        let is_upgraded = matches!(task, HttpTask::UpgradedBody(..));
+        let leading = if !extra.is_empty() || matches!(task, HttpTask::Header(_, true)) {
             migrate_end_of_stream(task)
+        } else {
+            LeadingTask::Unchanged
         };
 
+        let mut response_cacheability = response_cacheability;
         let leading_result = match &leading {
             LeadingTask::Unchanged => {
-                self.cache_http_task(session, task, ctx, serve_from_cache)
-                    .await
+                self.cache_http_task(
+                    session,
+                    task,
+                    response_cacheability.take(),
+                    ctx,
+                    serve_from_cache,
+                )
+                .await
             }
             LeadingTask::Substitute(substitute) => {
-                self.cache_http_task(session, substitute, ctx, serve_from_cache)
-                    .await
+                self.cache_http_task(
+                    session,
+                    substitute,
+                    response_cacheability.take(),
+                    ctx,
+                    serve_from_cache,
+                )
+                .await
             }
             LeadingTask::Drop => Ok(()),
         };
@@ -800,15 +958,29 @@ where
         }
 
         if extra.is_empty() {
+            if matches!(task, HttpTask::Header(_, true)) {
+                self.cache_http_task(
+                    session,
+                    &HttpTask::Body(None, true),
+                    None,
+                    ctx,
+                    serve_from_cache,
+                )
+                .await?;
+            }
             return Ok(());
         }
         let last = extra.len() - 1;
         let last_chunk_is_end_of_stream = !matches!(leading, LeadingTask::Unchanged);
         for (i, chunk) in extra.iter().enumerate() {
             let end = last_chunk_is_end_of_stream && i == last;
-            let extra_task = HttpTask::Body(Some(chunk.clone()), end);
+            let extra_task = if is_upgraded {
+                HttpTask::UpgradedBody(Some(chunk.clone()), end)
+            } else {
+                HttpTask::Body(Some(chunk.clone()), end)
+            };
             if let Err(e) = self
-                .cache_http_task(session, &extra_task, ctx, serve_from_cache)
+                .cache_http_task(session, &extra_task, None, ctx, serve_from_cache)
                 .await
             {
                 session.cache.disable(NoCacheReason::StorageError);
@@ -864,12 +1036,21 @@ where
                         }
                         // 304 doesn't contain all the headers, merge 304 into cached 200 header
                         // in order for response_cache_filter to run correctly
-                        let merged_header = session.cache.revalidate_merge_header(resp);
+                        let mut merged_header = session.cache.revalidate_merge_header(resp);
+                        let terminal_synthetic_entity =
+                            take_terminal_synthetic_wire_marker(&mut merged_header);
                         match self
                             .inner
                             .response_cache_filter(session, &merged_header, ctx)
                         {
                             Ok(Cacheable(mut meta)) => {
+                                // Preserve the trusted marker independently of
+                                // how the application rebuilds CacheMeta. The
+                                // callback never sees the private wire header.
+                                persist_terminal_synthetic_wire_marker(
+                                    meta.response_header_mut(),
+                                    terminal_synthetic_entity,
+                                );
                                 // For simplicity, ignore changes to variance over 304 for now.
                                 // Note this means upstream can only update variance via 2xx
                                 // (expired response).
@@ -902,6 +1083,10 @@ where
                                 //TODO: log more
                                 debug!("Uncacheable {reason:?} 304 received");
                                 session.cache.response_became_uncacheable(reason);
+                                persist_terminal_synthetic_wire_marker(
+                                    &mut merged_header,
+                                    terminal_synthetic_entity,
+                                );
                                 session.cache.revalidate_uncacheable(merged_header, reason);
                             }
                             Err(e) => {
@@ -909,6 +1094,10 @@ where
                                 // (avoid poisoning downstream cache with passthrough 304),
                                 // allow serving the stored response without updating cache
                                 warn!("Error {e:?} response_cache_filter during revalidation");
+                                persist_terminal_synthetic_wire_marker(
+                                    &mut merged_header,
+                                    terminal_synthetic_entity,
+                                );
                                 session.cache.revalidate_uncacheable(
                                     merged_header,
                                     NoCacheReason::InternalError,
@@ -1065,8 +1254,8 @@ where
 /// calling [`migrate_end_of_stream`] entirely otherwise and use
 /// [`LeadingTask::Unchanged`] directly for that hot, sink-empty path.
 enum LeadingTask {
-    /// `task` was not a true-end-of-stream `Body`/`UpgradedBody`: nothing to
-    /// migrate, feed `task` exactly as-is.
+    /// `task` did not carry an end-of-stream flag that can move to an emitted
+    /// body chunk: feed `task` exactly as-is.
     Unchanged,
     /// `task` carried a payload; feed this de-asserted (`end = false`)
     /// substitute in its place, then the queued chunks -- the LAST of which
@@ -1086,6 +1275,9 @@ enum LeadingTask {
 /// why the flag cannot simply be duplicated onto both `task` and the chunks.
 fn migrate_end_of_stream(task: &HttpTask) -> LeadingTask {
     match task {
+        HttpTask::Header(header, true) => {
+            LeadingTask::Substitute(HttpTask::Header(header.clone(), false))
+        }
         HttpTask::Body(Some(data), true) => {
             LeadingTask::Substitute(HttpTask::Body(Some(data.clone()), false))
         }
@@ -1117,7 +1309,12 @@ pub(crate) fn drain_emitted_chunks(
 ) {
     let extra = sink.take_extra();
     if extra.is_empty() {
-        out_tasks.push(task);
+        if let HttpTask::Header(header, true) = task {
+            out_tasks.push(HttpTask::Header(header, false));
+            out_tasks.push(HttpTask::Body(None, true));
+        } else {
+            out_tasks.push(task);
+        }
         return;
     }
 
@@ -1230,6 +1427,23 @@ mod eos_migration_tests {
     }
 
     #[test]
+    fn header_eos_migrates_to_the_last_emitted_body_chunk() {
+        let mut sink = sink_with(&[b"current", b"extra"]);
+        let mut out = Vec::new();
+        let header = Box::new(ResponseHeader::build(503, None).unwrap());
+        drain_emitted_chunks(HttpTask::Header(header, true), &mut sink, &mut out);
+        match out.as_slice() {
+            [HttpTask::Header(header, false), HttpTask::Body(Some(d0), false), HttpTask::Body(Some(d1), true)] =>
+            {
+                assert_eq!(header.status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(d0.as_ref(), b"current");
+                assert_eq!(d1.as_ref(), b"extra");
+            }
+            other => panic!("unexpected sequence: {other:?}"),
+        }
+    }
+
+    #[test]
     fn upgraded_body_chunks_stay_tagged_upgraded_body() {
         // `Session::write_response_tasks` picks the raw post-upgrade duplex
         // write path off this tag; mistagging a chunk as plain `Body` would
@@ -1251,14 +1465,10 @@ mod eos_migration_tests {
     }
 
     #[test]
-    fn non_body_task_with_a_nonempty_sink_still_drains_every_chunk() {
-        // Defensive: `upstream_response_body_filter` (the sink's only
-        // writer) only ever runs for `Body`/`UpgradedBody` input tasks, so a
-        // non-body task should see an empty sink in practice (see the
-        // `from_cache` guard and the early-return discard this module's
-        // callers apply). If it somehow isn't empty, chunks must still be
-        // delivered rather than silently dropped, just without any migrated
-        // end-of-stream (nothing on a `Trailer` to migrate it from).
+    fn trailer_with_a_nonempty_sink_still_drains_every_chunk() {
+        // Defensive: a trailer does not run the body hook, so it should see an
+        // empty sink. If it somehow does not, deliver the chunks without
+        // inventing another end-of-stream source.
         let mut sink = sink_with(&[b"a"]);
         let mut out = Vec::new();
         drain_emitted_chunks(HttpTask::Trailer(None), &mut sink, &mut out);
@@ -1273,6 +1483,9 @@ mod eos_migration_tests {
 
 fn cache_hit_header(cache: &HttpCache) -> Box<ResponseHeader> {
     let mut header = Box::new(cache.cache_meta().response_header_copy());
+    if take_terminal_synthetic_wire_marker(&mut header) {
+        mark_terminal_synthetic_entity(&mut header);
+    }
     // convert cache response
 
     // these status codes / method cannot have body, so no need to add chunked encoding

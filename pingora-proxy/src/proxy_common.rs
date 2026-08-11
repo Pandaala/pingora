@@ -568,6 +568,11 @@ pub(crate) fn restore_custom_message_reader(
 pub(crate) enum DownstreamRequestOutcome {
     /// Normal completion; the bool is downstream connection reusability.
     Complete(bool),
+    /// The downstream response completed successfully, but the upstream
+    /// response source failed after that terminal boundary. The bool is the
+    /// downstream connection reusability; the upstream connection must not
+    /// be reused.
+    CompleteWithoutUpstreamReuse(bool),
     /// Application termination: proxying of this request stops here. The
     /// application has already finished the downstream response.
     Terminate,

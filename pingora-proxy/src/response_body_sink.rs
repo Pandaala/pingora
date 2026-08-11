@@ -18,10 +18,14 @@
 //! case. When it needs to emit *additional* chunks, or to end the response
 //! early, it goes through this sink.
 //!
-//! The byte budget is per pump batch, not per chunk: the pump drains up to
-//! `TASK_BUFFER_SIZE` upstream tasks and writes them downstream as a unit, so
-//! the batch is what bounds resident memory. The pump calls
-//! [`ResponseBodySink::reset_batch`] once per batch.
+//! The byte budget is per pump batch, not per chunk: the pump coalesces the
+//! upstream tasks currently available (sized by, but not strictly capped at,
+//! `TASK_BUFFER_SIZE` — a fast producer can keep refilling while the drain loop
+//! runs) and writes them downstream as a unit, so the batch is what bounds
+//! resident memory. The pump calls [`ResponseBodySink::reset_batch`] once per
+//! batch. Because the batch size is scheduling-dependent, the effective budget a
+//! single filter observes can vary between runs; emit chunks well under the
+//! budget rather than relying on the exact per-batch limit.
 
 use bytes::Bytes;
 use pingora_error::{Error, ErrorType::InternalError, Result};
@@ -58,6 +62,14 @@ impl ResponseBodySink {
     ///
     /// Returns an error when the batch budget is exhausted. It never truncates
     /// silently and never records a partially accepted chunk.
+    ///
+    /// Length contract: a filter that grows the body (here, or by replacing the
+    /// in-place chunk with a larger one) MUST declare `changes_body_length()`.
+    /// Extra bytes pushed past a committed `content-length` are dropped silently
+    /// by h1's `write_body` (which stops at the declared length) and are a
+    /// protocol violation on h2 downstream; unlike the terminate direction
+    /// (see `warn_response_body_terminate_content_length_leak`), this overflow
+    /// direction is not currently diagnosed at runtime.
     pub fn push(&mut self, chunk: Bytes) -> Result<()> {
         if chunk.is_empty() {
             return Ok(());
@@ -77,6 +89,20 @@ impl ResponseBodySink {
         Ok(())
     }
 
+    /// Materialize the current chunk of a synthetic terminal body event before
+    /// extras already emitted by the filter chain.
+    ///
+    /// This is the Header-EOS representation of mutating
+    /// `Body(None, true)` into `Some(bytes)`. It is deliberately not charged
+    /// against the sink budget: ordinary current-chunk mutation is not sink
+    /// output either. Only `push()` output consumes the extra-chunk budget.
+    pub(crate) fn prepend_current(&mut self, chunk: Bytes) {
+        if chunk.is_empty() {
+            return;
+        }
+        self.extra.insert(0, chunk);
+    }
+
     /// End the response after the currently queued chunks are written. Sticky:
     /// once set it survives `reset_batch`.
     pub fn terminate(&mut self) {
@@ -85,6 +111,12 @@ impl ResponseBodySink {
 
     pub fn is_terminated(&self) -> bool {
         self.terminate
+    }
+
+    /// Consume a terminate signal at a response boundary that is already
+    /// naturally terminal.
+    pub(crate) fn consume_terminate(&mut self) {
+        self.terminate = false;
     }
 
     pub fn remaining_budget(&self) -> usize {
@@ -165,5 +197,43 @@ mod tests {
             sink.take_extra().is_empty(),
             "empty chunks are dropped, not queued"
         );
+    }
+
+    #[test]
+    fn prepend_current_keeps_current_chunk_before_extras_without_spending_budget() {
+        let mut sink = ResponseBodySink::new();
+        sink.push(Bytes::from_static(b"extra-a")).unwrap();
+        sink.push(Bytes::from_static(b"extra-b")).unwrap();
+        let remaining = sink.remaining_budget();
+        sink.prepend_current(Bytes::from_static(b"current"));
+        assert_eq!(sink.remaining_budget(), remaining);
+        assert_eq!(
+            sink.take_extra(),
+            vec![
+                Bytes::from_static(b"current"),
+                Bytes::from_static(b"extra-a"),
+                Bytes::from_static(b"extra-b"),
+            ]
+        );
+    }
+
+    #[test]
+    fn synthetic_current_chunk_has_the_same_unbudgeted_semantics_as_body_mutation() {
+        let mut sink = ResponseBodySink::new();
+        sink.prepend_current(Bytes::from(vec![0; RESPONSE_BODY_EMIT_BUDGET + 1]));
+        assert_eq!(sink.remaining_budget(), RESPONSE_BODY_EMIT_BUDGET);
+        assert_eq!(sink.take_extra()[0].len(), RESPONSE_BODY_EMIT_BUDGET + 1);
+
+        assert!(sink
+            .push(Bytes::from(vec![0; RESPONSE_BODY_EMIT_BUDGET + 1]))
+            .is_err());
+    }
+
+    #[test]
+    fn terminal_boundary_consumes_terminate() {
+        let mut sink = ResponseBodySink::new();
+        sink.terminate();
+        sink.consume_terminate();
+        assert!(!sink.is_terminated());
     }
 }
