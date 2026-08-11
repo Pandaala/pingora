@@ -42,6 +42,7 @@ use futures::future::FutureExt;
 use http::{header, version::Version, Method};
 use log::{debug, error, trace, warn};
 use once_cell::sync::Lazy;
+pub use pingora_core::modules::http::RequestBodyEvent;
 use pingora_core::protocols::http::v1::common::header_value_content_length;
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::fmt::Debug;

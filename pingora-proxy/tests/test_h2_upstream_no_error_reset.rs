@@ -323,7 +323,7 @@ async fn h2_upstream_truncated_response_then_no_error_reset_is_an_error() {
 // A second, self-contained proxy, on its own port, whose only job is to make
 // the application-visible effects of the pump observable. `tests/utils`'s
 // example proxy implements neither `request_body_filter_action` nor
-// `request_trailer_filter`, so nothing there can see the end-of-stream event
+// `request_trailer_filter`, so nothing there can see the terminal body event
 // this section is about.
 // ---------------------------------------------------------------------------
 
@@ -336,20 +336,33 @@ mod observing {
     use pingora_core::services::ServiceWithDependents;
     use pingora_core::upstreams::peer::HttpPeer;
     use pingora_error::Result;
-    use pingora_proxy::{ProxyHttp, RequestBodyAction, Session};
+    use pingora_proxy::{ProxyHttp, RequestBodyAction, RequestBodyEvent, Session};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
     pub const PROXY_ADDR: &str = "127.0.0.1:6161";
 
-    /// How many `(None, end_of_stream = true)` request-body events the
+    /// How many terminal request-body events the
     /// application received. The pump owes the application EXACTLY one per
     /// request, and the RFC 9113 section 8.1 handling must not spend it.
-    pub static EOS_EVENTS: AtomicUsize = AtomicUsize::new(0);
+    pub static TERMINAL_EVENTS: AtomicUsize = AtomicUsize::new(0);
+    /// How many terminal events identified an abandoned downstream body.
+    pub static ABANDONED_EVENTS: AtomicUsize = AtomicUsize::new(0);
     /// How many times the exchange reached `logging`, i.e. finished. Bumped
-    /// AFTER `EOS_EVENTS`, so a reader that sees this also sees that.
+    /// AFTER `TERMINAL_EVENTS`, so a reader that sees this also sees that.
     pub static COMPLETED: AtomicUsize = AtomicUsize::new(0);
+
+    /// Serializes the tests that drive THIS proxy.
+    ///
+    /// The three counters above are process-global and per-transport, not
+    /// per-request, so every claim about them is a claim about a DELTA across
+    /// one exchange. Two tests uploading through this proxy at the same time --
+    /// libtest runs the tests of one binary on parallel threads -- would each
+    /// see the other's increments, and both would fail (or, worse, pass for the
+    /// wrong reason). The tests using `tests/utils`'s proxy on 6147 are
+    /// unaffected and stay parallel.
+    pub static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     pub struct ObservingProxy {}
 
@@ -382,11 +395,14 @@ mod observing {
             &self,
             _session: &mut Session,
             _body: &mut Option<Bytes>,
-            end_of_stream: bool,
+            event: RequestBodyEvent,
             _ctx: &mut (),
         ) -> Result<RequestBodyAction> {
-            if end_of_stream {
-                EOS_EVENTS.fetch_add(1, Ordering::SeqCst);
+            if event.is_terminal() {
+                TERMINAL_EVENTS.fetch_add(1, Ordering::SeqCst);
+            }
+            if event == RequestBodyEvent::Abandoned {
+                ABANDONED_EVENTS.fetch_add(1, Ordering::SeqCst);
             }
             Ok(RequestBodyAction::Continue)
         }
@@ -436,25 +452,29 @@ mod observing {
     }
 }
 
-/// I1: the application's single end-of-stream request-body event must survive
+/// I1: the application's single terminal request-body event must survive
 /// the RFC 9113 section 8.1 handling.
 ///
 /// The canonical shape fails a MID-body write (`data = Some(chunk)`,
 /// `end_of_body = false`): the origin resets precisely BECAUSE this side is
 /// still uploading. Handling that by finishing the downstream read side also
 /// disables `downstream_body_read_is_futile` (which requires `is_reading()`),
-/// so without the explicit `(None, true)` the hooks never see the end of the
-/// body -- while the request completes 200 and logs as a success.
+/// so without the explicit `Abandoned` event the hooks never learn that the
+/// body was cut short -- while the request completes 200 and logs as a success.
 ///
 /// The client here holds its chunked body open past the reset and then simply
 /// stops, so the pump never reads a downstream EOF of its own: if the handler
 /// does not deliver the event, nothing else will.
 #[tokio::test]
-async fn h2_upstream_no_error_reset_still_delivers_the_end_of_stream_event() {
+async fn h2_upstream_no_error_reset_reports_abandoned_request_body() {
     observing::init();
+    // See `observing::SERIAL`: the counters below are process-global, so this
+    // exchange must be the only one going through that proxy.
+    let _serial = observing::SERIAL.lock().await;
     let port = spawn_ok_then_reset_origin(Duration::from_millis(100)).await;
 
-    let before_eos = observing::EOS_EVENTS.load(std::sync::atomic::Ordering::SeqCst);
+    let before_terminal = observing::TERMINAL_EVENTS.load(std::sync::atomic::Ordering::SeqCst);
+    let before_abandoned = observing::ABANDONED_EVENTS.load(std::sync::atomic::Ordering::SeqCst);
     let before_done = observing::COMPLETED.load(std::sync::atomic::Ordering::SeqCst);
 
     let mut io = TcpStream::connect(observing::PROXY_ADDR).await.unwrap();
@@ -480,8 +500,8 @@ async fn h2_upstream_no_error_reset_still_delivers_the_end_of_stream_event() {
     io.write_all(b"5\r\nworld\r\n").await.unwrap();
 
     // Wait for the exchange to finish. The client never sends its terminating
-    // chunk, so the only way the end-of-stream event can exist is if the pump
-    // synthesised it.
+    // chunk, so the only terminal notification can be the pump's explicit
+    // `Abandoned` event.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while observing::COMPLETED.load(std::sync::atomic::Ordering::SeqCst) == before_done {
         assert!(
@@ -492,12 +512,116 @@ async fn h2_upstream_no_error_reset_still_delivers_the_end_of_stream_event() {
     }
 
     assert_eq!(
-        observing::EOS_EVENTS.load(std::sync::atomic::Ordering::SeqCst),
-        before_eos + 1,
-        "the application is owed exactly one (None, end_of_stream = true) request \
-         body event, and the upstream's stop-uploading reset must not spend it"
+        observing::TERMINAL_EVENTS.load(std::sync::atomic::Ordering::SeqCst),
+        before_terminal + 1,
+        "the application is owed exactly one terminal request-body event, and the \
+         upstream's stop-uploading reset must not spend it"
+    );
+    assert_eq!(
+        observing::ABANDONED_EVENTS.load(std::sync::atomic::Ordering::SeqCst),
+        before_abandoned + 1,
+        "the synthetic terminal event must identify the incomplete downstream body as abandoned"
     );
     drop(io);
+}
+
+/// Spawn a cleartext-h2 origin that DRAINS the whole request body and only then
+/// answers 200 with a short body. One request only.
+///
+/// Draining first is what makes the 200 evidence that the proxy really forwarded
+/// the complete request body, rather than a race against it.
+async fn spawn_h2_drain_then_ok_origin() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (io, _) = listener.accept().await.unwrap();
+        let mut conn = h2::server::handshake(io).await.unwrap();
+        let (req, mut send_resp) = conn.accept().await.unwrap().unwrap();
+        let mut body = req.into_parts().1;
+        // The drain runs in its OWN task: only `conn.accept()` drives the
+        // connection's I/O, so draining inline would stop the flow-control
+        // updates below from ever reaching the peer -- and the upload, which is
+        // far larger than the initial window, would stall forever.
+        tokio::spawn(async move {
+            while let Some(chunk) = body.data().await {
+                let Ok(chunk) = chunk else { break };
+                // Reopen the window, or the peer stops after one window's worth.
+                let _ = body.flow_control().release_capacity(chunk.len());
+            }
+            let resp = Response::builder().status(StatusCode::OK).body(()).unwrap();
+            if let Ok(mut send_stream) = send_resp.send_response(resp, false) {
+                let _ = send_stream.send_data(Bytes::from(RESPONSE_BODY), true);
+            }
+        });
+        while conn.accept().await.is_some() {}
+    });
+    port
+}
+
+/// The NEGATIVE direction of I1, on the same observing proxy: an upload the
+/// client really finishes must be reported as a completion and NOT as an
+/// abandonment.
+///
+/// `TERMINAL_EVENTS` alone cannot state this. It is bumped on
+/// `event.is_terminal()`, which is true for `Abandoned` as well as for
+/// `Complete`, so a pump that labelled every normal end-of-stream `Abandoned`
+/// (the one-character regression of writing `is_terminal()` where the code means
+/// `is_complete()`, or of reusing the `Abandoned` constant as "the terminal
+/// one") would keep the assertion in
+/// `h2_upstream_no_error_reset_reports_abandoned_request_body` -- and every
+/// `x-eos-events: 1` assertion in the seam suite -- exactly as green as it is
+/// now. What it would break is everything downstream of the distinction: a
+/// filter that cancels its mirror on `Abandoned` would cancel every request, and
+/// a bridge that only sets `end_of_stream = true` on `Complete` would never set
+/// it at all.
+///
+/// So the load-bearing assertion here is that `ABANDONED_EVENTS` did NOT move.
+#[tokio::test]
+async fn h2_upstream_completed_upload_is_not_reported_as_abandoned() {
+    observing::init();
+    // See `observing::SERIAL`: the counters below are process-global, so this
+    // exchange must be the only one going through that proxy.
+    let _serial = observing::SERIAL.lock().await;
+    let port = spawn_h2_drain_then_ok_origin().await;
+
+    let before_terminal = observing::TERMINAL_EVENTS.load(std::sync::atomic::Ordering::SeqCst);
+    let before_abandoned = observing::ABANDONED_EVENTS.load(std::sync::atomic::Ordering::SeqCst);
+    let before_done = observing::COMPLETED.load(std::sync::atomic::Ordering::SeqCst);
+
+    // A real, finished body: `reqwest` sends it with a `Content-Length`, so the
+    // downstream read side observes the transport's own end of the body.
+    let res = reqwest::Client::new()
+        .post(format!("http://{}/upload", observing::PROXY_ADDR))
+        .header("x-port", port.to_string())
+        .body("x".repeat(UPLOAD_LEN))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .expect("the upload must succeed against an origin that drains it");
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.text().await.unwrap(), RESPONSE_BODY);
+
+    // `COMPLETED` is bumped after the body events, so waiting on it is what makes
+    // the two reads below final rather than a snapshot of a request in flight.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while observing::COMPLETED.load(std::sync::atomic::Ordering::SeqCst) == before_done {
+        assert!(Instant::now() < deadline, "the exchange never finished");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(
+        observing::ABANDONED_EVENTS.load(std::sync::atomic::Ordering::SeqCst),
+        before_abandoned,
+        "a downstream body the client really ended must never be reported as \
+         abandoned: `Abandoned` means the delivered bytes are only a prefix, and \
+         nothing here cut the body short"
+    );
+    assert_eq!(
+        observing::TERMINAL_EVENTS.load(std::sync::atomic::Ordering::SeqCst),
+        before_terminal + 1,
+        "the completed body still owes the application exactly one terminal \
+         request-body event"
+    );
 }
 
 /// The response the test below streams, as many small DATA frames. The COUNT

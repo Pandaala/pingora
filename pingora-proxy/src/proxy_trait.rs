@@ -170,6 +170,13 @@ pub trait ProxyHttp {
     /// This function will be called every time a piece of request body is received. The `body` is
     /// **not the entire request body**.
     ///
+    /// [`RequestBodyEvent::Complete`] means the downstream transport's real
+    /// end-of-stream was observed. [`RequestBodyEvent::Abandoned`] is also
+    /// terminal, but the bytes delivered so far are only a prefix because the
+    /// proxy deliberately stopped reading the downstream body.
+    /// A later upstream retry may replay buffered body events through the same
+    /// hook; it does not change the original downstream completion cause.
+    ///
     /// The async nature of this function allows to throttle the upload speed and/or executing
     /// heavy computation logic such as WAF rules on offloaded threads without blocking the threads
     /// who process the requests themselves.
@@ -177,7 +184,7 @@ pub trait ProxyHttp {
         &self,
         _session: &mut Session,
         _body: &mut Option<Bytes>,
-        _end_of_stream: bool,
+        _event: RequestBodyEvent,
         _ctx: &mut Self::CTX,
     ) -> Result<()>
     where
@@ -200,21 +207,19 @@ pub trait ProxyHttp {
     /// closed with an [`InternalError`](pingora_error::ErrorType::InternalError)
     /// instead.
     ///
-    /// The default preserves source compatibility by invoking
-    /// [`Self::request_body_filter`] and returning
+    /// The default invokes [`Self::request_body_filter`] and returns
     /// [`RequestBodyAction::Continue`].
     async fn request_body_filter_action(
         &self,
         session: &mut Session,
         body: &mut Option<Bytes>,
-        end_of_stream: bool,
+        event: RequestBodyEvent,
         ctx: &mut Self::CTX,
     ) -> Result<RequestBodyAction>
     where
         Self::CTX: Send + Sync,
     {
-        self.request_body_filter(session, body, end_of_stream, ctx)
-            .await?;
+        self.request_body_filter(session, body, event, ctx).await?;
         Ok(RequestBodyAction::Continue)
     }
 
@@ -232,18 +237,18 @@ pub trait ProxyHttp {
     /// is `None` there.
     ///
     /// It also fires only when the PUMP owns the request-body read, and only
-    /// when the pump actually observes the transport EOF. Two shapes skip it:
+    /// when the pump actually observes the transport EOF. These shapes skip it:
     /// - The application consumed the downstream body itself before proxying
     ///   started, without registering a replay buffer, so the pump has nothing
     ///   to read and never sees the EOF. An inspection policy that depends on
     ///   this hook must therefore not pre-read the request body.
-    /// - The pump abandoned the downstream read as futile: the upstream
-    ///   response completed while the client never ended a request body it had
-    ///   declared empty (`Content-Length: 0` without END_STREAM on H2). The
-    ///   pump then synthesizes the single
-    ///   [`Self::request_body_filter_action`] end-of-stream event, but the
-    ///   trailer-presence fact was never established, so a request that would
-    ///   have sent TRAILERS later yields no trailer event.
+    /// - The pump abandoned the downstream read before observing EOF. This can
+    ///   happen when the read became futile after an upstream response, or when
+    ///   an upstream leg stopped consuming a partially uploaded body. The pump
+    ///   emits [`RequestBodyEvent::Abandoned`] through
+    ///   [`Self::request_body_filter_action`], but the trailer-presence fact was
+    ///   never established, so a request that would have sent TRAILERS later
+    ///   yields no trailer event.
     ///
     /// The [`RequestBodyAction::Terminate`] contract is the same as for
     /// [`Self::request_body_filter_action`]: the application must have
@@ -895,7 +900,7 @@ mod tests {
             &self,
             _session: &mut Session,
             _body: &mut Option<Bytes>,
-            _end_of_stream: bool,
+            _event: RequestBodyEvent,
             ctx: &mut Self::CTX,
         ) -> Result<()> {
             *ctx = true;
@@ -912,7 +917,7 @@ mod tests {
         let app = LegacyBodyFilter;
 
         let action = app
-            .request_body_filter_action(&mut session, &mut body, false, &mut ctx)
+            .request_body_filter_action(&mut session, &mut body, RequestBodyEvent::Data, &mut ctx)
             .await
             .unwrap();
 

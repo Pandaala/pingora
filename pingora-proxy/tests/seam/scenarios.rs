@@ -15,6 +15,7 @@ use super::{Combo, Down, Step, Up};
 use crate::skip_combo;
 use bytes::Bytes;
 use h2::Reason;
+use pingora_proxy::RequestBodyEvent;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -714,13 +715,37 @@ pub fn cl0_without_end_stream_sends_one_eos(combo: Combo) {
     let (port, rec, _upstream) = combo.spawn(&[Step::DrainThenOk200]);
 
     RT.block_on(async {
-        let (status, eos_events, _echoed) =
+        let (status, eos_events, _echoed, record) =
             h2_cl0_no_end_stream_request(port, combo.upstream_is_h2()).await;
         assert_eq!(status, 200);
         assert_eq!(
             eos_events, "1",
             "the application must see exactly one end-of-stream event"
         );
+        // The NEGATIVE half of the same claim. This client ends its request
+        // stream with a real END_STREAM DATA frame, so the one terminal event it
+        // earns must be `Complete`. `x-eos-events` above cannot say that:
+        // `is_terminal()` is true for `Abandoned` too, so a pump that labelled
+        // this normal end-of-stream as "the proxy gave up reading" would keep
+        // that header at `1` -- while every application built on the
+        // distinction (a mirror that cancels, a digest that is discarded, a
+        // protobuf `end_of_stream` flag that is never set) silently breaks.
+        assert_eq!(
+            record.abandoned_events, 0,
+            "a downstream body that really ended must never be reported as abandoned"
+        );
+        assert_eq!(
+            record.eos_events, 1,
+            "the final count, after the pump released the request, must still be one \
+             terminal event"
+        );
+        assert_eq!(
+            record.events,
+            vec![RequestBodyEvent::Complete],
+            "a `Content-Length: 0` request that ends with an empty END_STREAM DATA \
+             frame owes the application exactly one event, and it is the completion"
+        );
+        record.assert_hooks_agree("a Content-Length: 0 request ended by a real END_STREAM");
 
         // The upstream framing follows the request's own DECLARATION, so
         // `Content-Length: 0` closes the upstream request stream at header

@@ -13,13 +13,16 @@ use http::Response;
 use once_cell::sync::Lazy;
 use pingora_cache::lock::{CacheKeyLockImpl, CacheLock};
 use pingora_cache::{CacheKey, MemCache};
+use pingora_core::modules::http::compression::ResponseCompressionBuilder;
+use pingora_core::modules::http::{HttpModule, HttpModuleBuilder, HttpModules, Module};
 use pingora_core::server::configuration::ServerConf;
 use pingora_core::server::Server;
 use pingora_core::services::ServiceWithDependents;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::Result;
 use pingora_http::{RequestHeader, ResponseHeader};
-use pingora_proxy::{ProxyHttp, Session};
+use pingora_proxy::{ProxyHttp, RequestBodyEvent, Session};
+use std::any::Any;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -64,6 +67,24 @@ pub struct CompletionRecord {
     /// stamps it while the upstream response headers pass through, which is
     /// necessarily before the pump could deliver a late end-of-stream event.
     pub eos_events: usize,
+    /// `ctx.abandoned_events` as of `logging`.
+    pub abandoned_events: usize,
+    /// Every [`RequestBodyEvent`], in order, that
+    /// `ProxyHttp::request_body_filter_action` was handed for this request.
+    ///
+    /// The counters above are lossy on purpose (`eos_events` MERGES `Complete`
+    /// and `Abandoned`), which is precisely what lets a mislabelled terminal
+    /// event pass unnoticed. The sequence is not lossy, so a test can state the
+    /// exact shape it expects -- e.g. "all `Data` and then one `Complete`".
+    pub events: Vec<RequestBodyEvent>,
+    /// The same sequence as observed by the downstream [`BodyEventProbe`]
+    /// module, read back out of `session.downstream_modules_ctx` in `logging`.
+    ///
+    /// The pump hands ONE event to both `HttpModuleCtx::request_body_filter`
+    /// and `ProxyHttp::request_body_filter_action`; that the two sides see the
+    /// same thing is an explicit promise of the typed-event design, and
+    /// comparing these two fields is the only place a real pump proves it.
+    pub module_events: Vec<RequestBodyEvent>,
     /// The final error's `retry` flag: `-1` = no error, `0`/`1` = the
     /// `RetryType::Decided` value, `2` = the undecided `ReusedOnly`.
     ///
@@ -73,6 +94,34 @@ pub struct CompletionRecord {
     /// behaviour cannot tell those two lines apart from the loop's check. What
     /// the application sees on the error it is handed can.
     pub retry_flag: i8,
+}
+
+impl CompletionRecord {
+    /// How many events of exactly `kind` `request_body_filter_action` saw.
+    pub fn count(&self, kind: RequestBodyEvent) -> usize {
+        self.events.iter().filter(|e| **e == kind).count()
+    }
+
+    /// Require that the downstream module and the `ProxyHttp` hook were handed
+    /// the same request-body events, in the same order.
+    ///
+    /// The two hooks are fed from a single `event` variable inside
+    /// `send_body_to_pipe`, so nothing about their agreement is structurally
+    /// enforced: a future change that recomputes the event for one of the two
+    /// call sites (or reorders them around a mutation of `event`) would leave
+    /// the module -- e.g. a mirroring or gRPC-bridge module -- with a different
+    /// story about the same body than the application has, and every
+    /// application-side assertion in this suite would stay green.
+    #[track_caller]
+    pub fn assert_hooks_agree(&self, what: &str) {
+        assert_eq!(
+            self.events, self.module_events,
+            "the pump must hand a downstream HttpModule exactly the request-body \
+             events it hands ProxyHttp::request_body_filter_action ({what}): the \
+             application saw {:?} while the module saw {:?}",
+            self.events, self.module_events
+        );
+    }
 }
 
 /// The rendezvous between a test and `logging`, keyed by the id the request
@@ -190,13 +239,62 @@ impl Drop for CompletionHandle {
     }
 }
 
+/// A downstream [`HttpModule`] whose only job is to record the request-body
+/// events the pump hands the MODULE chain, so that they can be compared with
+/// the ones it hands `ProxyHttp::request_body_filter_action`.
+///
+/// A module cannot see `SeamCtx`, and this deliberately does not try to: the
+/// events stay inside the module instance, which lives in the per-request
+/// `session.downstream_modules_ctx` and is read back by `logging` through
+/// `HttpModuleCtx::get::<BodyEventProbe>()`. That keeps the observation
+/// per-request -- the same property [`CompletionRecord`] exists for -- where a
+/// process-global counter keyed by the observation id would be shared by every
+/// concurrently running test in this binary.
+#[derive(Default)]
+pub struct BodyEventProbe {
+    events: Vec<RequestBodyEvent>,
+}
+
+#[async_trait]
+impl HttpModule for BodyEventProbe {
+    async fn request_body_filter(
+        &mut self,
+        _body: &mut Option<Bytes>,
+        event: RequestBodyEvent,
+    ) -> Result<()> {
+        self.events.push(event);
+        Ok(())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+struct BodyEventProbeBuilder;
+
+impl HttpModuleBuilder for BodyEventProbeBuilder {
+    fn init(&self) -> Module {
+        Box::new(BodyEventProbe::default())
+    }
+}
+
 #[derive(Default)]
 pub struct SeamCtx {
     body_bytes_seen: usize,
-    /// How many times the request body filter was invoked with
-    /// `end_of_stream`. Echoed back as `x-eos-events` by `response_filter`
-    /// so tests can assert the application sees exactly one EOS.
+    /// How many terminal request-body events the filter observed. Echoed back
+    /// as `x-eos-events` so existing tests can assert exactly one terminal
+    /// notification regardless of its cause.
     eos_events: usize,
+    /// How many terminal events reported that the proxy abandoned an
+    /// incomplete downstream body.
+    abandoned_events: usize,
+    /// Every event, in order. See [`CompletionRecord::events`].
+    events: Vec<RequestBodyEvent>,
     /// How many times `request_trailer_filter` was invoked. Echoed back as
     /// `x-trailer-hook-calls`; the hook's contract is at most one call per
     /// downstream request, including across retry attempts.
@@ -210,6 +308,19 @@ impl ProxyHttp for SeamProxy {
     type CTX = SeamCtx;
     fn new_ctx(&self) -> Self::CTX {
         SeamCtx::default()
+    }
+
+    /// Register [`BodyEventProbe`] alongside the module the trait default would
+    /// have added on its own.
+    ///
+    /// The disabled `ResponseCompressionBuilder` is repeated here on purpose:
+    /// overriding this hook REPLACES the default, and several tests in
+    /// `tests/utils` rely on that module existing at all. Keeping it means the
+    /// only thing the probe changes about this proxy is that an extra module
+    /// observes the request body.
+    fn init_downstream_modules(&self, modules: &mut HttpModules) {
+        modules.add_module(ResponseCompressionBuilder::enable(0));
+        modules.add_module(Box::new(BodyEventProbeBuilder));
     }
 
     /// Only bookkeeping: record that the proxy ADMITTED a request carrying an
@@ -360,12 +471,16 @@ impl ProxyHttp for SeamProxy {
         &self,
         session: &mut Session,
         body: &mut Option<Bytes>,
-        end_of_stream: bool,
+        event: RequestBodyEvent,
         ctx: &mut Self::CTX,
     ) -> Result<pingora_proxy::RequestBodyAction> {
-        if end_of_stream {
+        if event.is_terminal() {
             ctx.eos_events += 1;
         }
+        if event == RequestBodyEvent::Abandoned {
+            ctx.abandoned_events += 1;
+        }
+        ctx.events.push(event);
         ctx.body_bytes_seen += body.as_ref().map_or(0, |b| b.len());
 
         // Write a chunked response header + body but do NOT end the stream,
@@ -381,7 +496,7 @@ impl ProxyHttp for SeamProxy {
             .headers
             .get("x-terminate-unflushed")
             .is_some()
-            && end_of_stream
+            && event.is_terminal()
         {
             let mut resp = ResponseHeader::build(403, None).unwrap();
             resp.insert_header("transfer-encoding", "chunked")?;
@@ -451,12 +566,26 @@ impl ProxyHttp for SeamProxy {
             Some(pingora_error::RetryType::ReusedOnly) => 2,
             None => -1,
         };
+        // The module side of the same request, read out of the per-request
+        // module ctx. `logging` is the earliest phase that is guaranteed to run
+        // after the LAST body event (`response_filter` runs while the upstream
+        // response headers pass through, i.e. possibly before a late terminal
+        // event), and the session -- module ctx included -- is still alive here.
+        let module_events = session
+            .downstream_modules_ctx
+            .get::<BodyEventProbe>()
+            .expect("SeamProxy::init_downstream_modules registers BodyEventProbe")
+            .events
+            .clone();
         // The send can only fail if the test already dropped its handle (e.g.
         // its own deadline fired first); there is nothing to tell it then.
         if let Some(tx) = COMPLETION_OBSERVATIONS.lock().unwrap().remove(&id) {
             let _ = tx.send(CompletionRecord {
                 finished_at: Instant::now(),
                 eos_events: ctx.eos_events,
+                abandoned_events: ctx.abandoned_events,
+                events: ctx.events.clone(),
+                module_events,
                 retry_flag,
             });
         }
@@ -527,7 +656,7 @@ impl ProxyHttp for LegacyHookProxy {
         &self,
         _session: &mut Session,
         body: &mut Option<Bytes>,
-        _end_of_stream: bool,
+        _event: RequestBodyEvent,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         ctx.calls += 1;
@@ -1495,6 +1624,30 @@ pub enum UpstreamStep {
     Respond(&'static [u8]),
     /// Read one request, then close without writing anything.
     CloseWithoutResponse,
+    /// Read one request, write this exact byte string, wait to be RELEASED, then
+    /// CLOSE the connection -- WITHOUT ever consuming the request body.
+    ///
+    /// [`Self::Respond`] keeps the connection and drains the body, so the
+    /// proxy's request-body writes keep succeeding for as long as the client
+    /// uploads. This step is the only way to make the proxy's NEXT upstream body
+    /// write fail while the response it already holds is complete, which is what
+    /// drives `proxy_handle_upstream` to set both `response_done` and
+    /// `request_done`, return, and drop the receiving end of the body pipe. The
+    /// downstream half of the duplex loop then observes `tx.is_closed()`, and
+    /// what it owes the application there is
+    /// `single::h1_upstream_gone_mid_upload_reports_exactly_one_abandoned_event`'s
+    /// claim.
+    ///
+    /// The gate is not a nicety, it is what makes that test deterministic.
+    /// Closing a socket that still holds unread request-body bytes makes the
+    /// kernel send RST, and an RST DISCARDS whatever the peer had not yet read --
+    /// including this very response. Ungated, the proxy would sometimes see a
+    /// read error instead of the complete response and take the upstream-error
+    /// path, which delivers no `Abandoned` event at all. The test releases the
+    /// gate only after its own client has read the whole response, which
+    /// (response tasks are forwarded downstream only after `response_done` is
+    /// set) proves the proxy is past that point.
+    RespondThenClose(&'static [u8], Arc<Notify>),
     /// Read one request (headers only), then hang forever.
     Hang,
     /// Read one request (headers only), then never respond -- but keep READING
@@ -1623,6 +1776,15 @@ async fn serve_scripted_h1_connection(
                 }
             }
             Some(UpstreamStep::CloseWithoutResponse) => return,
+            Some(UpstreamStep::RespondThenClose(bytes, gate)) => {
+                let _ = stream.write_all(bytes).await;
+                // The timeout is only so a test that panicked before releasing
+                // the gate does not leak this task for the rest of the run.
+                let _ = tokio::time::timeout(Duration::from_secs(30), gate.notified()).await;
+                // Returning drops the socket, so the peer's next write to it
+                // fails. The body is deliberately left unconsumed.
+                return;
+            }
             Some(UpstreamStep::Hang) => {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
                 return;
@@ -2058,12 +2220,18 @@ pub async fn terminate_reply_and_eof(addr: &str, request: &str, rec: &Recorder) 
 
 /// Send `POST /` with `content-length: 0` over the h2c listener WITHOUT
 /// END_STREAM on HEADERS, then close the request stream with an empty
-/// END_STREAM DATA frame. Returns (status, `x-eos-events`, `x-headers-eos`).
+/// END_STREAM DATA frame. Returns (status, `x-eos-events`, `x-headers-eos`,
+/// [`CompletionRecord`]).
+///
+/// The record is what carries the NEGATIVE half of the end-of-stream claim: the
+/// echoed `x-eos-events` header merges `Complete` and `Abandoned`, so it stays
+/// `1` even if this normally-ended body were reported as abandoned.
 pub async fn h2_cl0_no_end_stream_request(
     upstream_port: u16,
     h2_upstream: bool,
-) -> (u16, String, Option<String>) {
+) -> (u16, String, Option<String>, CompletionRecord) {
     let ports = init();
+    let (id, completion) = observe_completion();
     let tcp = TcpStream::connect(ports.h2c_addr()).await.unwrap();
     let (h2, connection) = h2::client::handshake(tcp).await.unwrap();
     tokio::spawn(async move {
@@ -2075,6 +2243,7 @@ pub async fn h2_cl0_no_end_stream_request(
         .method("POST")
         .uri("http://t/")
         .header("x-port", upstream_port.to_string())
+        .header("x-observe-completion", id.into_header())
         .header("content-length", "0");
     if h2_upstream {
         builder = builder.header("x-h2", "1");
@@ -2096,11 +2265,17 @@ pub async fn h2_cl0_no_end_stream_request(
             .get(name)
             .map(|v| v.to_str().unwrap().to_string())
     };
-    (
-        response.status().as_u16(),
-        header("x-eos-events").expect("response_filter always sets x-eos-events"),
-        header("x-headers-eos"),
-    )
+    let status = response.status().as_u16();
+    let eos_events = header("x-eos-events").expect("response_filter always sets x-eos-events");
+    let echoed = header("x-headers-eos");
+    let record = completion
+        .wait(
+            Duration::from_secs(10),
+            "the request never reached ProxyHttp::logging even though the client held a \
+             complete response: the pump is still parked on the downstream read side",
+        )
+        .await;
+    (status, eos_events, echoed, record)
 }
 
 pub fn res_status(res: std::result::Result<reqwest::Response, reqwest::Error>) -> u16 {

@@ -8,9 +8,11 @@
 
 use super::harness::*;
 use bytes::Bytes;
+use pingora_proxy::RequestBodyEvent;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Notify;
 
@@ -256,10 +258,10 @@ fn h2_cl0_never_ending_request_reaches_an_upstream_that_waits_for_eos() {
 /// proxy finished the request.
 ///
 /// The response headers ARE the observable for invariant B: abandoning the
-/// read must still deliver the application its single end-of-stream event
-/// (`x-eos-events: 1`). Simply finishing the downstream state instead would
-/// silently skip an application that finalizes its inspection at EOS -- a
-/// client-reachable zero-EOS cell.
+/// read must still deliver the application one terminal event
+/// (`x-eos-events: 1`), identified as `Abandoned`. Simply finishing the
+/// downstream state instead would silently skip an application that finalizes
+/// its inspection at termination.
 #[test]
 fn h2_cl0_never_ending_request_completes() {
     let ports = init();
@@ -312,13 +314,270 @@ fn h2_cl0_never_ending_request_completes() {
                 .await;
 
             // ... and abandoning the read must not cost the application its
-            // single end-of-stream event (invariant B).
+            // single terminal event (invariant B).
             assert_eq!(
                 record.eos_events, 1,
-                "the application must still see exactly one end-of-stream event \
+                "the application must still see exactly one terminal event \
                  when the {tag}-upstream pump abandons the downstream read"
             );
+            assert_eq!(
+                record.abandoned_events, 1,
+                "the {tag}-upstream pump must distinguish its synthetic terminal event \
+                 from a complete downstream body"
+            );
+            assert_eq!(
+                record.events,
+                vec![RequestBodyEvent::Abandoned],
+                "the {tag}-upstream pump owes this request exactly one event and it is \
+                 the abandonment: this client never sent a byte and never ended its \
+                 stream, so there is nothing else to report"
+            );
+            // The module side of the SAME abandonment. A downstream module is
+            // where a real gateway hangs its mirroring/inspection, and it is fed
+            // from a different call site than the application hook; nothing else
+            // in this suite proves a real pump gives both the same event.
+            record.assert_hooks_agree(&format!(
+                "the {tag}-upstream pump abandoning an unfinished downstream body"
+            ));
         });
+    }
+}
+
+/// The H1 duplex loop's OTHER way of giving up on the downstream read side: the
+/// body pipe is closed because `proxy_handle_upstream` already returned.
+///
+/// This is not the futile-read branch, and no other test in this file can reach
+/// it: that branch requires `is_body_empty()`, and this request declares a real
+/// chunked body. The arm is
+/// `_ = tx.reserve(), if downstream_state.is_reading() && send_permit.is_err()`,
+/// and it used to call `downstream_state.maybe_finished(upstream_closed)` and
+/// nothing else -- so the request's single terminal body event was spent on
+/// silence: neither `Complete` nor `Abandoned` ever reached
+/// `request_body_filter_action`, `request_body_filter` or the module chain, while
+/// the request logged as a plain success. An application that finalizes at
+/// termination (a digest, an audit record, a mirrored request) simply never
+/// finalizes.
+///
+/// Getting here is deterministic, and every step is forced rather than hoped for:
+/// - the client declares a chunked body and never terminates it, so
+///   `is_body_empty()` is false (the futile branch cannot fire) and
+///   `downstream_state.is_reading()` stays true;
+/// - the origin sends a COMPLETE response and then closes its socket, so the
+///   proxy's next upstream body write fails. That is the one place
+///   `proxy_handle_upstream` sets `request_done = true` off a write error; with
+///   `response_done` already true it returns and drops `rx`;
+/// - `tx.try_reserve()` on a CLOSED channel returns `Err` whatever the capacity,
+///   so the arm's guard needs no full pipe, and the read arm (guarded on
+///   `send_permit.is_ok()`) is off for the same reason. Nothing else in the
+///   `select!` is runnable.
+///
+/// The close is gated on this test having read the whole response; see
+/// [`UpstreamStep::RespondThenClose`] for why an ungated close would race.
+#[test]
+fn h1_upstream_gone_mid_upload_reports_exactly_one_abandoned_event() {
+    let ports = init();
+    let close_upstream = Arc::new(Notify::new());
+    let upstream = spawn_scripted_upstream(vec![UpstreamStep::RespondThenClose(
+        OK_KEEPALIVE,
+        close_upstream.clone(),
+    )]);
+    let port = upstream.port();
+
+    RT.block_on(async {
+        let (id, completion) = observe_completion();
+        let mut stream = TcpStream::connect(ports.h1_addr()).await.unwrap();
+        // `x-no-retry` keeps the native retry buffer out of the shape: a
+        // buffered body could be replayed through the same hooks on a second
+        // attempt, and the claim here is about ONE attempt's event count.
+        stream
+            .write_all(
+                format!(
+                    "POST /upload HTTP/1.1\r\nHost: t\r\nx-port: {port}\r\n\
+                     x-no-retry: 1\r\nx-observe-completion: {}\r\n\
+                     Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n",
+                    id.into_header()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        // The complete response, read to its last byte. Response tasks only
+        // reach the downstream half after `response_done` was set, so this also
+        // establishes that the upstream half will never poll its read arm again.
+        let mut pending = Vec::new();
+        let response = read_one_h1_response(&mut stream, &mut pending).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "the origin's complete response must reach the client before it closes: \
+             {response}"
+        );
+
+        // Only now may the origin's socket go away.
+        close_upstream.notify_one();
+
+        // Keep uploading: each chunk is another upstream write, and one of them
+        // is the write that fails. The client never terminates the body, so no
+        // downstream end-of-stream can be mistaken for the event under test.
+        let uploader = tokio::spawn(async move {
+            loop {
+                if stream.write_all(b"5\r\nworld\r\n").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let record = completion
+            .wait(
+                Duration::from_secs(10),
+                "the pump never finished the request after its upstream leg went away",
+            )
+            .await;
+        uploader.abort();
+
+        assert_eq!(
+            record.eos_events, 1,
+            "the application is owed exactly one terminal request-body event, and a \
+             closed body pipe must not spend it on silence"
+        );
+        assert_eq!(
+            record.abandoned_events, 1,
+            "the bytes delivered so far are only a prefix -- the client never ended its \
+             body -- so the single terminal event must be `Abandoned`, not `Complete`"
+        );
+        assert_eq!(
+            record.events.last(),
+            Some(&RequestBodyEvent::Abandoned),
+            "the abandonment must be the LAST event of the request, and the events are \
+             {:?}",
+            record.events
+        );
+        assert_eq!(
+            record.count(RequestBodyEvent::Complete),
+            0,
+            "no end of stream was ever observed on this transport, so nothing may \
+             report one: the events are {:?}",
+            record.events
+        );
+        record.assert_hooks_agree("an H1 upstream leg that went away mid-upload");
+    });
+}
+
+/// The direction nothing else in this suite states: a request whose client
+/// REALLY ends its body must report zero abandonments.
+///
+/// Every other end-of-stream assertion here goes through `eos_events` /
+/// `x-eos-events`, which is incremented on `event.is_terminal()` -- true for
+/// `Abandoned` as well as for `Complete`. So a regression that mislabels a
+/// normal end of stream keeps every one of those assertions green, while an
+/// application built on the distinction breaks completely.
+///
+/// Run on BOTH downstream transports and BOTH pumps, because the four cells
+/// have separate terminal-event call sites.
+#[test]
+fn a_completed_downstream_body_is_never_reported_as_abandoned() {
+    let ports = init();
+
+    for h2_upstream in [false, true] {
+        let up_tag = if h2_upstream { "h2" } else { "h1" };
+        for down_tag in ["h1", "h2c"] {
+            // A fresh upstream per cell: the script cursor is per upstream, and
+            // `RespondAfterBody`/`EchoRequestEos` answer only once the whole
+            // request body is in, so the 200 the client reads is itself evidence
+            // that the body really reached the origin.
+            let upstream = if h2_upstream {
+                spawn_scripted_h2_upstream(vec![H2UpstreamStep::EchoRequestEos])
+            } else {
+                spawn_scripted_upstream(vec![UpstreamStep::RespondAfterBody(OK_KEEPALIVE)])
+            };
+            let port = upstream.port();
+            let cell = format!("{down_tag} downstream -> {up_tag} upstream");
+
+            RT.block_on(async {
+                let (id, completion) = observe_completion();
+                let record = if down_tag == "h1" {
+                    let client = reqwest::Client::new();
+                    let mut req = client
+                        .post(format!("http://{}/", ports.h1_addr()))
+                        .header("x-port", port.to_string())
+                        .header("x-observe-completion", id.into_header())
+                        .body("hello");
+                    if h2_upstream {
+                        req = req.header("x-h2", "1");
+                    }
+                    let res = tokio::time::timeout(Duration::from_secs(10), req.send())
+                        .await
+                        .unwrap_or_else(|_| panic!("{cell} hung"))
+                        .unwrap();
+                    assert_eq!(res.status(), 200, "{cell}");
+                    completion
+                        .wait(
+                            Duration::from_secs(10),
+                            &format!("the {cell} request never reached ProxyHttp::logging"),
+                        )
+                        .await
+                } else {
+                    let tcp = TcpStream::connect(ports.h2c_addr()).await.unwrap();
+                    let (h2, connection) = h2::client::handshake(tcp).await.unwrap();
+                    tokio::spawn(async move {
+                        let _ = connection.await;
+                    });
+                    let mut h2 = h2.ready().await.unwrap();
+                    let mut builder = http::Request::builder()
+                        .method("POST")
+                        .uri("http://t/")
+                        .header("x-port", port.to_string())
+                        .header("x-observe-completion", id.into_header())
+                        .header("content-length", "5");
+                    if h2_upstream {
+                        builder = builder.header("x-h2", "1");
+                    }
+                    let (response, mut body) =
+                        h2.send_request(builder.body(()).unwrap(), false).unwrap();
+                    // The real transport end-of-stream, on the DATA frame.
+                    body.send_data(Bytes::from_static(b"hello"), true).unwrap();
+                    let response = tokio::time::timeout(Duration::from_secs(10), response)
+                        .await
+                        .unwrap_or_else(|_| panic!("{cell} hung"))
+                        .unwrap();
+                    assert_eq!(response.status(), 200, "{cell}");
+                    completion
+                        .wait(
+                            Duration::from_secs(10),
+                            &format!("the {cell} request never reached ProxyHttp::logging"),
+                        )
+                        .await
+                };
+
+                assert_eq!(
+                    record.abandoned_events, 0,
+                    "{cell}: a downstream body the client really ended must never be \
+                     reported as abandoned -- an application that cancels its mirror on \
+                     `Abandoned` would cancel every single request"
+                );
+                assert_eq!(
+                    record.eos_events, 1,
+                    "{cell}: the completed body still owes the application exactly one \
+                     terminal event"
+                );
+                assert_eq!(
+                    record.count(RequestBodyEvent::Complete),
+                    1,
+                    "{cell}: exactly one of this request's events must be the completion, \
+                     and the events are {:?}",
+                    record.events
+                );
+                assert_eq!(
+                    record.events.last(),
+                    Some(&RequestBodyEvent::Complete),
+                    "{cell}: the completion must be the LAST event -- nothing may follow \
+                     the end of the body -- and the events are {:?}",
+                    record.events
+                );
+                record.assert_hooks_agree(&cell);
+            });
+        }
     }
 }
 

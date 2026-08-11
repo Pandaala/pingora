@@ -142,13 +142,13 @@ enum UpstreamBodyOutcome {
     UpstreamDoneReceiving {
         /// Whether the event whose write failed was itself the end of the
         /// downstream body, i.e. whether the application's single
-        /// `(None, end_of_stream = true)` event has already been delivered.
+        /// terminal request-body event has already been delivered.
         ///
         /// The canonical §8.1 shape fails on a MID-body write, where it has
         /// not: the handler then owes the application that event before it
         /// takes the downstream read side out of the loop, because nothing else
         /// will ever deliver it. See the arms in `bidirection_down_to_up`.
-        end_of_stream_delivered: bool,
+        terminal_event_delivered: bool,
     },
 }
 
@@ -243,7 +243,7 @@ struct UpstreamBodyWrite {
 /// [`upstream_write_failed_because_stream_gone`].
 fn upstream_write_error_outcome(
     e: Box<Error>,
-    end_of_stream_delivered: bool,
+    terminal_event_delivered: bool,
     body_write: &UpstreamBodyWrite,
 ) -> Result<UpstreamBodyOutcome> {
     if body_write.upstream_response_ended.observed()
@@ -253,7 +253,7 @@ fn upstream_write_error_outcome(
             "upstream stopped receiving the request body after flagging its response complete: {e}"
         );
         Ok(UpstreamBodyOutcome::UpstreamDoneReceiving {
-            end_of_stream_delivered,
+            terminal_event_delivered,
         })
     } else {
         Err(e.into_up())
@@ -451,7 +451,7 @@ where
         // The downstream READ side always keeps the strict transport fact (see
         // `DownstreamStateMachine::new` and the bodyless prelude in
         // `bidirection_down_to_up`), so the client's real end of stream is still
-        // read and still produces exactly one application end-of-stream event.
+        // read and still produces exactly one application terminal event.
         let disposition = self.inner.upstream_request_body_disposition(session, ctx);
         let body_empty_declared = session.as_mut().is_body_empty();
         // The H2 pump always sends HTTP/2 upstream, so there is no below-1.1
@@ -516,7 +516,7 @@ where
         //   the H1 pump gets for free from its zero-length body writer.
         // - a request with no body at all, whose EOS rode on the HEADERS frame
         //   while the prelude below still owes the application its single
-        //   end-of-stream event.
+        //   `Complete` event.
         // - a request that DECLARED an empty body (`Content-Length: 0`) whose
         //   downstream stream has not ended yet: the declaration was forwarded
         //   upstream, and the client's real end-of-stream still has to be read
@@ -785,7 +785,7 @@ where
         // `Content-Length: 0`: an H2 downstream request declaring
         // `Content-Length: 0` without END_STREAM is not bodyless (design 4.3),
         // so the loop below reads on to the real EOS and would deliver a
-        // SECOND end-of-stream event. Requiring both facts delivers exactly
+        // SECOND terminal event. Requiring both facts delivers exactly
         // one. The upstream EOS for exactly this shape already rode on the
         // HEADERS frame (or on the empty DATA frame), which is why
         // `body_write.stream_closed` suppresses the write side here.
@@ -795,7 +795,7 @@ where
                 .send_body_to2(
                     session,
                     buffer,
-                    downstream_state.is_done(),
+                    RequestBodyEvent::from(downstream_state.is_done()),
                     client_body,
                     ctx,
                     &body_write,
@@ -816,9 +816,9 @@ where
                 // request here would discard that response; the duplex loop
                 // below still has to run to deliver it.
                 UpstreamBodyOutcome::UpstreamDoneReceiving {
-                    end_of_stream_delivered,
+                    terminal_event_delivered,
                 } => {
-                    if !end_of_stream_delivered
+                    if !terminal_event_delivered
                         && self
                             .finish_downstream_body_side(session, client_body, ctx, &body_write)
                             .await?
@@ -864,8 +864,8 @@ where
         {
             if downstream_body_read_is_futile(session, &downstream_state, &response_state) {
                 // Abandoning the read must not cost the application its single
-                // end-of-stream event (invariant B): run the hooks with
-                // `(None, end_of_stream = true)` exactly once.
+                // terminal event (invariant B): run the hooks with one
+                // `Abandoned` event exactly once.
                 //
                 // `body_write` is passed through UNCHANGED on purpose. Forcing
                 // `stream_closed: true` here would skip the terminating
@@ -884,7 +884,7 @@ where
                     .send_body_to2(
                         session,
                         None,
-                        true,
+                        RequestBodyEvent::Abandoned,
                         client_body,
                         ctx,
                         &UpstreamBodyWrite {
@@ -900,8 +900,8 @@ where
                     return Ok(DownstreamRequestOutcome::Terminate);
                 }
                 // `UpstreamDoneReceiving` needs nothing extra here. The
-                // end-of-stream event this branch exists to pay has just been
-                // paid (`(None, true)` above), so the only thing the arms in
+                // terminal event this branch exists to deliver has just been
+                // delivered (`Abandoned` above), so the only thing the arms in
                 // the loop below add -- `finish_downstream_body_side` -- would
                 // be a second delivery. The read side is already being
                 // finished, and `eos_write_optional` has already swallowed the
@@ -961,7 +961,17 @@ where
                         }
                     };
                     let is_body_done = session.is_body_done();
-                    match self.send_body_to2(session, body, is_body_done, client_body, ctx, &body_write).await {
+                    match self
+                        .send_body_to2(
+                            session,
+                            body,
+                            RequestBodyEvent::from(is_body_done),
+                            client_body,
+                            ctx,
+                            &body_write,
+                        )
+                        .await
+                    {
                         Ok(UpstreamBodyOutcome::Downstream(
                             DownstreamRequestOutcome::Complete(request_done)
                             | DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(request_done),
@@ -974,10 +984,10 @@ where
                         // in hand, and whether it is complete was decided by the
                         // read half. All that is left is to stop feeding a write
                         // half that is gone -- and, first, to pay the application
-                        // the end-of-stream event that taking the read side out of
+                        // the terminal event that taking the read side out of
                         // the loop would otherwise cost it.
-                        Ok(UpstreamBodyOutcome::UpstreamDoneReceiving { end_of_stream_delivered }) => {
-                            if !end_of_stream_delivered
+                        Ok(UpstreamBodyOutcome::UpstreamDoneReceiving { terminal_event_delivered }) => {
+                            if !terminal_event_delivered
                                 && self.finish_downstream_body_side(session, client_body, ctx, &body_write).await?
                             {
                                 session.set_keepalive(None);
@@ -1523,9 +1533,8 @@ where
         Ok(())
     }
 
-    /// Deliver the downstream body's single end-of-stream event, for a pump
-    /// that is about to stop reading the downstream body without having seen
-    /// its end.
+    /// Deliver the downstream body's single `Abandoned` terminal event for a
+    /// pump that is about to stop reading without having seen its end.
     ///
     /// Returns whether the application asked to terminate.
     ///
@@ -1534,7 +1543,7 @@ where
     /// uploading -- sets `downstream_state` to finished and disables the read
     /// branch. That also disables `downstream_body_read_is_futile`, which needs
     /// `is_reading()`, so nothing downstream of here would ever run the hooks
-    /// with `(None, end_of_stream = true)`: `request_body_filter_action` would
+    /// with a terminal event: `request_body_filter_action` would
     /// never see the end of the body, `request_trailer_filter` would never
     /// fire, and the downstream body modules would be left mid-stream -- while
     /// the request completed 200 and logged as a success. This is the same
@@ -1559,7 +1568,7 @@ where
             .send_body_to2(
                 session,
                 None,
-                true,
+                RequestBodyEvent::Abandoned,
                 client_body,
                 ctx,
                 &UpstreamBodyWrite {
@@ -1576,7 +1585,7 @@ where
         &self,
         session: &mut Session,
         mut data: Option<Bytes>,
-        end_of_body: bool,
+        mut event: RequestBodyEvent,
         client_body: &mut h2::SendStream<bytes::Bytes>,
         ctx: &mut SV::CTX,
         body_write: &UpstreamBodyWrite,
@@ -1600,9 +1609,13 @@ where
         // they CAN on a `SessionCustom` downstream, whose `is_body_done()` is
         // implemented by the user -- and this pump serves an H1/H2/custom
         // downstream depending only on which UPSTREAM protocol was selected.
-        let end_of_body = end_of_body || data.is_none();
+        if data.is_none() && event == RequestBodyEvent::Data {
+            event = RequestBodyEvent::Complete;
+        }
+        let end_of_body = event.is_terminal();
 
-        if data.is_none()
+        if event.is_complete()
+            && data.is_none()
             && !session.request_trailer_filter_fired
             && session
                 .downstream_session
@@ -1630,12 +1643,12 @@ where
 
         session
             .downstream_modules_ctx
-            .request_body_filter(&mut data, end_of_body)
+            .request_body_filter(&mut data, event)
             .await?;
 
         if self
             .inner
-            .request_body_filter_action(session, &mut data, end_of_body, ctx)
+            .request_body_filter_action(session, &mut data, event, ctx)
             .await?
             == RequestBodyAction::Terminate
         {

@@ -427,12 +427,12 @@ where
         // Native retry-buffer path. Registered app buffers are replayed through
         // `read_body_or_idle()` below, one bounded chunk at a time.
         //
-        // The bodyless prelude fires one immediate `(None, end)` body event. It
+        // The bodyless prelude fires one immediate terminal body event. It
         // must therefore require the transport fact (`is_body_done()`) and not
         // just `is_body_empty()`, which still infers emptiness from
         // `Content-Length: 0`: an H2 downstream request declaring `Content-Length: 0`
         // without END_STREAM is not bodyless (design 4.3), so the loop below reads
-        // on to the real EOS and would deliver a SECOND end-of-stream event to
+        // on to the real EOS and would deliver a SECOND terminal event to
         // `request_body_filter`. Requiring both facts delivers exactly one.
         if buffer.is_some() || (session.as_mut().is_body_empty() && session.as_mut().is_body_done())
         {
@@ -444,7 +444,7 @@ where
                 .send_body_to_pipe(
                     session,
                     buffer,
-                    downstream_state.is_done(),
+                    RequestBodyEvent::from(downstream_state.is_done()),
                     Some(send_permit),
                     ctx,
                     body_disposition,
@@ -497,12 +497,19 @@ where
         {
             if downstream_body_read_is_futile(session, &downstream_state, &response_state) {
                 // Abandoning the read must not cost the application its single
-                // end-of-stream event (invariant B): run the hooks with
-                // `(None, end_of_stream = true)` exactly once, with NO permit
+                // terminal event (invariant B): run the hooks with one
+                // `Abandoned` event exactly once, with NO permit
                 // so nothing reaches the upstream -- the upstream exchange is
                 // already complete and owes no further request framing.
                 let outcome = self
-                    .send_body_to_pipe(session, None, true, None, ctx, body_disposition)
+                    .send_body_to_pipe(
+                        session,
+                        None,
+                        RequestBodyEvent::Abandoned,
+                        None,
+                        ctx,
+                        body_disposition,
+                    )
                     .await?;
                 if outcome == DownstreamRequestOutcome::Terminate {
                     session.set_keepalive(None);
@@ -582,7 +589,7 @@ where
                     let outcome = self.send_body_to_pipe(
                         session,
                         body,
-                        is_body_done,
+                        RequestBodyEvent::from(is_body_done),
                         Some(send_permit.unwrap()), // safe because we checked is_ok()
                         ctx,
                         body_disposition,
@@ -602,8 +609,40 @@ where
 
                 _ = tx.reserve(), if downstream_state.is_reading() && send_permit.is_err() => {
                     // If tx is closed, the upstream has already finished its job.
-                    downstream_state.maybe_finished(tx.is_closed());
-                    debug!("waiting for permit {send_permit:?}, upstream closed {}", tx.is_closed());
+                    // Capture the fact before releasing `send_permit`, which borrows `tx`:
+                    // the closed case awaits below, and the diagnostic wants both facts.
+                    let upstream_closed = tx.is_closed();
+                    debug!("waiting for permit {send_permit:?}, upstream closed {upstream_closed}");
+                    drop(send_permit);
+                    if upstream_closed {
+                        // A closed pipe means `proxy_handle_upstream` has returned and dropped
+                        // the receiver, so this request body will never be read again even
+                        // though the client only partially uploaded it. Finishing the read side
+                        // silently would spend the request's single terminal body event on
+                        // nothing (invariant B): `request_body_filter`/`request_trailer_filter`
+                        // would see neither `Complete` nor `Abandoned`. Deliver exactly one
+                        // `Abandoned` here, with NO permit -- the upstream exchange is over and
+                        // owes no further request framing, so nothing may be written. This is
+                        // the H1 counterpart of `finish_downstream_body_side` in proxy_h2.rs.
+                        // Only the closed case abandons; a merely full pipe still just waits.
+                        let outcome = self
+                            .send_body_to_pipe(
+                                session,
+                                None,
+                                RequestBodyEvent::Abandoned,
+                                None,
+                                ctx,
+                                body_disposition,
+                            )
+                            .await?;
+                        if outcome == DownstreamRequestOutcome::Terminate {
+                            session.set_keepalive(None);
+                            finish_terminated_response(session).await;
+                            restore_custom_message_reader(session, downstream_custom_message_reader.take());
+                            return Ok(outcome);
+                        }
+                    }
+                    downstream_state.maybe_finished(upstream_closed);
                     /* No permit, wait on more capacity to avoid starving.
                      * Otherwise this select only blocks on rx, which might send no data
                      * before the entire body is uploaded.
@@ -1145,7 +1184,7 @@ where
         &self,
         session: &mut Session,
         mut data: Option<Bytes>,
-        end_of_body: bool,
+        mut event: RequestBodyEvent,
         tx: Option<mpsc::Permit<'_, HttpTask>>,
         ctx: &mut SV::CTX,
         body_disposition: UpstreamRequestBodyDisposition,
@@ -1157,9 +1196,13 @@ where
         // None: end of body
         // this var is to signal if downstream finish sending the body, which shouldn't be
         // affected by the request_body_filter
-        let end_of_body = end_of_body || data.is_none();
+        if data.is_none() && event == RequestBodyEvent::Data {
+            event = RequestBodyEvent::Complete;
+        }
+        let end_of_body = event.is_terminal();
 
-        if data.is_none()
+        if event.is_complete()
+            && data.is_none()
             && !session.request_trailer_filter_fired
             && session
                 .downstream_session
@@ -1195,14 +1238,14 @@ where
 
         session
             .downstream_modules_ctx
-            .request_body_filter(&mut data, end_of_body)
+            .request_body_filter(&mut data, event)
             .await?;
 
         // TODO: request body filter to have info about upgraded status?
         // (can also check session.was_upgraded())
         if self
             .inner
-            .request_body_filter_action(session, &mut data, end_of_body, ctx)
+            .request_body_filter_action(session, &mut data, event, ctx)
             .await?
             == RequestBodyAction::Terminate
         {

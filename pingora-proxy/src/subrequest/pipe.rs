@@ -29,7 +29,7 @@ use crate::proxy_common::{
     no_downstream_body_to_read, DownstreamStateMachine, ResponseStateMachine,
 };
 use crate::subrequest::*;
-use crate::{PreparedSubrequest, Session};
+use crate::{PreparedSubrequest, RequestBodyEvent, Session};
 use bytes::Bytes;
 use futures::FutureExt;
 use log::{debug, warn};
@@ -362,7 +362,7 @@ async fn send_body_to_pipe(
 
     session
         .downstream_modules_ctx
-        .request_body_filter(&mut data, end_of_body)
+        .request_body_filter(&mut data, RequestBodyEvent::from(end_of_body))
         .await?;
 
     do_send_body_to_pipe(data, end_of_body, saved_body, tx)

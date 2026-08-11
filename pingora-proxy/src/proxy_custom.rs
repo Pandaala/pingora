@@ -930,15 +930,16 @@ where
         // event, and return `Ok(false)` forever, so the duplex loop would spin
         // on an already-finished read side at 100% CPU.
         let end_of_body = end_of_body || data.is_none();
+        let event = RequestBodyEvent::from(end_of_body);
 
         session
             .downstream_modules_ctx
-            .request_body_filter(&mut data, end_of_body)
+            .request_body_filter(&mut data, event)
             .await?;
 
         if self
             .inner
-            .request_body_filter_action(session, &mut data, end_of_body, ctx)
+            .request_body_filter_action(session, &mut data, event, ctx)
             .await?
             == RequestBodyAction::Terminate
         {
