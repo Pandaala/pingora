@@ -3,6 +3,7 @@ use bytes::Bytes;
 use http::Method;
 use log::{debug, warn};
 use pingora_cache::NoCacheReason;
+use pingora_core::protocols::http::HttpTask;
 use pingora_error::{BError, Error, ErrorType::InternalError, Result};
 use pingora_http::RequestHeader;
 
@@ -102,6 +103,94 @@ impl ResponseStateMachine {
     pub fn maybe_set_cache_done(&mut self, done: bool) {
         if done {
             self.cached_response_done = true;
+        }
+    }
+}
+
+/// Tracks whether the single terminal `upstream_response_body_filter` callback
+/// (the one carrying `end_of_stream = true`) has already been delivered for
+/// this response.
+///
+/// `HttpProxy::upstream_filter` reaches the body filter only from a
+/// `Body`/`UpgradedBody` task, so a response that terminates with a `Trailer`
+/// or a bare `Done` would otherwise never deliver end-of-stream at all: on H2
+/// the `END_STREAM` flag rides the trailers HEADERS frame, so every DATA frame
+/// of a trailered response is emitted with `eos = false`. A body filter that
+/// withholds bytes across callbacks until end-of-stream then never releases
+/// them.
+///
+/// `Trailer` and the `Done` that follows it are two observations of ONE
+/// termination, and a bare `Done` is a third; exactly one of them may dispatch.
+/// Terminations that already carry end-of-stream through the ordinary path
+/// (`Header(_, true)` via `terminal_upstream_body_filter`, `Body(_, true)`)
+/// claim the latch without dispatching, so the trailing `Done` cannot deliver a
+/// second one.
+///
+/// `Failed` claims WITHOUT dispatching: the response aborted, and synthesizing
+/// end-of-stream for it would tell a filter that a truncated body was complete.
+/// Claiming (rather than ignoring) is what stops a `Done` following the error
+/// from doing exactly that.
+///
+/// Protocol-neutral on purpose: the H2 and custom pumps share it today, and H1
+/// inherits it unchanged once H1 trailer parsing lands (`v1/client.rs`,
+/// `// TODO: support h1 trailer`).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TerminalBodyDispatch {
+    claimed: bool,
+    upgraded: bool,
+}
+
+impl TerminalBodyDispatch {
+    /// Whether this response has carried upgraded body tasks.
+    ///
+    /// Bytes released by the terminal callback must be re-emitted under the
+    /// response's own body variant: `Session::write_response_tasks` picks the
+    /// raw post-upgrade duplex write path off the `UpgradedBody` tag, so
+    /// tagging released bytes as plain `Body` would misroute them on an
+    /// upgraded (e.g. WebSocket) connection. The terminal task itself is a
+    /// `Trailer`/`Done` and carries no variant, hence the latch remembers it.
+    pub fn is_upgraded(&self) -> bool {
+        self.upgraded
+    }
+
+    /// Record that the final filtered response header completed the downstream
+    /// Upgrade handshake. This must be called from the header path after
+    /// `response_filter`: the upstream status alone is insufficient because
+    /// the downstream request may not be an Upgrade and the filter may rewrite
+    /// the response status before it reaches the writer.
+    pub fn mark_upgraded(&mut self) {
+        self.upgraded = true;
+    }
+
+    /// Record `task` as this response's terminal observation if nothing has
+    /// claimed that role yet, and report whether `task` must dispatch the
+    /// terminal body-filter callback.
+    ///
+    /// Returns true at most once per response, and only for `Trailer`/`Done`.
+    pub fn claim_for(&mut self, task: &HttpTask) -> bool {
+        self.upgraded |= matches!(task, HttpTask::UpgradedBody(..));
+        match task {
+            // Already delivers end-of-stream through the ordinary path: the
+            // `terminal_header` branch runs `terminal_upstream_body_filter`,
+            // and a terminal body task carries `eos = true` into
+            // `upstream_response_body_filter` itself.
+            HttpTask::Header(_, true)
+            | HttpTask::Body(_, true)
+            | HttpTask::UpgradedBody(_, true)
+            // Aborted: must never be given a synthetic end-of-stream.
+            | HttpTask::Failed(_) => {
+                self.claimed = true;
+                false
+            }
+            HttpTask::Trailer(_) | HttpTask::Done => {
+                if self.claimed {
+                    false
+                } else {
+                    self.claimed = true;
+                    true
+                }
+            }
+            _ => false,
         }
     }
 }
@@ -990,5 +1079,152 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod terminal_body_dispatch_tests {
+    use super::*;
+    use pingora_error::ErrorType::InternalError;
+    use pingora_http::ResponseHeader;
+
+    fn header(eos: bool) -> HttpTask {
+        HttpTask::Header(Box::new(ResponseHeader::build(200, None).unwrap()), eos)
+    }
+
+    fn body(eos: bool) -> HttpTask {
+        HttpTask::Body(Some(Bytes::from_static(b"chunk")), eos)
+    }
+
+    fn trailer() -> HttpTask {
+        HttpTask::Trailer(Some(Box::default()))
+    }
+
+    fn failed() -> HttpTask {
+        HttpTask::Failed(Error::explain(InternalError, "upstream aborted"))
+    }
+
+    /// Feed a whole response through one latch and collect, for each task,
+    /// whether it dispatched the terminal callback.
+    fn dispatches(tasks: &[HttpTask]) -> Vec<bool> {
+        let mut latch = TerminalBodyDispatch::default();
+        tasks.iter().map(|t| latch.claim_for(t)).collect()
+    }
+
+    /// The defect this latch exists for: H2 puts END_STREAM on the trailers
+    /// HEADERS frame, so every DATA frame arrives with `eos = false`. The
+    /// `Trailer` must dispatch, and the `Done` behind it must not repeat it.
+    #[test]
+    fn trailered_response_dispatches_once_on_the_trailer() {
+        assert_eq!(
+            dispatches(&[
+                header(false),
+                body(false),
+                body(false),
+                trailer(),
+                HttpTask::Done
+            ]),
+            [false, false, false, true, false]
+        );
+    }
+
+    #[test]
+    fn bare_done_dispatches_when_nothing_claimed_the_termination() {
+        assert_eq!(
+            dispatches(&[header(false), body(false), HttpTask::Done]),
+            [false, false, true]
+        );
+    }
+
+    /// `Header(_, true)` is 204/304/HEAD/`CL:0`: the `terminal_header` branch
+    /// already runs `terminal_upstream_body_filter` for it.
+    #[test]
+    fn terminal_header_claims_without_dispatching() {
+        assert_eq!(dispatches(&[header(true), HttpTask::Done]), [false, false]);
+    }
+
+    /// `Body(_, true)` carries `eos = true` into the body filter itself.
+    #[test]
+    fn terminal_body_claims_without_dispatching() {
+        assert_eq!(
+            dispatches(&[header(false), body(false), body(true), HttpTask::Done]),
+            [false, false, false, false]
+        );
+    }
+
+    /// A trailer arriving after a body task already ended the stream is not a
+    /// second termination.
+    #[test]
+    fn trailer_after_terminal_body_does_not_dispatch() {
+        assert_eq!(
+            dispatches(&[body(true), trailer(), HttpTask::Done]),
+            [false, false, false]
+        );
+    }
+
+    /// An aborted response must never be told its truncated body was complete,
+    /// and the `Done` that may follow the error must not say it either.
+    #[test]
+    fn failed_never_dispatches_and_suppresses_a_following_done() {
+        assert_eq!(
+            dispatches(&[header(false), body(false), failed(), HttpTask::Done]),
+            [false, false, false, false]
+        );
+    }
+
+    /// `Trailer(None)` is still a termination observation: `upstream_filter`
+    /// skips it (its match arm is `Trailer(Some(..))`), so if it were ignored
+    /// here the following `Done` would dispatch a second time.
+    #[test]
+    fn empty_trailer_claims_the_termination() {
+        assert_eq!(
+            dispatches(&[body(false), HttpTask::Trailer(None), HttpTask::Done]),
+            [false, true, false]
+        );
+    }
+
+    /// Released bytes must inherit the response's body variant so
+    /// `write_response_tasks` keeps routing them down the post-upgrade duplex
+    /// path. The terminal `Done` itself carries no variant.
+    #[test]
+    fn upgraded_body_is_remembered_for_the_terminal_dispatch() {
+        let mut latch = TerminalBodyDispatch::default();
+        assert!(!latch.is_upgraded());
+        latch.claim_for(&HttpTask::UpgradedBody(
+            Some(Bytes::from_static(b"frame")),
+            false,
+        ));
+        assert!(latch.is_upgraded());
+        assert!(latch.claim_for(&HttpTask::Done));
+        assert!(latch.is_upgraded());
+    }
+
+    /// An upgraded response can close before yielding any body task. The final
+    /// filtered handshake must therefore establish the body variant on its
+    /// own, or bytes released by the later `Done` callback would be emitted as
+    /// plain `Body` into an already-upgraded downstream session.
+    #[test]
+    fn filtered_upgrade_handshake_marks_response_upgraded() {
+        let mut latch = TerminalBodyDispatch::default();
+        latch.mark_upgraded();
+        assert!(latch.is_upgraded());
+        assert!(latch.claim_for(&HttpTask::Done));
+    }
+
+    #[test]
+    fn plain_body_response_is_not_marked_upgraded() {
+        let mut latch = TerminalBodyDispatch::default();
+        latch.claim_for(&body(false));
+        latch.claim_for(&trailer());
+        assert!(!latch.is_upgraded());
+    }
+
+    /// The latch is per response, not per batch: a fresh one dispatches again.
+    #[test]
+    fn a_new_latch_dispatches_for_the_next_response() {
+        let mut latch = TerminalBodyDispatch::default();
+        assert!(latch.claim_for(&HttpTask::Done));
+        assert!(!latch.claim_for(&HttpTask::Done));
+        assert!(TerminalBodyDispatch::default().claim_for(&HttpTask::Done));
     }
 }

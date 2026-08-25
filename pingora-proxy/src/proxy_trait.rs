@@ -581,10 +581,38 @@ pub trait ProxyHttp {
     /// Similar to [Self::upstream_response_filter()] but for response body
     ///
     /// This function will be called every time a piece of response body is received. The `body` is
-    /// **not the entire response body**. When a complete response ends on its
-    /// header task, the hook is called once with `body = None` and
-    /// `end_of_stream = true`. Informational and upgraded responses do not use
-    /// that synthetic terminal call.
+    /// **not the entire response body**.
+    ///
+    /// # Terminal call
+    ///
+    /// Every response representation received from upstream and forwarded by
+    /// the pump that terminates NORMALLY delivers `end_of_stream = true`
+    /// exactly once, whatever task shape the protocol used to end it. Responses
+    /// served from cache do not run this upstream hook. When the termination
+    /// carries no body chunk of its own, the hook is called with `body = None`
+    /// and `end_of_stream = true`; a filter may release withheld bytes by
+    /// writing them into `body`.
+    ///
+    /// | Upstream termination | Terminal call arrives on |
+    /// |---|---|
+    /// | end-of-stream on the response header (204/304/HEAD/`CL: 0`) | a synthetic call, `body = None` |
+    /// | end-of-stream on the last body chunk | that body task itself |
+    /// | trailers (H2 puts `END_STREAM` on the trailers HEADERS frame) | a synthetic call before the trailer |
+    /// | a bare `Done` with no earlier end-of-stream | a synthetic call |
+    ///
+    /// Bytes released by a synthetic call are written downstream and admitted
+    /// to cache BEFORE the trailer (or `Done`) that terminates the response, so
+    /// they cannot land after the terminal marker. The terminating task keeps
+    /// the response's single completion; released chunks never carry
+    /// end-of-stream themselves.
+    ///
+    /// An ABORTED response never receives the terminal call: a synthetic
+    /// end-of-stream would tell a filter that a truncated body was complete.
+    /// Informational responses do not use the synthetic call. An upgraded
+    /// response normally delivers end-of-stream on its final `UpgradedBody`;
+    /// if it closes normally without such a task, its bare `Done` delivers the
+    /// synthetic call instead. Terminal output retains the upgraded body
+    /// variant.
     ///
     /// Mutate `body` in place for the common one-in-one-out case. To emit
     /// *additional* chunks, or to end the response early, use `sink`. The
@@ -603,7 +631,8 @@ pub trait ProxyHttp {
     /// request method or the filtered response status forbids a body.
     /// Internal cache-control responses consumed by revalidation or stale
     /// serving are not forwarded response representations and do not receive
-    /// this synthetic body event.
+    /// this synthetic body event. Ordinary cache hits skip this upstream hook
+    /// entirely; use `Self::response_body_filter` for cache-hit observation.
     async fn upstream_response_body_filter(
         &self,
         _session: &mut Session,

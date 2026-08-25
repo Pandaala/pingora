@@ -998,6 +998,84 @@ where
         Ok(())
     }
 
+    /// Cache the chunks `sink` queued BEFORE `task`, the admission-side mirror
+    /// of [`drain_emitted_chunks_before`].
+    ///
+    /// The cached entity must be byte-identical to what the client receives, so
+    /// a terminal `Trailer`/`Done` that released withheld body bytes has to feed
+    /// those bytes to the cache ahead of the terminal task, exactly as they are
+    /// written downstream.
+    ///
+    /// Load-bearing for the bare-`Done` dispatch specifically: `Done` runs
+    /// `finish_miss_handler()` in [`Self::cache_http_task`], so admitting the
+    /// released bytes after it would `write_body` into an already finished miss
+    /// handler -- the failure the "this will panic if more data is sent after we
+    /// see end_stream" note on the `Body` arm warns about. `Trailer` is a cache
+    /// no-op, so only the ordering around `Done` changes the stored entity.
+    ///
+    /// No end-of-stream migration, for the same reason as the downstream drain:
+    /// `Trailer`/`Done` already carry the response's single completion.
+    pub(crate) async fn cache_task_and_emitted_chunks_before(
+        &self,
+        session: &mut Session,
+        task: &HttpTask,
+        sink: &ResponseBodySink,
+        is_upgraded: bool,
+        ctx: &mut SV::CTX,
+        serve_from_cache: &mut ServeFromCache,
+    ) -> Result<()>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        if !(session.cache.enabled() || session.cache.bypassing()) {
+            return Ok(());
+        }
+
+        for chunk in sink.peek_extra() {
+            let extra_task = if is_upgraded {
+                HttpTask::UpgradedBody(Some(chunk.clone()), false)
+            } else {
+                HttpTask::Body(Some(chunk.clone()), false)
+            };
+            if let Err(e) = self
+                .cache_http_task(session, &extra_task, None, ctx, serve_from_cache)
+                .await
+            {
+                session.cache.disable(NoCacheReason::StorageError);
+                if serve_from_cache.is_miss_body() {
+                    // The miss body is already short: giving up the request is
+                    // the only way to avoid storing a truncated entity.
+                    return Err(e);
+                }
+                warn!(
+                    "Fail to cache released response chunk: {}, {}",
+                    e,
+                    self.inner.request_summary(session, ctx)
+                );
+                // The cache is disabled now; the terminal task below would
+                // no-op anyway.
+                return Ok(());
+            }
+        }
+
+        if let Err(e) = self
+            .cache_http_task(session, task, None, ctx, serve_from_cache)
+            .await
+        {
+            session.cache.disable(NoCacheReason::StorageError);
+            if serve_from_cache.is_miss_body() {
+                return Err(e);
+            }
+            warn!(
+                "Fail to cache response: {}, {}",
+                e,
+                self.inner.request_summary(session, ctx)
+            );
+        }
+        Ok(())
+    }
+
     // Decide if local cache can be used according to upstream http header
     // 1. when upstream returns 304, the local cache is refreshed and served fresh
     // 2. when upstream returns certain HTTP error status, the local cache is served stale
@@ -1338,6 +1416,41 @@ pub(crate) fn drain_emitted_chunks(
     }
 }
 
+/// Drain the chunks `sink` queued and append them to `out_tasks` BEFORE
+/// `task`, the mirror image of [`drain_emitted_chunks`].
+///
+/// Used only for a terminal `Trailer`/`Done` that dispatched the terminal
+/// `upstream_response_body_filter` callback (see
+/// `proxy_common::TerminalBodyDispatch`). The chunks queued there are response
+/// BODY the filter had been withholding, so they must reach the wire before the
+/// trailer that terminates the response, not after it.
+///
+/// No end-of-stream migration happens here, unlike [`drain_emitted_chunks`]:
+/// `Trailer` and `Done` are intrinsically `HttpTask::is_end()`, so `task`
+/// already carries the response's single completion and the released chunks are
+/// always emitted with `end = false`. Migrating would either duplicate the
+/// completion or, because [`migrate_end_of_stream`] reports `Unchanged` for
+/// both variants, strand the released bytes after a terminal marker.
+///
+/// `is_upgraded` comes from the latch rather than from `task`, which is a
+/// `Trailer`/`Done` and carries no body variant of its own -- see
+/// `TerminalBodyDispatch::is_upgraded` for why the tag must be preserved.
+pub(crate) fn drain_emitted_chunks_before(
+    task: HttpTask,
+    sink: &mut ResponseBodySink,
+    is_upgraded: bool,
+    out_tasks: &mut Vec<HttpTask>,
+) {
+    for chunk in sink.take_extra() {
+        out_tasks.push(if is_upgraded {
+            HttpTask::UpgradedBody(Some(chunk), false)
+        } else {
+            HttpTask::Body(Some(chunk), false)
+        });
+    }
+    out_tasks.push(task);
+}
+
 #[cfg(test)]
 mod eos_migration_tests {
     use super::*;
@@ -1348,6 +1461,97 @@ mod eos_migration_tests {
             sink.push(Bytes::from_static(c)).unwrap();
         }
         sink
+    }
+
+    /// Nothing released: the terminal task is emitted alone, unchanged.
+    #[test]
+    fn before_drain_with_empty_sink_emits_only_the_task() {
+        let mut sink = ResponseBodySink::new();
+        let mut out = Vec::new();
+        drain_emitted_chunks_before(HttpTask::Done, &mut sink, false, &mut out);
+        assert!(matches!(out.as_slice(), [HttpTask::Done]));
+    }
+
+    /// The defect this helper exists for: released body bytes must reach the
+    /// wire BEFORE the trailer that terminates the response.
+    #[test]
+    fn before_drain_puts_released_bytes_ahead_of_the_trailer() {
+        let mut sink = sink_with(&[b"held-a", b"held-b"]);
+        let mut out = Vec::new();
+        drain_emitted_chunks_before(
+            HttpTask::Trailer(Some(Box::default())),
+            &mut sink,
+            false,
+            &mut out,
+        );
+        assert!(matches!(
+            out.as_slice(),
+            [
+                HttpTask::Body(Some(a), false),
+                HttpTask::Body(Some(b), false),
+                HttpTask::Trailer(Some(_)),
+            ] if a.as_ref() == b"held-a" && b.as_ref() == b"held-b"
+        ));
+    }
+
+    /// `Trailer`/`Done` are intrinsically `is_end()`, so the completion stays
+    /// on the terminal task and no released chunk claims it -- this is what
+    /// keeps the response finishing exactly once.
+    #[test]
+    fn before_drain_never_migrates_end_of_stream_onto_released_chunks() {
+        for task in [HttpTask::Done, HttpTask::Trailer(Some(Box::default()))] {
+            let mut sink = sink_with(&[b"a", b"b"]);
+            let mut out = Vec::new();
+            assert!(task.is_end());
+            drain_emitted_chunks_before(task, &mut sink, false, &mut out);
+            assert_eq!(out.len(), 3);
+            assert!(out[..2].iter().all(|t| !t.is_end()));
+            assert!(out[2].is_end());
+        }
+    }
+
+    /// When `response_trailer_filter` converts the trailer into a body buffer
+    /// (`proxy_h2.rs`), the released bytes must still come first and the
+    /// converted buffer keeps its `end = true`.
+    #[test]
+    fn before_drain_keeps_released_bytes_ahead_of_a_converted_trailer_buffer() {
+        let mut sink = sink_with(&[b"held"]);
+        let mut out = Vec::new();
+        drain_emitted_chunks_before(
+            HttpTask::Body(Some(Bytes::from_static(b"trailer-buffer")), true),
+            &mut sink,
+            false,
+            &mut out,
+        );
+        assert!(matches!(
+            out.as_slice(),
+            [
+                HttpTask::Body(Some(held), false),
+                HttpTask::Body(Some(buf), true),
+            ] if held.as_ref() == b"held" && buf.as_ref() == b"trailer-buffer"
+        ));
+    }
+
+    /// Released bytes inherit the response's body variant: mistagging them as
+    /// plain `Body` would misroute them off the post-upgrade duplex write path.
+    #[test]
+    fn before_drain_preserves_the_upgraded_body_tag() {
+        let mut sink = sink_with(&[b"frame"]);
+        let mut out = Vec::new();
+        drain_emitted_chunks_before(HttpTask::Done, &mut sink, true, &mut out);
+        assert!(matches!(
+            out.as_slice(),
+            [HttpTask::UpgradedBody(Some(d), false), HttpTask::Done] if d.as_ref() == b"frame"
+        ));
+    }
+
+    /// The sink is drained, not peeked: a later batch must not replay them.
+    #[test]
+    fn before_drain_empties_the_sink() {
+        let mut sink = sink_with(&[b"a"]);
+        let mut out = Vec::new();
+        drain_emitted_chunks_before(HttpTask::Done, &mut sink, false, &mut out);
+        assert!(sink.peek_extra().is_empty());
     }
 
     #[test]

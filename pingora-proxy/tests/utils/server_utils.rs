@@ -61,6 +61,8 @@ pub struct CTX {
     conn_reused: bool,
     upstream_client_addr: Option<SocketAddr>,
     upstream_server_addr: Option<SocketAddr>,
+    /// Response bytes withheld by the `x-retain-until-eos` processor.
+    withheld_body: Vec<u8>,
 }
 
 // Common logic for both ProxyHttp(s) types
@@ -240,6 +242,35 @@ impl ProxyHttp for ExampleProxyHttps {
     }
 }
 
+/// Terminal (`end_of_stream`) `upstream_response_body_filter` dispatches,
+/// counted per `x-eos-probe` request header value.
+///
+/// A test that must prove the terminal callback was *not* dispatched cannot
+/// read that off the client-visible body: when the exchange fails mid-body the
+/// HTTP client discards what it already received, so an accidental dispatch
+/// looks exactly like a correct skip. This map is written from inside the
+/// filter, so it survives a failed body collection.
+static EOS_PROBES: Lazy<std::sync::Mutex<HashMap<String, usize>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Remove and return the terminal dispatch count recorded for `probe`.
+///
+/// Removing on read keeps the map bounded and keeps a probe id from leaking
+/// into another test.
+pub fn take_eos_dispatches(probe: &str) -> usize {
+    EOS_PROBES.lock().unwrap().remove(probe).unwrap_or(0)
+}
+
+/// Count one terminal dispatch for the request's probe id, if it carries one.
+fn record_eos_dispatch(session: &Session) {
+    let probe = session.get_header_bytes("x-eos-probe");
+    if probe.is_empty() {
+        return;
+    }
+    let probe = String::from_utf8_lossy(probe).into_owned();
+    *EOS_PROBES.lock().unwrap().entry(probe).or_insert(0) += 1;
+}
+
 pub struct ExampleProxyHttp {}
 
 #[async_trait]
@@ -323,8 +354,11 @@ impl ProxyHttp for ExampleProxyHttp {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
         sink: &mut ResponseBodySink,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> Result<Option<Duration>> {
+        if end_of_stream {
+            record_eos_dispatch(session);
+        }
         if session.get_header_bytes("x-bodyless-replace") == b"true"
             && end_of_stream
             && body.is_none()
@@ -332,6 +366,23 @@ impl ProxyHttp for ExampleProxyHttp {
             *body = Some(Bytes::from_static(b"generated"));
             sink.push(Bytes::from_static(b"-extra"))?;
             sink.terminate();
+        }
+        // A processor that withholds every chunk and releases the whole body
+        // only at end-of-stream -- the shape that silently loses the entire
+        // response when a termination never delivers `end_of_stream`.
+        //
+        // The `|eos` marker is appended by the terminal callback itself, so the
+        // client-visible body doubles as the callback count: a second terminal
+        // dispatch would append a second marker.
+        if session.get_header_bytes("x-retain-until-eos") == b"true" {
+            if let Some(bytes) = body.take() {
+                ctx.withheld_body.extend_from_slice(&bytes);
+            }
+            if end_of_stream {
+                let mut released = std::mem::take(&mut ctx.withheld_body);
+                released.extend_from_slice(b"|eos");
+                *body = Some(Bytes::from(released));
+            }
         }
         Ok(None)
     }
@@ -397,6 +448,8 @@ static CACHE_VARY_ALLOWED_HEADERS: Lazy<Option<HashSet<&str>>> =
 // #[allow(clippy::upper_case_acronyms)]
 pub struct CacheCTX {
     upstream_status: Option<u16>,
+    /// Response bytes withheld by the `x-retain-until-eos` processor.
+    withheld_body: Vec<u8>,
 }
 
 pub struct ExampleProxyCache {}
@@ -407,6 +460,7 @@ impl ProxyHttp for ExampleProxyCache {
     fn new_ctx(&self) -> Self::CTX {
         CacheCTX {
             upstream_status: None,
+            withheld_body: Vec::new(),
         }
     }
 
@@ -650,6 +704,34 @@ impl ProxyHttp for ExampleProxyCache {
             false,
             &CACHE_DEFAULT,
         ))
+    }
+
+    /// Same withholding processor as `ExampleProxyHttp`, so the terminal
+    /// dispatch can be observed through cache admission: the cached entity must
+    /// be byte-identical to what the client received on the miss.
+    ///
+    /// Note: `x-eos-probe` recording lives on `ExampleProxyHttp` only. A probe
+    /// assertion written against this service would read 0 and pass vacuously;
+    /// add `record_eos_dispatch` here first.
+    async fn upstream_response_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        _sink: &mut ResponseBodySink,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        if session.get_header_bytes("x-retain-until-eos") == b"true" {
+            if let Some(bytes) = body.take() {
+                ctx.withheld_body.extend_from_slice(&bytes);
+            }
+            if end_of_stream {
+                let mut released = std::mem::take(&mut ctx.withheld_body);
+                released.extend_from_slice(b"|eos");
+                *body = Some(Bytes::from(released));
+            }
+        }
+        Ok(None)
     }
 
     async fn upstream_response_filter(

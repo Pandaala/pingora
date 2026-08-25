@@ -20,10 +20,13 @@ use pingora_core::{
     },
     ImmutStr,
 };
-use proxy_cache::{drain_emitted_chunks, range_filter::RangeBodyFilter, ServeFromCache};
+use proxy_cache::{
+    drain_emitted_chunks, drain_emitted_chunks_before, range_filter::RangeBodyFilter,
+    ServeFromCache,
+};
 use proxy_common::{
     no_downstream_body_to_read, release_cache_on_terminate, DownstreamRequestOutcome,
-    DownstreamStateMachine, ResponseStateMachine,
+    DownstreamStateMachine, ResponseStateMachine, TerminalBodyDispatch,
 };
 use tokio::sync::oneshot;
 
@@ -363,6 +366,10 @@ where
         // `ResponseBodySink::reset_batch`), but a `terminate()` signal stays
         // sticky for the rest of this response.
         let mut sink = ResponseBodySink::new();
+        // Also shared across every batch: `Trailer` and the `Done` behind it
+        // can land in different batches, so the latch that keeps the terminal
+        // body callback to exactly one delivery must outlive a single batch.
+        let mut terminal_body = TerminalBodyDispatch::default();
         let mut suppress_downstream_body = false;
         let mut filtered_terminal_header = None;
         let mut upstream_reusable = true;
@@ -466,7 +473,7 @@ where
                                 &mut suppress_downstream_body,
                                 &mut filtered_terminal_header,
                                 &mut upstream_reusable,
-                                &mut sink, &mut filtered_tasks).await?;
+                                &mut sink, &mut terminal_body, &mut filtered_tasks).await?;
                             if serve_from_cache.is_miss_header() {
                                 response_state.enable_cached_response();
                             }
@@ -541,7 +548,7 @@ where
                         &mut suppress_downstream_body,
                         &mut filtered_terminal_header,
                         &mut upstream_reusable,
-                        &mut sink, &mut cached_tasks).await?;
+                        &mut sink, &mut terminal_body, &mut cached_tasks).await?;
                     match session.write_response_tasks(cached_tasks).await {
                         Ok(_) => response_state.maybe_set_cache_done(cache_source_done),
                         Err(e) => if serve_from_cache.is_miss() {
@@ -661,6 +668,7 @@ where
         filtered_terminal_header: &mut Option<Box<ResponseHeader>>,
         upstream_reusable: &mut bool,
         sink: &mut ResponseBodySink,
+        terminal_body: &mut TerminalBodyDispatch,
         out_tasks: &mut Vec<HttpTask>,
     ) -> Result<()>
     where
@@ -676,12 +684,32 @@ where
             || matches!(&task, HttpTask::Body(..) | HttpTask::UpgradedBody(..))
             || (from_cache && matches!(&task, HttpTask::Done));
         let mut terminal_cacheability = None;
+        // Whether this task must deliver the response's single terminal
+        // `upstream_response_body_filter` callback. Only `Trailer`/`Done` ever
+        // set it, and only once per response -- see `TerminalBodyDispatch`.
+        let mut terminal_dispatch = false;
 
         if !from_cache {
             if let Some(duration) = self.upstream_filter(session, &mut task, sink, ctx).await? {
                 trace!("delaying upstream response for {duration:?}");
                 time::sleep(duration).await;
             }
+
+            // `upstream_filter` reaches the body filter only from a
+            // `Body`/`UpgradedBody` task, so a response terminating with a
+            // trailer or a bare `Done` would never deliver end-of-stream to a
+            // filter that withholds bytes until it.
+            terminal_dispatch = terminal_body.claim_for(&task);
+            if terminal_dispatch {
+                if let Some(duration) = self
+                    .terminal_upstream_body_filter(session, sink, ctx)
+                    .await?
+                {
+                    trace!("delaying terminal upstream response for {duration:?}");
+                    time::sleep(duration).await;
+                }
+            }
+
             if terminal_header {
                 let HttpTask::Header(header, _) = &task else {
                     unreachable!("terminal task must be a header")
@@ -695,8 +723,23 @@ where
             // transformation. Requests that bypassed cache still need to run
             // filters to see if the response has become cacheable.
             if !terminal_header {
-                self.cache_task_and_emitted_chunks(session, &task, sink, ctx, serve_from_cache)
+                if terminal_dispatch {
+                    // Released body bytes precede the terminating task on the
+                    // wire, so the cached entity has to be admitted in that
+                    // same order to stay byte-identical.
+                    self.cache_task_and_emitted_chunks_before(
+                        session,
+                        &task,
+                        sink,
+                        terminal_body.is_upgraded(),
+                        ctx,
+                        serve_from_cache,
+                    )
                     .await?;
+                } else {
+                    self.cache_task_and_emitted_chunks(session, &task, sink, ctx, serve_from_cache)
+                        .await?;
+                }
                 self.track_predicted_uncacheable_response(session, &task, sink);
             }
 
@@ -774,6 +817,12 @@ where
                     self.inner
                         .response_filter(session, &mut header, ctx)
                         .await?;
+                }
+                if !from_cache
+                    && session.as_downstream().is_upgrade_req()
+                    && header.status == http::StatusCode::SWITCHING_PROTOCOLS
+                {
+                    terminal_body.mark_upgraded();
                 }
                 if terminal_header {
                     if let Some(duration) = self
@@ -881,6 +930,12 @@ where
             // task -- see the `sink.take_extra()` discard on the early-return
             // path above for where that would otherwise leak from.
             out_tasks.push(task);
+        } else if terminal_dispatch {
+            // The terminal callback releases body bytes the filter had been
+            // withholding. They are body, so they must precede the trailer
+            // that ends the response -- the opposite of the ordinary drain
+            // below. `task` keeps its own end-of-stream meaning.
+            drain_emitted_chunks_before(task, sink, terminal_body.is_upgraded(), out_tasks);
         } else {
             // Extra chunks emitted by the upstream body filter follow the
             // chunk they were emitted from, preserving order; `task`'s own
@@ -898,7 +953,9 @@ where
                     .await?;
             }
             reconcile_terminal_response_tasks(out_tasks, start, downstream_body_forbidden)?;
-        } else if filter_downstream_body {
+            // A `Trailer` task is not a `Body` task, so released bytes would
+            // otherwise skip the downstream body filter entirely.
+        } else if filter_downstream_body || terminal_dispatch {
             self.downstream_response_body_filter_tasks(session, &mut out_tasks[start..], ctx)
                 .await?;
         }
@@ -992,6 +1049,10 @@ async fn custom_pipe_up_to_down_response<S: CustomSession>(
     tx: mpsc::Sender<HttpTask>,
 ) -> Result<()> {
     let mut is_informational = true;
+    // Set when a final `101` arrived together with clean end-of-stream, i.e.
+    // the whole response is complete at the header. See the normalization
+    // below for why that end-of-stream cannot ride on the header task.
+    let mut upgrade_ended = false;
     while is_informational {
         client
             .read_response_header()
@@ -1004,7 +1065,24 @@ async fn custom_pipe_up_to_down_response<S: CustomSession>(
 
         match client.check_response_end_or_error(true).await {
             Ok(eos) => {
-                tx.send(HttpTask::Header(resp_header, eos))
+                // A connector that already saw the upgraded connection reach
+                // clean EOF reports the entire response as `Header(101, true)`.
+                // Downstream, `Header(_, true)` means "terminal header": a
+                // final response with an empty body, served by the
+                // `terminal_header` branch of `custom_response_filter`. A `101`
+                // can never take that branch -- it is informational by status,
+                // and writing it switches the H1 downstream session into raw
+                // upgraded mode, where that branch's plain-body framing is
+                // invalid. Normalize it to the shape the rest of the pipeline
+                // already handles, `Header(101, false)` followed by `Done`:
+                // `Done` is what dispatches the response's single terminal
+                // `upstream_response_body_filter` callback, and it releases the
+                // bytes that filter withheld under the response's own upgraded
+                // body variant.
+                if eos && resp_header.status == http::StatusCode::SWITCHING_PROTOCOLS {
+                    upgrade_ended = true;
+                }
+                tx.send(HttpTask::Header(resp_header, eos && !upgrade_ended))
                     .await
                     .or_err(InternalError, "sending custom headers to pipe")?;
             }
@@ -1017,6 +1095,16 @@ async fn custom_pipe_up_to_down_response<S: CustomSession>(
                 return Ok(());
             }
         }
+    }
+
+    if upgrade_ended {
+        // The upgraded connection is already at clean EOF: no body and no
+        // trailers can follow it, and the session must not be read again after
+        // it reported end-of-stream.
+        tx.send(HttpTask::Done)
+            .await
+            .unwrap_or_else(|_| debug!("custom channel closed!"));
+        return Ok(());
     }
 
     while let Some(chunk) = client

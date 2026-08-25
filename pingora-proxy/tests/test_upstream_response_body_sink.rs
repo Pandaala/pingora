@@ -131,6 +131,27 @@ const SUPPRESS_DOWNSTREAM_BODY_HEADER: (&str, &str) = ("x-suppress-downstream-bo
 const RESPONSE_FILTER_CALLS_HEADER: &str = "x-test-response-filter-calls";
 const SUPPRESSED_BODY_EXTRA: &[u8] = b"+";
 const SUPPRESSION_ORIGIN_BODY_SIZE: usize = 256 * 1024;
+/// Body chunks the scripted custom origin streams before its trailers.
+const CUSTOM_TRAILERED_CHUNKS: [&[u8]; 3] = [b"alpha", b"beta", b"gamma"];
+const CUSTOM_TRAILERED_PATH: &str = "/custom_trailered";
+/// Selects the trailered script in the custom session. A request HEADER, not
+/// the path: the upstream request URI is rewritten to "/" before it reaches
+/// `write_request_header`.
+const CUSTOM_TRAILERED_HEADER: (&str, &str) = ("x-custom-trailered", "1");
+const CUSTOM_EMPTY_UPGRADE_PATH: &str = "/bodyless_empty_upgrade";
+const CUSTOM_EMPTY_UPGRADE_HEADER: (&str, &str) = ("x-custom-empty-upgrade", "1");
+/// Selects the custom session that reports a completed Upgrade as a single
+/// `Header(101, true)`: a final 101 whose connection already reached clean EOF,
+/// with no `UpgradedBody` task behind it.
+const CUSTOM_TERMINAL_UPGRADE_PATH: &str = "/bodyless_terminal_upgrade";
+const CUSTOM_TERMINAL_UPGRADE_HEADER: (&str, &str) = ("x-custom-terminal-upgrade", "1");
+/// Same scripted `Header(101, true)` session, but the downstream request is a
+/// plain GET: the 101 is naked and must not upgrade the downstream response.
+const CUSTOM_NAKED_TERMINAL_UPGRADE_PATH: &str = "/bodyless_naked_terminal_upgrade";
+/// Same scripted session again, with `response_filter` rewriting the 101 to a
+/// non-upgrade status before it reaches the downstream writer.
+const CUSTOM_REWRITTEN_TERMINAL_UPGRADE_PATH: &str = "/bodyless_rewritten_terminal_upgrade";
+
 const BODYLESS_CURRENT: &[u8] = b"generated";
 const BODYLESS_EXTRA: &[u8] = b"-extra";
 
@@ -370,6 +391,28 @@ static TERMINAL_CUSTOM_RANGE_FILTER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SPOOF_CUSTOM_RANGE_FILTER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static TERMINAL_CACHED_HEAD_BODY_FILTER_CALLS: AtomicUsize = AtomicUsize::new(0);
 static TERMINAL_CACHED_304_BODY_FILTER_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// End-of-stream `upstream_response_body_filter` calls seen on each of the
+/// scripted `Header(101, true)` paths. Keyed by path because the three tests
+/// share one proxy instance and may run concurrently.
+static TERMINAL_UPGRADE_EOS_CALLS: Lazy<Mutex<std::collections::HashMap<String, usize>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+/// Set if the pump reads ANY scripted `Header(101, true)` session again after
+/// it reported end-of-stream. Nothing may follow that header on the wire, so
+/// neither `read_response_body` nor `read_trailers` may be called.
+///
+/// Deliberately not keyed by path: the scripted session only sees the upstream
+/// request, whose URI has already been normalized to `/`. Correct behavior
+/// never sets this flag for any of the three terminal-upgrade paths, so every
+/// one of them asserts on it and the assertion message stays path-agnostic.
+static TERMINAL_UPGRADE_SESSION_READ_AFTER_EOS: AtomicBool = AtomicBool::new(false);
+
+fn assert_no_terminal_upgrade_read_after_eos() {
+    assert!(
+        !TERMINAL_UPGRADE_SESSION_READ_AFTER_EOS.load(Ordering::SeqCst),
+        "the pump read a scripted terminal-upgrade session after it reported \
+         end-of-stream (the flag is shared by all three terminal-upgrade tests)"
+    );
+}
 
 struct NonStreamingMemCache {
     inner: MemCache,
@@ -462,6 +505,8 @@ pub struct EmitProxy {
 /// `ctx.will_terminate`.
 #[derive(Default)]
 pub struct EmitCtx {
+    /// Response bytes withheld by the `CUSTOM_TRAILERED_PATH` processor.
+    withheld_body: Vec<u8>,
     will_terminate: bool,
     response_filter_seen: bool,
     response_cache_filter_seen: bool,
@@ -475,6 +520,18 @@ struct HeaderOnlyCustomSession {
     response: ResponseHeader,
     request_header_written: bool,
     fail_after_terminal: bool,
+    /// Body chunks still to hand to the pump. Non-empty only for
+    /// `CUSTOM_TRAILERED_PATH`, which scripts the custom-pump analogue of an
+    /// H2 trailered response: body chunks that never carry end-of-stream,
+    /// followed by trailers that do.
+    pending_body: std::collections::VecDeque<Bytes>,
+    pending_trailers: bool,
+    upgraded: bool,
+    body_eof_observed: bool,
+    /// Scripts `Header(101, true)`: the connector already saw the upgraded
+    /// connection reach clean EOF, so the whole response is complete at the
+    /// header and the session must never be read again.
+    terminal_upgrade: bool,
 }
 
 struct NoopBodyWriter;
@@ -503,6 +560,11 @@ impl HeaderOnlyCustomSession {
             response: ResponseHeader::build(503, None).unwrap(),
             request_header_written: false,
             fail_after_terminal: false,
+            pending_body: std::collections::VecDeque::new(),
+            pending_trailers: false,
+            upgraded: false,
+            body_eof_observed: false,
+            terminal_upgrade: false,
         }
     }
 }
@@ -551,6 +613,33 @@ impl CustomSession for HeaderOnlyCustomSession {
             .headers
             .get(CUSTOM_POST_TERMINAL_FAILURE_HEADER.0)
             .is_some();
+        if req.headers.get(CUSTOM_TRAILERED_HEADER.0).is_some() {
+            self.response = ResponseHeader::build(200, None).unwrap();
+            self.pending_body = CUSTOM_TRAILERED_CHUNKS
+                .iter()
+                .map(|c| Bytes::from_static(c))
+                .collect();
+            self.pending_trailers = true;
+        }
+        if req.headers.get(CUSTOM_EMPTY_UPGRADE_HEADER.0).is_some() {
+            self.response =
+                ResponseHeader::build(http::StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
+            self.response
+                .insert_header(http::header::CONNECTION, "upgrade")?;
+            self.response
+                .insert_header(http::header::UPGRADE, "websocket")?;
+            self.upgraded = true;
+        }
+        if req.headers.get(CUSTOM_TERMINAL_UPGRADE_HEADER.0).is_some() {
+            self.response =
+                ResponseHeader::build(http::StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
+            self.response
+                .insert_header(http::header::CONNECTION, "upgrade")?;
+            self.response
+                .insert_header(http::header::UPGRADE, "websocket")?;
+            self.upgraded = true;
+            self.terminal_upgrade = true;
+        }
         Ok(())
     }
 
@@ -571,6 +660,13 @@ impl CustomSession for HeaderOnlyCustomSession {
     }
 
     async fn read_response_body(&mut self) -> Result<Option<Bytes>> {
+        if self.terminal_upgrade {
+            TERMINAL_UPGRADE_SESSION_READ_AFTER_EOS.store(true, Ordering::SeqCst);
+            return Ok(None);
+        }
+        if let Some(chunk) = self.pending_body.pop_front() {
+            return Ok(Some(chunk));
+        }
         if self.fail_after_terminal {
             CUSTOM_POST_TERMINAL_FAILURE_EMITTED.store(true, Ordering::SeqCst);
             return pingora_error::Error::e_explain(
@@ -578,11 +674,14 @@ impl CustomSession for HeaderOnlyCustomSession {
                 "scripted failure after terminal custom response header",
             );
         }
+        self.body_eof_observed = true;
         Ok(None)
     }
 
     fn response_finished(&self) -> bool {
-        true
+        self.pending_body.is_empty()
+            && !self.pending_trailers
+            && (!self.upgraded || self.terminal_upgrade || self.body_eof_observed)
     }
 
     async fn shutdown(&mut self, _code: u32, _ctx: &str) {}
@@ -592,7 +691,7 @@ impl CustomSession for HeaderOnlyCustomSession {
     }
 
     fn was_upgraded(&self) -> bool {
-        false
+        self.upgraded
     }
 
     fn digest(&self) -> Option<&Digest> {
@@ -612,6 +711,16 @@ impl CustomSession for HeaderOnlyCustomSession {
     }
 
     async fn read_trailers(&mut self) -> Result<Option<HeaderMap>> {
+        if self.terminal_upgrade {
+            TERMINAL_UPGRADE_SESSION_READ_AFTER_EOS.store(true, Ordering::SeqCst);
+            return Ok(None);
+        }
+        if self.pending_trailers {
+            self.pending_trailers = false;
+            let mut trailers = HeaderMap::new();
+            trailers.insert("grpc-status", "0".parse().unwrap());
+            return Ok(Some(trailers));
+        }
         Ok(None)
     }
 
@@ -620,7 +729,10 @@ impl CustomSession for HeaderOnlyCustomSession {
     }
 
     async fn check_response_end_or_error(&mut self, _headers: bool) -> Result<bool> {
-        Ok(true)
+        // Mirrors `pingora_core::protocols::http::v2::client`: while trailers
+        // are still pending the per-chunk end-of-stream predicate is false, so
+        // no body task ever carries `eos = true`.
+        Ok(self.response_finished())
     }
 
     fn take_request_body_writer(&mut self) -> Option<Box<dyn BodyWrite>> {
@@ -746,6 +858,13 @@ impl ProxyHttp for EmitProxy {
             .ends_with("/bodyless_late_204")
         {
             upstream_response.set_status(http::StatusCode::NO_CONTENT)?;
+        }
+        if session.req_header().uri.path() == CUSTOM_REWRITTEN_TERMINAL_UPGRADE_PATH {
+            // The FILTERED header is what decides the downstream handshake, so
+            // a 101 rewritten away here must leave the response un-upgraded.
+            upstream_response.set_status(http::StatusCode::OK)?;
+            upstream_response.remove_header(&http::header::CONNECTION);
+            upstream_response.remove_header(&http::header::UPGRADE);
         }
         if session
             .req_header()
@@ -925,6 +1044,21 @@ impl ProxyHttp for EmitProxy {
         sink: &mut ResponseBodySink,
         ctx: &mut Self::CTX,
     ) -> Result<Option<Duration>> {
+        if end_of_stream {
+            let path = session.req_header().uri.path();
+            if matches!(
+                path,
+                CUSTOM_TERMINAL_UPGRADE_PATH
+                    | CUSTOM_NAKED_TERMINAL_UPGRADE_PATH
+                    | CUSTOM_REWRITTEN_TERMINAL_UPGRADE_PATH
+            ) {
+                *TERMINAL_UPGRADE_EOS_CALLS
+                    .lock()
+                    .unwrap()
+                    .entry(path.to_string())
+                    .or_default() += 1;
+            }
+        }
         match session.req_header().uri.path() {
             path if path.ends_with("/bodyless_no_upstream_output")
                 || path.ends_with("/bodyless_empty_cl0") => {}
@@ -966,6 +1100,22 @@ impl ProxyHttp for EmitProxy {
                 expected.extend_from_slice(body.as_ref().unwrap());
                 expected.extend_from_slice(SUPPRESSED_BODY_EXTRA);
                 sink.push(Bytes::from_static(SUPPRESSED_BODY_EXTRA))?;
+            }
+            CUSTOM_TRAILERED_PATH => {
+                // The canonical withholding processor: take every chunk and
+                // release the whole body only at end-of-stream. Without the
+                // terminal dispatch on `Trailer`/`Done` this never fires and
+                // the client sees an empty 200. The `|eos` marker is written by
+                // the terminal callback itself, so the client-visible body
+                // doubles as the callback count.
+                if let Some(bytes) = body.take() {
+                    ctx.withheld_body.extend_from_slice(&bytes);
+                }
+                if end_of_stream {
+                    let mut released = std::mem::take(&mut ctx.withheld_body);
+                    released.extend_from_slice(b"|eos");
+                    *body = Some(Bytes::from(released));
+                }
             }
             "/emit_overflow" => {
                 // Push a chunk larger than the batch budget: `push` must
@@ -2024,6 +2174,243 @@ async fn custom_header_eos_runs_body_hook_without_terminate_failure() {
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(response.text().await.unwrap(), "generated-extra");
+}
+
+/// The custom pump has the same terminal-dispatch hole as the H2 pump:
+/// `upstream_filter` reaches the body filter only from a `Body` task, so a
+/// response ending in `Trailer` -> `Done` delivered no end-of-stream and a
+/// withholding processor dropped the entire body.
+#[tokio::test]
+async fn custom_trailered_response_releases_the_withheld_body() {
+    let harness = init();
+    let expected: Vec<u8> = CUSTOM_TRAILERED_CHUNKS.concat();
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{}{CUSTOM_TRAILERED_PATH}",
+            harness.custom_base_url()
+        ))
+        .header(CUSTOM_TRAILERED_HEADER.0, CUSTOM_TRAILERED_HEADER.1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.text().await.unwrap(),
+        format!("{}|eos", String::from_utf8(expected).unwrap())
+    );
+}
+
+/// `Trailer` claims the termination; the `Done` behind it must not dispatch a
+/// second callback, which would append a second `|eos` marker.
+#[tokio::test]
+async fn custom_trailered_response_dispatches_the_terminal_callback_once() {
+    let harness = init();
+    let body = reqwest::Client::new()
+        .get(format!(
+            "{}{CUSTOM_TRAILERED_PATH}",
+            harness.custom_base_url()
+        ))
+        .header(CUSTOM_TRAILERED_HEADER.0, CUSTOM_TRAILERED_HEADER.1)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(body.matches("|eos").count(), 1, "body was {body:?}");
+}
+
+/// A cleanly closed upgrade may yield no `UpgradedBody` task at all. Bytes
+/// synthesized by the terminal `Done` callback must still use the upgraded
+/// body variant; a plain `Body` would panic in the H1 downstream writer after
+/// the 101 handshake has switched it to raw duplex mode.
+#[tokio::test]
+async fn custom_empty_upgrade_tags_terminal_output_as_upgraded_body() {
+    let harness = init();
+    let mut io = TcpStream::connect(("127.0.0.1", harness.custom_proxy_port))
+        .await
+        .unwrap();
+    io.write_all(
+        format!(
+            "GET {CUSTOM_EMPTY_UPGRADE_PATH} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n{}: {}\r\n\r\n",
+            CUSTOM_EMPTY_UPGRADE_HEADER.0, CUSTOM_EMPTY_UPGRADE_HEADER.1
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+
+    let response = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut response = Vec::new();
+        let mut chunk = [0; 1024];
+        while !response.ends_with(b"generated-extra") {
+            let read = io.read(&mut chunk).await.unwrap();
+            assert_ne!(
+                read, 0,
+                "empty upgraded response closed before terminal output"
+            );
+            response.extend_from_slice(&chunk[..read]);
+        }
+        response
+    })
+    .await
+    .expect("empty upgraded response did not arrive");
+    let response = String::from_utf8(response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 101"), "{response}");
+    assert!(response.ends_with("generated-extra"), "{response}");
+}
+
+fn terminal_upgrade_eos_calls(path: &str) -> usize {
+    TERMINAL_UPGRADE_EOS_CALLS
+        .lock()
+        .unwrap()
+        .get(path)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Drive one request against the scripted `Header(101, true)` session and
+/// return everything the proxy wrote back, reading until the connection closes.
+///
+/// A raw socket rather than an HTTP client: after a 101 the downstream session
+/// switches to raw duplex mode, and the point of these tests is what lands on
+/// the wire byte for byte.
+async fn terminal_upgrade_response(path: &str, upgrade_request: bool) -> String {
+    let harness = init();
+    let mut io = TcpStream::connect(("127.0.0.1", harness.custom_proxy_port))
+        .await
+        .unwrap();
+    let upgrade_headers = if upgrade_request {
+        "Connection: Upgrade\r\nUpgrade: websocket\r\n"
+    } else {
+        ""
+    };
+    io.write_all(
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\n{upgrade_headers}{}: {}\r\n\r\n",
+            CUSTOM_TERMINAL_UPGRADE_HEADER.0, CUSTOM_TERMINAL_UPGRADE_HEADER.1
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+
+    let response = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut response = Vec::new();
+        let mut chunk = [0; 1024];
+        loop {
+            let read = io.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            response.extend_from_slice(&chunk[..read]);
+            // Raw upgraded writes end at the generated bytes; an ordinary
+            // chunked response ends at its terminating chunk.
+            if response.ends_with(b"generated-extra") || response.ends_with(b"0\r\n\r\n") {
+                break;
+            }
+        }
+        response
+    })
+    .await
+    .expect("terminal upgrade response did not arrive");
+    String::from_utf8(response).unwrap()
+}
+
+/// Concatenate the payloads of a chunked body, so an assertion on the bytes
+/// does not depend on how many tasks the writer happened to coalesce.
+fn dechunk(body: &str) -> String {
+    let mut out = String::new();
+    let mut rest = body;
+    loop {
+        let (size, tail) = rest
+            .split_once("\r\n")
+            .unwrap_or_else(|| panic!("truncated chunk size in {body:?}"));
+        let size = usize::from_str_radix(size.trim(), 16)
+            .unwrap_or_else(|e| panic!("bad chunk size {size:?} in {body:?}: {e}"));
+        if size == 0 {
+            return out;
+        }
+        out.push_str(&tail[..size]);
+        rest = &tail[size + 2..];
+    }
+}
+
+/// The defect: a custom connector may report a completed Upgrade as a single
+/// `Header(101, true)`. That header used to miss the `terminal_header` branch
+/// (101 satisfies `StatusCode::is_informational()`) while still claiming the
+/// terminal-dispatch latch, so the response body hook never saw end-of-stream
+/// and the generic header-EOS drain appended a plain `Body(None, true)` behind
+/// the 101 -- which panics the H1 writer once the handshake has switched it to
+/// raw duplex mode.
+///
+/// The arrival of the terminal bytes is itself the no-panic assertion: a plain
+/// `Body` task after the 101 aborts the connection task in
+/// `buffer_body_data`, so a regression yields a closed connection and an empty
+/// read rather than a wrong string.
+#[tokio::test]
+async fn custom_terminal_upgrade_header_dispatches_eos_without_a_plain_body() {
+    let response = terminal_upgrade_response(CUSTOM_TERMINAL_UPGRADE_PATH, true).await;
+
+    assert!(response.starts_with("HTTP/1.1 101"), "{response}");
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("no header terminator in {response:?}"));
+    // Raw upgraded write path: the generated bytes reach the wire verbatim,
+    // with none of the chunked framing a plain body task would have added.
+    assert_eq!(body, "generated-extra", "{response}");
+    assert!(
+        !head.to_ascii_lowercase().contains("transfer-encoding"),
+        "{response}"
+    );
+    assert_eq!(
+        terminal_upgrade_eos_calls(CUSTOM_TERMINAL_UPGRADE_PATH),
+        1,
+        "terminal body hook must observe end-of-stream exactly once"
+    );
+    assert_no_terminal_upgrade_read_after_eos();
+}
+
+/// A naked upstream 101 -- the downstream request never asked to upgrade -- must
+/// not mark the downstream response upgraded. The terminal bytes then travel as
+/// ordinary body, and tagging them `UpgradedBody` would panic the H1 writer from
+/// the other side of the same invariant.
+#[tokio::test]
+async fn custom_naked_terminal_upgrade_header_does_not_upgrade_downstream() {
+    let response = terminal_upgrade_response(CUSTOM_NAKED_TERMINAL_UPGRADE_PATH, false).await;
+
+    assert!(response.starts_with("HTTP/1.1 101"), "{response}");
+    assert!(response.ends_with("generated-extra"), "{response}");
+    assert_eq!(
+        terminal_upgrade_eos_calls(CUSTOM_NAKED_TERMINAL_UPGRADE_PATH),
+        1,
+        "terminal body hook must observe end-of-stream exactly once"
+    );
+    assert_no_terminal_upgrade_read_after_eos();
+}
+
+/// `response_filter` rewriting the 101 to a non-upgrade status makes the
+/// FILTERED header authoritative: no downstream handshake happens, so the
+/// terminal bytes must be emitted as ordinary body and framed normally.
+#[tokio::test]
+async fn custom_rewritten_terminal_upgrade_header_does_not_upgrade_downstream() {
+    let response = terminal_upgrade_response(CUSTOM_REWRITTEN_TERMINAL_UPGRADE_PATH, true).await;
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("no header terminator in {response:?}"));
+    assert!(
+        head.to_ascii_lowercase().contains("transfer-encoding"),
+        "{response}"
+    );
+    assert_eq!(dechunk(body), "generated-extra", "{response}");
+    assert_eq!(
+        terminal_upgrade_eos_calls(CUSTOM_REWRITTEN_TERMINAL_UPGRADE_PATH),
+        1,
+        "terminal body hook must observe end-of-stream exactly once"
+    );
+    assert_no_terminal_upgrade_read_after_eos();
 }
 
 #[tokio::test]
