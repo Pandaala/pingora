@@ -29,13 +29,16 @@ use pingora_timeout::timeout;
 use regex::bytes::Regex;
 use std::any::Any;
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::body::{BodyReader, BodyWriter};
 use super::common::*;
 use super::header::HeaderWriter;
-use crate::protocols::http::{body_buffer::FixedBuffer, date, HttpTask, ReusableHttpStream};
+use crate::protocols::http::{
+    body_buffer::{FixedBuffer, RegisteredRequestBodyBuffer, RequestBodyBuffer},
+    date, HttpTask, ReusableHttpStream,
+};
 use crate::protocols::{Digest, SocketAddr, Stream};
 use crate::utils::{BufRef, KVRef};
 
@@ -84,6 +87,14 @@ pub struct HttpSession {
     preread_body: Option<BytesMut>,
     /// A state machine to track how to read the request body
     body_reader: BodyReader,
+    /// Snapshot of whether the request framing ended at the header section,
+    /// taken once when the body reader is initialized for the current request
+    /// and cleared when the next request starts on a keepalive connection.
+    /// Snapshotting matters because the live parser state moves: a chunked
+    /// request with an empty body only reports "empty" once its terminal
+    /// chunk has been parsed, which would flip this transport fact from
+    /// false to true mid-request (and again for a retry attempt).
+    request_headers_end_stream: Option<bool>,
     /// A state machine to track how to write the response body
     body_writer: BodyWriter,
     /// Cancel-safe proxy task state.
@@ -99,6 +110,19 @@ pub struct HttpSession {
     /// timeouts:
     keepalive_timeout: KeepaliveStatus,
     read_timeout: Option<Duration>,
+    /// Absolute deadline of the CURRENT request-body read.
+    ///
+    /// The body bound is a DEADLINE, not a per-call duration, for the same
+    /// reason as its h2 counterpart (see `v2::server::HttpSession::read_deadline`):
+    /// the proxy polls `read_body_or_idle` from a `tokio::select!` branch, so
+    /// any other ready branch drops the read future, and a duration recomputed
+    /// on the next iteration would restart the bound from zero. A client that
+    /// stalls forever while the upstream speaks even once per period would
+    /// then never be released.
+    ///
+    /// Cleared only by a read that actually produced body bytes, or by the end
+    /// of the body -- never by a cancelled read.
+    read_deadline: Option<Instant>,
     write_timeout: Option<Duration>,
     /// How long to wait to make downstream session reusable, if body needs to be drained.
     total_drain_timeout: Option<Duration>,
@@ -108,6 +132,26 @@ pub struct HttpSession {
     request_header: Option<Box<RequestHeader>>,
     /// An internal buffer that holds a copy of the request body up to a certain size
     retry_buffer: Option<FixedBuffer>,
+    /// Optional app-supplied buffer that captures the full request body for early
+    /// inspection / rewrite and replay to upstream. Parallel to `retry_buffer`.
+    early_body_buffer: Option<RegisteredRequestBodyBuffer>,
+    /// Set right before awaiting an `early_body_buffer` capture/finish and cleared
+    /// once the await returns Ok. A body-read future dropped mid-await
+    /// (select!/timeout cancellation) leaves it set: the chunk was already
+    /// consumed from the transport, so the buffered body is incomplete and any
+    /// further body read or replay must fail closed.
+    early_body_capture_poisoned: bool,
+    /// Set when `drain_request_body` discards a registered `early_body_buffer`.
+    /// The body bytes are gone from both the transport and the buffer, so a later
+    /// replay attempt must fail closed instead of silently forwarding a bodyless
+    /// request upstream.
+    early_body_buffer_discarded: bool,
+    /// Set when the session drops a fully replayed `early_body_buffer` after the
+    /// response was committed downstream (no further retry is possible then).
+    /// A later replay attempt indicates a broken retry decision upstream of this
+    /// session and must fail closed instead of silently forwarding a bodyless
+    /// request.
+    early_body_buffer_released: bool,
     /// Whether this session is an upgraded session. This flag is calculated when sending the
     /// response header to the client.
     upgraded: bool,
@@ -176,6 +220,7 @@ impl HttpSession {
             raw_header: None,
             preread_body: None,
             body_reader: BodyReader::new(false),
+            request_headers_end_stream: None,
             body_writer: BodyWriter::new(),
             proxy_task_state: ProxyTaskState::default(),
             body_write_buf: BytesMut::new(),
@@ -184,11 +229,16 @@ impl HttpSession {
             response_written: None,
             request_header: None,
             read_timeout: Some(Duration::from_secs(60)),
+            read_deadline: None,
             write_timeout: None,
             total_drain_timeout: None,
             body_bytes_sent: 0,
             body_bytes_read: 0,
             retry_buffer: None,
+            early_body_buffer: None,
+            early_body_capture_poisoned: false,
+            early_body_buffer_discarded: false,
+            early_body_buffer_released: false,
             upgraded: false,
             digest,
             min_send_rate: None,
@@ -416,7 +466,18 @@ impl HttpSession {
 
                         self.body_reader.reinit();
                         self.pipelined_idle_bytes_stashed = false;
+                        // A new request on this (keepalive) connection gets its
+                        // own transport facts.
+                        self.request_headers_end_stream = None;
                         self.response_written = None;
+                        // Reset the per-request early-body-buffer state too, so a reused
+                        // ServerSession struct can use the capture feature again on the
+                        // next request instead of inheriting request 1's sticky flags.
+                        self.early_body_buffer_released = false;
+                        self.early_body_buffer_discarded = false;
+                        self.early_body_capture_poisoned = false;
+                        self.body_bytes_read = 0;
+                        self.read_deadline = None;
                         self.respect_keepalive();
 
                         // Disable keepalive if both Transfer-Encoding and Content-Length were present
@@ -578,15 +639,40 @@ impl HttpSession {
 
     /// Read the request body. `Ok(None)` when there is no (more) body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
-        let read = self.read_body().await?;
-        Ok(read.map(|b| {
-            let bytes = Bytes::copy_from_slice(self.get_body(&b));
-            self.body_bytes_read += bytes.len();
-            if let Some(buffer) = self.retry_buffer.as_mut() {
-                buffer.write_to_buffer(&bytes);
+        if self.early_body_capture_poisoned {
+            return Error::e_explain(
+                InternalError,
+                "request body capture failed or was cancelled mid-chunk; buffered body is incomplete",
+            );
+        }
+        let Some(b) = self.read_body().await? else {
+            if let Some(buffer) = self.early_body_buffer.as_mut() {
+                // Poison across the await: if this future is dropped mid-await
+                // the flag stays set and the session fails closed from then on.
+                self.early_body_capture_poisoned = true;
+                buffer.finish_capture().await?;
+                self.early_body_capture_poisoned = false;
             }
-            bytes
-        }))
+            return Ok(None);
+        };
+        let bytes = Bytes::copy_from_slice(self.get_body(&b));
+        self.body_bytes_read += bytes.len();
+        if let Some(buffer) = self.retry_buffer.as_mut() {
+            buffer.write_to_buffer(&bytes);
+        }
+        if let Some(buffer) = self.early_body_buffer.as_mut() {
+            self.early_body_capture_poisoned = true;
+            buffer.capture(&bytes).await?;
+            self.early_body_capture_poisoned = false;
+        }
+        if self.body_reader.body_done() {
+            if let Some(buffer) = self.early_body_buffer.as_mut() {
+                self.early_body_capture_poisoned = true;
+                buffer.finish_capture().await?;
+                self.early_body_capture_poisoned = false;
+            }
+        }
+        Ok(Some(bytes))
     }
 
     async fn do_read_body(&mut self) -> Result<Option<BufRef>> {
@@ -597,12 +683,37 @@ impl HttpSession {
     }
 
     /// Read the body into the internal buffer
+    ///
+    /// The `read_timeout` is applied as an inter-chunk idle bound anchored on
+    /// `read_deadline`: it survives the cancellation of this future by a losing
+    /// `select!` branch, and it is rearmed only by a read that produced body
+    /// bytes or reached the end of the body. A read that returns zero bytes --
+    /// chunked framing split across packets, and the empty payloads the chunk
+    /// parser reports for it -- is not progress and must not rearm it, or a
+    /// peer could hold the connection open forever with framing alone.
     async fn read_body(&mut self) -> Result<Option<BufRef>> {
         match self.read_timeout {
-            Some(t) => match timeout(t, self.do_read_body()).await {
-                Ok(res) => res,
-                Err(_) => Error::e_explain(ReadTimedout, format!("reading body, timeout: {t:?}")),
-            },
+            Some(t) => {
+                let now = Instant::now();
+                let deadline = *self.read_deadline.get_or_insert(now + t);
+                let remaining = deadline.saturating_duration_since(now);
+                match timeout(remaining, self.do_read_body()).await {
+                    Ok(res) => {
+                        let progressed = match res.as_ref() {
+                            Ok(Some(b)) => !b.is_empty(),
+                            Ok(None) => true, // end of body
+                            Err(_) => true,   // failed reads get a fresh bound
+                        };
+                        if progressed {
+                            self.read_deadline = None;
+                        }
+                        res
+                    }
+                    Err(_) => {
+                        Error::e_explain(ReadTimedout, format!("reading body, timeout: {t:?}"))
+                    }
+                }
+            }
             None => self.do_read_body().await,
         }
     }
@@ -619,8 +730,22 @@ impl HttpSession {
 
     /// Drain the request body. `Ok(())` when there is no (more) body to read.
     pub async fn drain_request_body(&mut self) -> Result<()> {
+        // Clear any read deadline armed by an earlier (possibly long-cancelled) read
+        // so the end-of-request drain gets a fresh `read_timeout` per read instead of
+        // failing the first pending read instantly with ReadTimedout.
+        self.read_deadline = None;
         if self.is_body_done() {
             return Ok(());
+        }
+        // Draining means the remaining body is discarded (e.g. keepalive reuse after
+        // the app rejected the request without reading it). That is incompatible with
+        // capture-for-replay, so drop any early body buffer first: replay can no
+        // longer happen, and teeing a discarded (possibly hostile) body into the
+        // buffer would be pure waste. Remember the discard: the body now exists in
+        // neither the transport nor the buffer, so a later replay attempt must fail
+        // closed instead of silently proxying a bodyless request.
+        if self.early_body_buffer.take().is_some() {
+            self.early_body_buffer_discarded = true;
         }
         match self.total_drain_timeout {
             Some(t) => match timeout(t, self.do_drain_request_body()).await {
@@ -633,6 +758,25 @@ impl HttpSession {
 
     /// Whether there is no (more) body to be read.
     pub fn is_body_done(&mut self) -> bool {
+        if self
+            .early_body_buffer
+            .as_ref()
+            .is_some_and(RegisteredRequestBodyBuffer::is_replaying)
+        {
+            return false;
+        }
+        self.init_body_reader();
+        self.body_reader.body_done()
+    }
+
+    /// Whether the REAL downstream request body has been fully read.
+    ///
+    /// Unlike [`Self::is_body_done`], this ignores the early-body-buffer
+    /// replay override: while a registered buffer is replaying to the
+    /// upstream, the downstream body was already fully captured, so
+    /// downstream-facing decisions (e.g. whether connection reuse is safe)
+    /// must consult the actual body reader state, not the widened replay view.
+    fn downstream_body_done(&mut self) -> bool {
         self.init_body_reader();
         self.body_reader.body_done()
     }
@@ -641,9 +785,52 @@ impl HttpSession {
     /// Because HTTP 1.1 clients have to send either `Content-Length` or `Transfer-Encoding` in order
     /// to signal the server that it will send the body, this function returns accurate results even
     /// only when the request header is just read.
+    ///
+    /// While an early request body buffer is registered, the effective body is whatever
+    /// the buffer replays, which may be a non-empty rewrite of a zero-byte original
+    /// (e.g. chunked terminated by an immediate zero chunk). Report non-empty then, so
+    /// upstream framing decisions (H2 END_STREAM on HEADERS) keep the stream open until
+    /// replay reaches EOF.
     pub fn is_body_empty(&mut self) -> bool {
+        if self.early_body_buffer.is_some() {
+            return false;
+        }
         self.init_body_reader();
         self.body_reader.body_empty()
+    }
+
+    /// Whether the request ended with actual trailer fields.
+    ///
+    /// This is meaningful after the request body reader reaches EOF. A
+    /// `Trailer` declaration header alone does not affect this result.
+    pub fn request_trailers_present(&mut self) -> bool {
+        self.init_body_reader();
+        self.body_reader.trailers_present()
+    }
+
+    /// Whether request framing ended at the header section.
+    ///
+    /// This is a transport fact, snapshotted once when the body reader is
+    /// initialized for the current request and stable for the rest of it
+    /// (including across retry attempts): reading the live parser state
+    /// instead would flip a chunked-but-empty request from false to true once
+    /// its terminal chunk was parsed.
+    ///
+    /// On H1 the framing is declarative, so `Content-Length: 0` (and the
+    /// absence of both `Content-Length` and `Transfer-Encoding`) counts as
+    /// ended-at-headers. This intentionally differs from H2, where only an
+    /// END_STREAM flag on the HEADERS frame counts and a `Content-Length: 0`
+    /// request may still legitimately send DATA frames -- a protocol-inherent
+    /// asymmetry, not an inconsistency.
+    ///
+    /// Unlike [`Self::is_body_empty`] it deliberately ignores a registered
+    /// early request body buffer -- that buffer is an application artifact
+    /// which rewrites the effective body for upstream framing, and must not
+    /// rewrite what the client actually put on the wire.
+    pub fn request_headers_end_stream(&mut self) -> bool {
+        self.init_body_reader();
+        // `init_body_reader()` above always establishes the snapshot.
+        self.request_headers_end_stream.unwrap_or(false)
     }
 
     /// Write the response header to the client.
@@ -665,15 +852,49 @@ impl HttpSession {
                         .or_err(WriteError, "flushing response header")?;
                 }
                 self.response_written = Some(header);
+                // Committing a non-informational response ends any possibility of
+                // an upstream retry; a fully replayed body buffer is dead weight
+                // for the rest of the response (which may be long-lived, e.g. SSE).
+                self.maybe_release_early_body_buffer();
                 Ok(())
             }
             Err(e) => Error::e_because(WriteError, "writing response header", e),
         }
     }
 
+    /// Drop the registered early body buffer once it can no longer be needed:
+    /// replay reached EOF AND a non-informational response header was committed
+    /// downstream. Both conditions are required — before the response commits, a
+    /// retry may still rewind and replay the buffer; before replay EOF, the
+    /// current attempt is still reading it. Called from both places where either
+    /// condition becomes true. The `early_body_buffer_released` flag makes any
+    /// later replay attempt fail closed (see `begin_request_body_replay`).
+    fn maybe_release_early_body_buffer(&mut self) {
+        let response_committed = self
+            .response_written
+            .as_ref()
+            .is_some_and(|resp| !resp.status.is_informational());
+        if response_committed
+            && self
+                .early_body_buffer
+                .as_ref()
+                .is_some_and(RegisteredRequestBodyBuffer::is_replay_done)
+        {
+            self.early_body_buffer = None;
+            self.early_body_buffer_released = true;
+        }
+    }
+
     /// Return the response header if it is already sent.
     pub fn response_written(&self) -> Option<&ResponseHeader> {
         self.response_written.as_deref()
+    }
+
+    /// Whether the response body writer has already been finished, i.e. the
+    /// full framed body (including a chunked terminator, if any) was handed to
+    /// the writer. `false` while a response is still being streamed.
+    pub fn response_body_finished(&self) -> bool {
+        self.body_writer.finished()
     }
 
     /// `Some(true)` if the this is a successful upgrade
@@ -831,7 +1052,7 @@ impl HttpSession {
 
         // if body unfinished, or request header was not finished reading
         if self.close_on_response_before_downstream_finish
-            && (self.request_header.is_none() || !self.is_body_done())
+            && (self.request_header.is_none() || !self.downstream_body_done())
         {
             debug!("set connection close before downstream finish");
             self.set_keepalive(None);
@@ -1111,6 +1332,18 @@ impl HttpSession {
 
     fn init_body_reader(&mut self) {
         if self.body_reader.need_init() {
+            // No request has been read yet (no preread body captured), so there is
+            // nothing to initialize the body reader from. Return early instead of
+            // unwrapping, so the read-only accessors (`is_body_done`,
+            // `is_body_empty`, `request_headers_end_stream`,
+            // `request_trailers_present`) answer conservatively instead of
+            // panicking. Actually reading a body before `read_request` still
+            // panics one frame down in `BodyReader::read_body`, which is
+            // unchanged: that is a caller sequencing error, not an accessor.
+            if self.preread_body.is_none() {
+                return;
+            }
+
             // reset retry buffer
             if let Some(buffer) = self.retry_buffer.as_mut() {
                 buffer.clear();
@@ -1143,6 +1376,14 @@ impl HttpSession {
                     }
                 }
             }
+
+            // Snapshot the headers-end-stream transport fact exactly once per
+            // request, while the body reader still reflects only the framing
+            // declared by the header section. Reading it later would observe
+            // parser progress instead (see the field's doc).
+            if self.request_headers_end_stream.is_none() {
+                self.request_headers_end_stream = Some(self.body_reader.body_empty());
+            }
         }
     }
 
@@ -1166,6 +1407,131 @@ impl HttpSession {
                 b.get_buffer()
             }
         })
+    }
+
+    /// Register an app-supplied buffer to capture the request body for early
+    /// inspection / rewrite and upstream replay. Must be called BEFORE any body
+    /// byte is read: registering after a partial read would capture only the
+    /// remainder and silently replay a truncated body, so it fails closed then.
+    /// Also fails closed for upgrade requests: their "body" is a bidirectional
+    /// tunnel, so capture-until-EOF semantics do not apply. Also fails closed
+    /// when the native retry buffer is already enabled: the capturing reads
+    /// would tee every drained chunk into it, and the proxy would then send
+    /// that buffer AND replay this one — the same body twice. (The proxy's own
+    /// `enable_retry_buffering()` is not affected: it runs after the app has
+    /// drained the body, and replayed chunks bypass the retry-buffer tee.)
+    pub fn set_request_body_buffer(&mut self, buffer: Box<dyn RequestBodyBuffer>) -> Result<()> {
+        if self.early_body_buffer.is_some() {
+            return Error::e_explain(InternalError, "request body buffer is already registered");
+        }
+        if self.retry_buffer.is_some() {
+            return Error::e_explain(
+                InternalError,
+                "request body buffer cannot be registered while retry buffering is enabled",
+            );
+        }
+        if self.is_upgrade_req() {
+            return Error::e_explain(
+                InternalError,
+                "request body buffer cannot be registered for an upgrade request",
+            );
+        }
+        if self.is_body_empty() {
+            return Error::e_explain(
+                InternalError,
+                "request body buffer cannot be registered for an empty request body",
+            );
+        }
+        if self.body_bytes_read > 0 {
+            return Error::e_explain(
+                InternalError,
+                "request body buffer must be registered before the body is read",
+            );
+        }
+        self.early_body_buffer = Some(RegisteredRequestBodyBuffer::new(buffer));
+        Ok(())
+    }
+
+    /// Register an already-finalized replay source for a request whose
+    /// downstream body is empty. This path performs no downstream capture and
+    /// exists so an application can inject a body without weakening
+    /// `set_request_body_buffer`'s register-before-read contract.
+    pub fn set_bodyless_request_replay_buffer(
+        &mut self,
+        buffer: Box<dyn RequestBodyBuffer>,
+    ) -> Result<()> {
+        if self.early_body_buffer.is_some() {
+            return Error::e_explain(InternalError, "request body buffer is already registered");
+        }
+        // Same double-send defense as `set_request_body_buffer`. A bodyless
+        // request has nothing to tee today, but rejecting keeps the two
+        // mechanisms mutually exclusive by construction instead of by the
+        // current send-path details.
+        if self.retry_buffer.is_some() {
+            return Error::e_explain(
+                InternalError,
+                "request body replay buffer cannot be registered while retry buffering is enabled",
+            );
+        }
+        if self.is_upgrade_req() {
+            return Error::e_explain(
+                InternalError,
+                "request body replay buffer cannot be registered for an upgrade request",
+            );
+        }
+        if !self.is_body_empty() {
+            return Error::e_explain(
+                InternalError,
+                "request body replay buffer requires an empty downstream request body",
+            );
+        }
+        self.early_body_buffer = Some(RegisteredRequestBodyBuffer::ready(buffer));
+        Ok(())
+    }
+
+    pub fn request_body_buffer_registered(&self) -> bool {
+        self.early_body_buffer.is_some()
+    }
+
+    /// Whether a registered request body buffer is currently replaying, i.e.
+    /// `read_body_or_idle` serves buffered chunks instead of reading the client
+    /// connection, so its errors originate in the buffer, not the client.
+    pub fn request_body_buffer_replaying(&self) -> bool {
+        self.early_body_buffer
+            .as_ref()
+            .is_some_and(RegisteredRequestBodyBuffer::is_replaying)
+    }
+
+    /// Prepare the registered buffer as the active request-body source for one
+    /// upstream attempt. Returns `false` when no buffer was registered.
+    pub async fn begin_request_body_replay(&mut self) -> Result<bool> {
+        if self.early_body_capture_poisoned {
+            return Error::e_explain(
+                InternalError,
+                "request body capture failed or was cancelled mid-chunk; refusing to replay incomplete buffered body",
+            );
+        }
+        if self.early_body_buffer_discarded {
+            return Error::e_explain(
+                InternalError,
+                "request body buffer was discarded by drain_request_body; the request body is gone and cannot be replayed",
+            );
+        }
+        if self.early_body_buffer_released {
+            return Error::e_explain(
+                InternalError,
+                "request body buffer was released after the response was committed downstream; no further replay is possible",
+            );
+        }
+        let Some(registered) = self.early_body_buffer.as_mut() else {
+            return Ok(false);
+        };
+        registered.begin_replay().await?;
+        // See the h2 counterpart: a deadline left over from a live read that
+        // was cancelled before this attempt no longer describes the client's
+        // silence once replay is serving buffered chunks.
+        self.read_deadline = None;
+        Ok(true)
     }
 
     fn get_body(&self, buf_ref: &BufRef) -> &[u8] {
@@ -1209,6 +1575,18 @@ impl HttpSession {
     /// is called after the connection is already marked half-closed and `abort_on_close` is
     /// **disabled**, then it will pend forever.
     pub async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
+        if let Some(registered) = self.early_body_buffer.as_mut() {
+            if registered.is_replaying() {
+                let chunk = registered.next_chunk().await?;
+                if chunk.is_none() {
+                    // Replay EOF. If the response was already committed downstream
+                    // (upstream responded before replay finished), the buffer can
+                    // never be needed again — drop it now.
+                    self.maybe_release_early_body_buffer();
+                }
+                return Ok(chunk);
+            }
+        }
         if no_body_expected || self.is_body_done() {
             if self.half_closed {
                 if self.abort_on_close {
@@ -1905,6 +2283,102 @@ mod tests_stream {
         assert_eq!(Version::HTTP_11, http_stream.req_header().version);
 
         assert_eq!(b"pingora.org", http_stream.get_header_bytes("Host"));
+    }
+
+    #[tokio::test]
+    async fn headers_end_stream_is_a_stable_snapshot() {
+        init_log();
+        // A chunked request with an EMPTY body: framing did not end at the
+        // header section, and reading the body to completion must not change
+        // that fact (the live parser state would say "empty" afterwards).
+        let input1 = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let input2 = b"0\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(&input1[..])
+            .read(&input2[..])
+            .read(&input1[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert!(!http_stream.request_headers_end_stream());
+        assert!(http_stream.read_body_bytes().await.unwrap().is_none());
+        assert!(http_stream.is_body_done());
+        // `is_body_empty()` now reports true; the transport fact must not.
+        assert!(http_stream.is_body_empty());
+        assert!(
+            !http_stream.request_headers_end_stream(),
+            "the headers-end-stream fact must not flip once the body is read"
+        );
+
+        // The next request on this keepalive connection re-snapshots.
+        http_stream.read_request().await.unwrap();
+        assert!(!http_stream.request_headers_end_stream());
+    }
+
+    /// Read the request body to EOF and return it as one string.
+    async fn drain_h1_request_body(session: &mut HttpSession) -> String {
+        let mut body = String::new();
+        while let Some(chunk) = session.read_body_bytes().await.unwrap() {
+            body.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        body
+    }
+
+    /// `BodyReader::reinit()` must clear `trailers_present`, because the reader
+    /// is REUSED for the next request on a keepalive connection. Without that
+    /// line the second request inherits the first one's trailer fact, and both
+    /// proxy pumps drive `request_trailer_filter` off it: a plain request
+    /// pipelined behind a trailer-bearing one would fire the trailer hook it
+    /// never had.
+    #[tokio::test]
+    async fn trailer_fact_is_cleared_across_a_keepalive_request() {
+        init_log();
+        let headers = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nTransfer-Encoding: chunked\r\n\r\n";
+        // Request 1 ends with a real trailer field; request 2 does not.
+        let body_with_trailers = b"5\r\nhello\r\n0\r\nx-checksum: ok\r\n\r\n";
+        let body_without_trailers = b"5\r\nhello\r\n0\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(&headers[..])
+            .read(&body_with_trailers[..])
+            .read(&headers[..])
+            .read(&body_without_trailers[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+
+        http_stream.read_request().await.unwrap();
+        assert_eq!(
+            drain_h1_request_body(&mut http_stream).await,
+            "hello",
+            "request 1 body"
+        );
+        assert!(http_stream.request_trailers_present());
+
+        http_stream.read_request().await.unwrap();
+        assert!(
+            !http_stream.request_trailers_present(),
+            "a new request must not inherit the previous request's trailer fact"
+        );
+        assert_eq!(
+            drain_h1_request_body(&mut http_stream).await,
+            "hello",
+            "request 2 body"
+        );
+        assert!(
+            !http_stream.request_trailers_present(),
+            "this request ended with no trailer fields"
+        );
+    }
+
+    #[tokio::test]
+    async fn headers_end_stream_true_for_content_length_zero() {
+        init_log();
+        // H1 framing is declarative: `Content-Length: 0` ends the request at
+        // the header section (unlike H2, where END_STREAM is the only signal).
+        let input = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 0\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert!(http_stream.request_headers_end_stream());
     }
 
     #[tokio::test]
@@ -3722,6 +4196,47 @@ mod test_proxy_tasks {
         // then the Body task should be rejected)
         let _ = http_stream.write_proxy_tasks().await;
     }
+    /// The h1 counterpart of
+    /// `v2::server::test::test_read_body_timeout_survives_select_cancellation`.
+    ///
+    /// The proxy polls the downstream body read from a `tokio::select!` branch,
+    /// so any other ready branch drops the read future. The bound must be a
+    /// deadline that survives that, or an upstream chattier than the timeout
+    /// rearms it forever and a stalled client pins the pump.
+    #[tokio::test]
+    async fn test_read_http_body_timeout_survives_select_cancellation() {
+        /// Well under `TEST_READ_TIMEOUT`: the read is cancelled and rebuilt
+        /// several times before the deadline is reached.
+        const COMPETING_BRANCH_TICK: Duration = Duration::from_millis(100);
+
+        let mut http_stream = HttpSession::new(mocked_blocking_body_forever_stream());
+        http_stream.read_timeout = Some(TEST_READ_TIMEOUT);
+        http_stream.read_request().await.unwrap();
+
+        let mut cancellations = 0u32;
+        let res = test_read_with_tokio_timeout(async {
+            loop {
+                tokio::select! {
+                    body = http_stream.read_body_bytes() => break body,
+                    _ = tokio::time::sleep(COMPETING_BRANCH_TICK) => {
+                        cancellations += 1;
+                    }
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            res.is_ok(),
+            "an unrelated ready select! branch must not rearm the request-body idle bound"
+        );
+        assert_eq!(res.unwrap().unwrap_err().etype(), &ReadTimedout);
+        assert!(
+            cancellations >= 2,
+            "the competing branch must have cancelled the read at least twice for this \
+             to test anything; saw {cancellations}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4529,5 +5044,843 @@ mod test_pipelining {
         }
 
         assert!(prefix.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod test_early_body_buffer {
+    use super::*;
+    use crate::protocols::http::body_buffer::{InMemoryRequestBodyBuffer, RequestBodyBuffer};
+    use async_trait::async_trait;
+    use http::StatusCode;
+    use tokio_test::io::Builder;
+
+    fn init_log() {
+        let _ = env_logger::builder().is_test(true).try_init();
+    }
+
+    /// Like a disk-spill impl: awaits (yields) inside next_chunk before reading
+    /// at the cursor, opening a cancellation window mid-replay.
+    struct YieldingBuffer {
+        buf: BytesMut,
+        body: Option<Bytes>,
+        offset: usize,
+        chunk_cap: usize,
+    }
+
+    impl YieldingBuffer {
+        fn new() -> Self {
+            Self::with_chunk_cap(usize::MAX)
+        }
+
+        /// Cap each replay chunk at `chunk_cap` bytes so a small test body
+        /// still replays in multiple chunks, like a large body against the
+        /// real 64 KiB replay chunk size.
+        fn with_chunk_cap(chunk_cap: usize) -> Self {
+            YieldingBuffer {
+                buf: BytesMut::new(),
+                body: None,
+                offset: 0,
+                chunk_cap,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RequestBodyBuffer for YieldingBuffer {
+        async fn write(&mut self, data: &Bytes) -> Result<()> {
+            self.buf.extend_from_slice(data);
+            Ok(())
+        }
+
+        async fn finish(&mut self) -> Result<()> {
+            if self.body.is_none() {
+                self.body = Some(self.buf.split().freeze());
+            }
+            Ok(())
+        }
+
+        async fn rewind(&mut self) -> Result<()> {
+            self.offset = 0;
+            Ok(())
+        }
+
+        async fn next_chunk(&mut self, max_bytes: usize) -> Result<Option<Bytes>> {
+            tokio::task::yield_now().await;
+            let Some(body) = self.body.as_ref() else {
+                return Ok(None);
+            };
+            if self.offset >= body.len() {
+                return Ok(None);
+            }
+            let end = self
+                .offset
+                .saturating_add(max_bytes.min(self.chunk_cap))
+                .min(body.len());
+            Ok(Some(body.slice(self.offset..end)))
+        }
+
+        fn consume(&mut self, bytes: usize) {
+            self.offset = self.offset.saturating_add(bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_survives_select_cancellation() {
+        init_log();
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\nabc";
+        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream
+            .set_request_body_buffer(Box::new(YieldingBuffer::new()))
+            .unwrap();
+        assert_eq!(
+            http_stream.read_body_bytes().await.unwrap().unwrap(),
+            b"abc".as_slice()
+        );
+        assert!(http_stream.begin_request_body_replay().await.unwrap());
+        // Poll the replay branch once (it suspends at the impl's internal
+        // await), then drop the future — exactly what the proxy body pump does
+        // to read_body_or_idle when a losing tokio::select! branch is cancelled.
+        {
+            let mut fut = tokio_test::task::spawn(http_stream.read_body_or_idle(false));
+            assert!(fut.poll().is_pending());
+        }
+        // The cancelled call must not have consumed the chunk.
+        assert_eq!(
+            http_stream.read_body_or_idle(false).await.unwrap().unwrap(),
+            b"abc".as_slice()
+        );
+        assert!(http_stream
+            .read_body_or_idle(false)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn early_body_buffer_captures_and_replays() {
+        init_log();
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\nabc";
+        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream
+            .set_request_body_buffer(Box::new(InMemoryRequestBodyBuffer::new()))
+            .unwrap();
+        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(res, b"abc".as_slice());
+        for _ in 0..2 {
+            assert!(http_stream.begin_request_body_replay().await.unwrap());
+            assert_eq!(
+                http_stream.read_body_or_idle(false).await.unwrap().unwrap(),
+                b"abc".as_slice()
+            );
+            assert!(http_stream
+                .read_body_or_idle(false)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn expect_continue_capture_sends_100_before_body() {
+        init_log();
+        let input1 =
+            b"POST / HTTP/1.1\r\nHost: pingora.org\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n";
+        let output_100 = b"HTTP/1.1 100 Continue\r\n\r\n";
+        let input2 = b"abc";
+        // The mock io script is ordered: the body read stays pending until the
+        // 100 is written, mirroring a client that only sends the body after
+        // seeing the 100. Draining without write_continue_response() first
+        // would hang here, which is exactly the deadlock the contract warns
+        // about.
+        let mock_io = Builder::new()
+            .read(&input1[..])
+            .write(&output_100[..])
+            .read(&input2[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream
+            .set_request_body_buffer(Box::new(InMemoryRequestBodyBuffer::new()))
+            .unwrap();
+        http_stream.write_continue_response().await.unwrap();
+        assert_eq!(
+            http_stream.read_body_bytes().await.unwrap().unwrap(),
+            b"abc".as_slice()
+        );
+        assert!(http_stream.begin_request_body_replay().await.unwrap());
+        assert_eq!(
+            http_stream.read_body_or_idle(false).await.unwrap().unwrap(),
+            b"abc".as_slice()
+        );
+        assert!(http_stream
+            .read_body_or_idle(false)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn write_continue_response_only_sends_once() {
+        init_log();
+        let input1 =
+            b"POST / HTTP/1.1\r\nHost: pingora.org\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n";
+        let input2 = b"abc";
+        // Ordered script: once the 100 write expectation is consumed, any
+        // duplicate 100 bytes would mismatch the next scripted action and
+        // fail the mock.
+        let output_100 = b"HTTP/1.1 100 Continue\r\n\r\n";
+        let output_200 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(&input1[..])
+            .write(&output_100[..])
+            .read(&input2[..])
+            .write(&output_200[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream
+            .set_request_body_buffer(Box::new(InMemoryRequestBodyBuffer::new()))
+            .unwrap();
+        http_stream.write_continue_response().await.unwrap();
+        // A repeat is a no-op: nothing extra reaches the wire.
+        http_stream.write_continue_response().await.unwrap();
+        assert_eq!(
+            http_stream.read_body_bytes().await.unwrap().unwrap(),
+            b"abc".as_slice()
+        );
+        assert!(http_stream.begin_request_body_replay().await.unwrap());
+        assert_eq!(
+            http_stream.read_body_or_idle(false).await.unwrap().unwrap(),
+            b"abc".as_slice()
+        );
+        assert!(http_stream
+            .read_body_or_idle(false)
+            .await
+            .unwrap()
+            .is_none());
+        // The 100 does not block the final response.
+        let mut response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        response.insert_header(header::CONTENT_LENGTH, "0").unwrap();
+        http_stream.update_resp_headers = false;
+        http_stream
+            .write_response_header_ref(&response)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rewind_from_mid_replay_re_serves_full_body() {
+        init_log();
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nContent-Length: 6\r\n\r\nabcdef";
+        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        // 2-byte replay chunks: the 6-byte body replays in multiple chunks,
+        // like a large body against the real 64 KiB replay chunk size.
+        http_stream
+            .set_request_body_buffer(Box::new(YieldingBuffer::with_chunk_cap(2)))
+            .unwrap();
+        assert_eq!(
+            http_stream.read_body_bytes().await.unwrap().unwrap(),
+            b"abcdef".as_slice()
+        );
+
+        // Attempt 1 fails mid-replay: one chunk was delivered (its commit
+        // still pending) when the retry rewinds from the Replaying state.
+        assert!(http_stream.begin_request_body_replay().await.unwrap());
+        assert_eq!(
+            http_stream.read_body_or_idle(false).await.unwrap().unwrap(),
+            b"ab".as_slice()
+        );
+        assert!(http_stream.begin_request_body_replay().await.unwrap());
+        let mut replayed = Vec::new();
+        while let Some(chunk) = http_stream.read_body_or_idle(false).await.unwrap() {
+            replayed.extend_from_slice(&chunk);
+        }
+        assert_eq!(replayed, b"abcdef");
+
+        // Attempt 2 fails with a read in flight: the read is cancelled
+        // mid-poll (losing select! branch) before the retry rewinds from the
+        // Replaying state.
+        assert!(http_stream.begin_request_body_replay().await.unwrap());
+        assert_eq!(
+            http_stream.read_body_or_idle(false).await.unwrap().unwrap(),
+            b"ab".as_slice()
+        );
+        {
+            let mut fut = tokio_test::task::spawn(http_stream.read_body_or_idle(false));
+            assert!(fut.poll().is_pending());
+        }
+        assert!(http_stream.begin_request_body_replay().await.unwrap());
+        let mut replayed = Vec::new();
+        while let Some(chunk) = http_stream.read_body_or_idle(false).await.unwrap() {
+            replayed.extend_from_slice(&chunk);
+        }
+        assert_eq!(replayed, b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn early_response_mid_replay_keeps_downstream_keepalive() {
+        init_log();
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\nabc";
+        let output = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(&input1[..])
+            .read(&input2[..])
+            .write(&output[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert_eq!(http_stream.keepalive_timeout, KeepaliveStatus::Infinite);
+        http_stream
+            .set_request_body_buffer(Box::new(InMemoryRequestBodyBuffer::new()))
+            .unwrap();
+        assert_eq!(
+            http_stream.read_body_bytes().await.unwrap().unwrap(),
+            b"abc".as_slice()
+        );
+        assert!(http_stream.begin_request_body_replay().await.unwrap());
+        // Precondition of the bug: the replay override reports "not done"
+        // while the real downstream body was fully captured above.
+        assert!(!http_stream.is_body_done());
+        // Upstream answered before consuming the replayed body (early 4xx,
+        // auth reject). The keepalive guard must consult the real downstream
+        // state and keep the connection reusable. Content-Length is set so
+        // the response is not close-delimited, which would disable reuse on
+        // its own and mask what this test asserts.
+        let mut response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        response.insert_header(header::CONTENT_LENGTH, "0").unwrap();
+        http_stream.update_resp_headers = false;
+        http_stream
+            .write_response_header_ref(&response)
+            .await
+            .unwrap();
+        assert_eq!(http_stream.keepalive_timeout, KeepaliveStatus::Infinite);
+    }
+
+    #[tokio::test]
+    async fn early_response_mid_capture_still_disables_keepalive() {
+        init_log();
+        let input = b"GET / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 3\r\n\r\nabc";
+        let output = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).write(&output[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert_eq!(http_stream.keepalive_timeout, KeepaliveStatus::Infinite);
+        http_stream
+            .set_request_body_buffer(Box::new(InMemoryRequestBodyBuffer::new()))
+            .unwrap();
+        // Body not read: the downstream really is unfinished, so the guard
+        // must still close regardless of the registered buffer. Content-Length
+        // is set so the only keepalive-off source is the guard itself.
+        let mut response = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        response.insert_header(header::CONTENT_LENGTH, "0").unwrap();
+        http_stream.update_resp_headers = false;
+        http_stream
+            .write_response_header_ref(&response)
+            .await
+            .unwrap();
+        assert_eq!(http_stream.keepalive_timeout, KeepaliveStatus::Off);
+    }
+
+    #[tokio::test]
+    async fn headers_end_stream_fact_ignores_early_body_buffer() {
+        init_log();
+        // A bodyless request: no Content-Length, no Transfer-Encoding, so the
+        // request framing ended at the header section.
+        let input = b"GET / HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert!(http_stream.request_headers_end_stream());
+
+        // Registering an early body buffer makes `is_body_empty()` report
+        // non-empty, because the buffer replays a rewritten, non-empty body
+        // upstream. That is an application artifact: the transport fact of
+        // what the client sent must not move with it.
+        let mut buffer = InMemoryRequestBodyBuffer::new();
+        buffer
+            .write(&Bytes::from_static(b"injected"))
+            .await
+            .unwrap();
+        buffer.finish().await.unwrap();
+        http_stream
+            .set_bodyless_request_replay_buffer(Box::new(buffer))
+            .unwrap();
+        assert!(!http_stream.is_body_empty());
+        assert!(http_stream.request_headers_end_stream());
+    }
+
+    #[tokio::test]
+    async fn early_body_buffer_not_registered() {
+        init_log();
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\nabc";
+        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        let _ = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert!(!http_stream.begin_request_body_replay().await.unwrap());
+    }
+
+    /// Delegates to [`InMemoryRequestBodyBuffer`] and reports its own drop, so
+    /// tests can pin down exactly when the session releases the buffer.
+    struct DropProbeBuffer {
+        inner: InMemoryRequestBodyBuffer,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl DropProbeBuffer {
+        fn new() -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+            let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            (
+                DropProbeBuffer {
+                    inner: InMemoryRequestBodyBuffer::new(),
+                    dropped: dropped.clone(),
+                },
+                dropped,
+            )
+        }
+    }
+
+    impl Drop for DropProbeBuffer {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl RequestBodyBuffer for DropProbeBuffer {
+        async fn write(&mut self, data: &Bytes) -> Result<()> {
+            self.inner.write(data).await
+        }
+
+        async fn finish(&mut self) -> Result<()> {
+            self.inner.finish().await
+        }
+
+        async fn rewind(&mut self) -> Result<()> {
+            self.inner.rewind().await
+        }
+
+        async fn next_chunk(&mut self, max_bytes: usize) -> Result<Option<Bytes>> {
+            self.inner.next_chunk(max_bytes).await
+        }
+
+        fn consume(&mut self, bytes: usize) {
+            self.inner.consume(bytes)
+        }
+    }
+
+    fn dropped(flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> bool {
+        flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn buffer_released_when_response_commits_after_replay() {
+        init_log();
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\nabc";
+        let mock_io = Builder::new()
+            .read(&input1[..])
+            .read(&input2[..])
+            .write(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .write(b"HTTP/1.1 200 OK\r\n\r\n")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.update_resp_headers = false;
+        http_stream.read_request().await.unwrap();
+        let (probe, probe_dropped) = DropProbeBuffer::new();
+        http_stream
+            .set_request_body_buffer(Box::new(probe))
+            .unwrap();
+        let _ = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert!(http_stream.begin_request_body_replay().await.unwrap());
+        assert_eq!(
+            http_stream.read_body_or_idle(false).await.unwrap().unwrap(),
+            b"abc".as_slice()
+        );
+        assert!(http_stream
+            .read_body_or_idle(false)
+            .await
+            .unwrap()
+            .is_none());
+        // Replay is done but no response committed yet: a retry could still
+        // rewind and replay, so the buffer must survive.
+        assert!(!dropped(&probe_dropped));
+        // An informational response is not a commitment either.
+        let informational = Box::new(ResponseHeader::build(100, None).unwrap());
+        http_stream
+            .write_response_header(informational)
+            .await
+            .unwrap();
+        assert!(!dropped(&probe_dropped));
+        // Committing the real response releases the buffer immediately.
+        let response = Box::new(ResponseHeader::build(200, None).unwrap());
+        http_stream.write_response_header(response).await.unwrap();
+        assert!(dropped(&probe_dropped));
+        assert!(!http_stream.request_body_buffer_registered());
+        // A replay attempt after release must fail closed, not silently proxy
+        // a bodyless request.
+        assert!(http_stream.begin_request_body_replay().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn buffer_released_at_replay_eof_when_response_committed_first() {
+        init_log();
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\nabc";
+        let mock_io = Builder::new()
+            .read(&input1[..])
+            .read(&input2[..])
+            .write(b"HTTP/1.1 200 OK\r\n\r\n")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.update_resp_headers = false;
+        http_stream.read_request().await.unwrap();
+        let (probe, probe_dropped) = DropProbeBuffer::new();
+        http_stream
+            .set_request_body_buffer(Box::new(probe))
+            .unwrap();
+        let _ = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert!(http_stream.begin_request_body_replay().await.unwrap());
+        assert_eq!(
+            http_stream.read_body_or_idle(false).await.unwrap().unwrap(),
+            b"abc".as_slice()
+        );
+        // Early upstream response: the header commits downstream while replay
+        // is still in flight — the buffer must survive until replay EOF.
+        let response = Box::new(ResponseHeader::build(200, None).unwrap());
+        http_stream.write_response_header(response).await.unwrap();
+        assert!(!dropped(&probe_dropped));
+        assert!(http_stream
+            .read_body_or_idle(false)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(dropped(&probe_dropped));
+        assert!(http_stream.begin_request_body_replay().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn set_buffer_rejected_for_empty_body() {
+        init_log();
+        let input = b"GET / HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert!(http_stream
+            .set_request_body_buffer(Box::new(InMemoryRequestBodyBuffer::new()))
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn set_buffer_rejected_for_upgrade_request() {
+        init_log();
+        // Upgrade request whose "body" is really the start of a tunnel: the buffer
+        // capture-until-EOF model does not apply, registration must fail closed.
+        let input = b"GET / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: websocket\r\nConnection: upgrade\r\nContent-Length: 3\r\n\r\nabc";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert!(http_stream
+            .set_request_body_buffer(Box::new(InMemoryRequestBodyBuffer::new()))
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn set_buffer_rejected_when_retry_buffering_enabled() {
+        init_log();
+        // Capture registration: retry buffering already on would tee the
+        // drained body into the native buffer and send it twice.
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\nabc";
+        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream.enable_retry_buffering();
+        assert!(http_stream
+            .set_request_body_buffer(Box::new(InMemoryRequestBodyBuffer::new()))
+            .is_err());
+
+        // Bodyless replay registration: rejected for the same mutual-exclusion
+        // contract (a bodyless request needs its own session so the retry
+        // check, not the body-empty check, is what fires).
+        let input = b"GET / HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream.enable_retry_buffering();
+        let mut ready = InMemoryRequestBodyBuffer::new();
+        ready.finish().await.unwrap();
+        assert!(http_stream
+            .set_bodyless_request_replay_buffer(Box::new(ready))
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn set_buffer_rejected_after_body_read() {
+        init_log();
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\nabc";
+        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        // Read the body BEFORE registering: registration must fail closed so a
+        // truncated body can never be captured and replayed.
+        let _ = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert!(http_stream
+            .set_request_body_buffer(Box::new(InMemoryRequestBodyBuffer::new()))
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn replay_rejected_before_capture_finishes() {
+        init_log();
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\nabc";
+        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream
+            .set_request_body_buffer(Box::new(InMemoryRequestBodyBuffer::new()))
+            .unwrap();
+        assert!(http_stream.begin_request_body_replay().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn drain_discards_buffer_no_tee() {
+        // Draining a registered-but-unread body (e.g. keepalive reuse after the app
+        // rejected the request) must drop the buffer, not tee the discarded body
+        // into it — the reject path is exactly where hostile bodies show up. The
+        // discard is remembered: a later replay attempt must fail closed rather
+        // than report "no buffer registered" and let the proxy forward a request
+        // whose body is gone.
+        init_log();
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\nabc";
+        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream
+            .set_request_body_buffer(Box::new(InMemoryRequestBodyBuffer::new()))
+            .unwrap();
+        assert!(http_stream
+            .set_request_body_buffer(Box::new(InMemoryRequestBodyBuffer::new()))
+            .is_err());
+        http_stream.drain_request_body().await.unwrap();
+        assert!(http_stream.begin_request_body_replay().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn drain_after_partial_read_poisons_replay() {
+        init_log();
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\nab";
+        let input3 = b"c";
+        let mock_io = Builder::new()
+            .read(&input1[..])
+            .read(&input2[..])
+            .read(&input3[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream
+            .set_request_body_buffer(Box::new(InMemoryRequestBodyBuffer::new()))
+            .unwrap();
+        assert_eq!(
+            http_stream.read_body_bytes().await.unwrap().unwrap(),
+            b"ab".as_slice()
+        );
+        http_stream.drain_request_body().await.unwrap();
+        // The partially captured buffer was discarded with the rest of the body:
+        // replay must fail closed, not silently proxy a bodyless request.
+        assert!(http_stream.begin_request_body_replay().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn no_op_drain_preserves_completed_capture() {
+        init_log();
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\nabc";
+        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream
+            .set_request_body_buffer(Box::new(InMemoryRequestBodyBuffer::new()))
+            .unwrap();
+        assert_eq!(
+            http_stream.read_body_bytes().await.unwrap().unwrap(),
+            b"abc".as_slice()
+        );
+        http_stream.drain_request_body().await.unwrap();
+        assert!(http_stream.begin_request_body_replay().await.unwrap());
+        assert_eq!(
+            http_stream.read_body_or_idle(false).await.unwrap().unwrap(),
+            b"abc".as_slice()
+        );
+    }
+
+    /// Ignores captured data and replays a fixed non-empty body, like an app
+    /// rewriting a zero-byte payload.
+    #[derive(Default)]
+    struct RewriteToNonEmptyBuffer {
+        offset: usize,
+    }
+
+    const REWRITTEN_BODY: &[u8] = b"rewritten";
+
+    #[async_trait]
+    impl RequestBodyBuffer for RewriteToNonEmptyBuffer {
+        async fn write(&mut self, _data: &Bytes) -> Result<()> {
+            Ok(())
+        }
+
+        async fn finish(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn rewind(&mut self) -> Result<()> {
+            self.offset = 0;
+            Ok(())
+        }
+
+        async fn next_chunk(&mut self, max_bytes: usize) -> Result<Option<Bytes>> {
+            if self.offset >= REWRITTEN_BODY.len() {
+                return Ok(None);
+            }
+            let end = self
+                .offset
+                .saturating_add(max_bytes)
+                .min(REWRITTEN_BODY.len());
+            Ok(Some(Bytes::from_static(&REWRITTEN_BODY[self.offset..end])))
+        }
+
+        fn consume(&mut self, bytes: usize) {
+            self.offset = self.offset.saturating_add(bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_payload_chunked_body_stays_non_empty_while_registered() {
+        // A chunked request terminated by an immediate zero chunk passes
+        // registration (its framing permits a body) but captures zero bytes,
+        // and the registered buffer may rewrite that into a non-empty body.
+        // is_body_empty() feeds the upstream END_STREAM-on-HEADERS decision in
+        // proxy_h2, so it must keep reporting non-empty while the buffer is
+        // registered — ending the stream at HEADERS would turn the replay DATA
+        // into a send-after-end-of-stream error.
+        init_log();
+        let input1 = b"POST / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream
+            .set_request_body_buffer(Box::new(RewriteToNonEmptyBuffer::default()))
+            .unwrap();
+        assert!(!http_stream.is_body_empty());
+        // The zero chunk ends the body immediately: zero bytes captured.
+        assert!(http_stream.read_body_bytes().await.unwrap().is_none());
+        // Without the replay-source guard the framing now reads Complete(0)
+        // and this would flip to true.
+        assert!(!http_stream.is_body_empty());
+        assert!(http_stream.begin_request_body_replay().await.unwrap());
+        assert!(!http_stream.is_body_empty());
+        assert_eq!(
+            http_stream.read_body_or_idle(false).await.unwrap().unwrap(),
+            REWRITTEN_BODY
+        );
+        assert!(http_stream
+            .read_body_or_idle(false)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn finalized_replay_buffer_injects_body_into_empty_request() {
+        init_log();
+        let input = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 0\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        assert!(http_stream.is_body_empty());
+
+        http_stream
+            .set_bodyless_request_replay_buffer(Box::new(RewriteToNonEmptyBuffer::default()))
+            .unwrap();
+        assert!(!http_stream.is_body_empty());
+        assert!(http_stream.begin_request_body_replay().await.unwrap());
+        assert_eq!(
+            http_stream.read_body_or_idle(false).await.unwrap().unwrap(),
+            REWRITTEN_BODY
+        );
+        assert!(http_stream
+            .read_body_or_idle(false)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// A capture impl that never completes `write()`, opening a cancellation
+    /// window after the chunk has already been consumed from the transport.
+    struct PendingCaptureBuffer;
+
+    #[async_trait]
+    impl RequestBodyBuffer for PendingCaptureBuffer {
+        async fn write(&mut self, _data: &Bytes) -> Result<()> {
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+
+        async fn finish(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn rewind(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn next_chunk(&mut self, _max_bytes: usize) -> Result<Option<Bytes>> {
+            Ok(None)
+        }
+
+        fn consume(&mut self, _bytes: usize) {}
+    }
+
+    #[tokio::test]
+    async fn cancelled_capture_poisons_read_and_replay() {
+        init_log();
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\nabc";
+        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        http_stream
+            .set_request_body_buffer(Box::new(PendingCaptureBuffer))
+            .unwrap();
+        // The first poll consumes "abc" from the transport, then suspends in
+        // the buffer's write(). Dropping the future here models a losing
+        // select!/timeout branch cancelling the read mid-capture.
+        {
+            let mut fut = tokio_test::task::spawn(http_stream.read_body_bytes());
+            assert!(fut.poll().is_pending());
+        }
+        // The chunk is gone from both the app's view and the buffer: the
+        // session must fail closed on any further read or replay instead of
+        // replaying a truncated body.
+        assert!(http_stream.read_body_bytes().await.is_err());
+        assert!(http_stream.begin_request_body_replay().await.is_err());
     }
 }

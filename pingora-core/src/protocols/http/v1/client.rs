@@ -650,6 +650,33 @@ impl HttpSession {
     /// If the connection cannot be reused, the underlying stream will be closed and `None` will be
     /// returned.
     pub async fn reuse(mut self) -> Option<Stream> {
+        // A request body that was never completed leaves the connection
+        // DESYNCHRONISED: a `Content-Length` framed body short of its declared
+        // length, or a chunked body without its `0\r\n\r\n` terminator, means
+        // the server is still reading this request's body. Pooling the
+        // connection then makes the next request on it read as a continuation of
+        // this one's body -- a request-smuggling/desync primitive.
+        //
+        // This must be checked HERE rather than left to the proxy's reuse
+        // verdict: this is the single choke point through which an upstream H1
+        // session can enter the pool (`connectors::http::v1::release_http_session`),
+        // it already owns the other pooling precondition (`keepalive_timeout`),
+        // and it is the only place with the writer state. The proxy's verdict
+        // cannot carry it: `proxy_h1`'s duplex loop deliberately reports a
+        // successful upstream exchange even when the DOWNSTREAM read errored
+        // mid-body while a cache miss was still filling (the `wait_for_cache_fill`
+        // branch swallows the error into `to_errored()`), which is exactly the
+        // path on which an unterminated upstream request body reaches this
+        // function.
+        //
+        // Close-delimited bodies (an accepted upgrade / CONNECT tunnel) report
+        // unfinished too, which is correct: such a connection is a byte stream
+        // and must never go back into a request pool.
+        if !self.body_writer.finished() {
+            debug!("HTTP shutdown connection with an unfinished request body");
+            self.shutdown().await;
+            return None;
+        }
         // TODO: this function is unnecessarily slow for keepalive case
         // because that case does not need async
         match self.keepalive_timeout {
@@ -952,6 +979,83 @@ mod tests_stream {
 
     fn init_log() {
         let _ = env_logger::builder().is_test(true).try_init();
+    }
+
+    /// A CHUNKED upstream request whose terminating `0\r\n\r\n` was never
+    /// written leaves the server still reading this request's body. Pooling the
+    /// connection would make the NEXT request on it read as a continuation of
+    /// this one -- the request-smuggling/desync primitive.
+    ///
+    /// Reachable in `pingora-proxy` even though the exchange "succeeded": the
+    /// duplex loops swallow a mid-body downstream read error into `to_errored()`
+    /// while a cache miss is still filling and then still report the upstream
+    /// half complete, so nothing above this function refuses the pooling.
+    #[tokio::test]
+    async fn unfinished_chunked_request_body_is_not_reusable() {
+        init_log();
+        let wire = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let chunk = b"5\r\nhello\r\n";
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let mock_io = Builder::new()
+            .write(&wire[..])
+            .write(&chunk[..])
+            .read(&response[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let mut req = RequestHeader::build("POST", b"/", None).unwrap();
+        req.insert_header("Transfer-Encoding", "chunked").unwrap();
+        http_stream
+            .write_request_header(Box::new(req))
+            .await
+            .unwrap();
+        http_stream.write_body(&b"hello"[..]).await.unwrap();
+        // Deliberately NOT `finish_body()`: the chunked terminator never goes
+        // on the wire.
+        assert!(!http_stream.body_writer.finished());
+
+        http_stream.read_response().await.unwrap();
+        http_stream.respect_keepalive();
+        assert!(
+            http_stream.will_keepalive(),
+            "precondition: the RESPONSE side says the connection is keepalive-able, \
+             so only the request-body check can refuse it"
+        );
+
+        assert!(
+            http_stream.reuse().await.is_none(),
+            "a connection whose request body was never terminated must not be pooled"
+        );
+    }
+
+    /// The control: the very same exchange with the body properly finished IS
+    /// reusable, so the check above cannot pass by simply refusing everything.
+    #[tokio::test]
+    async fn finished_chunked_request_body_is_reusable() {
+        init_log();
+        let wire = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let chunk = b"5\r\nhello\r\n";
+        let terminator = b"0\r\n\r\n";
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let mock_io = Builder::new()
+            .write(&wire[..])
+            .write(&chunk[..])
+            .write(&terminator[..])
+            .read(&response[..])
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        let mut req = RequestHeader::build("POST", b"/", None).unwrap();
+        req.insert_header("Transfer-Encoding", "chunked").unwrap();
+        http_stream
+            .write_request_header(Box::new(req))
+            .await
+            .unwrap();
+        http_stream.write_body(&b"hello"[..]).await.unwrap();
+        http_stream.finish_body().await.unwrap();
+        assert!(http_stream.body_writer.finished());
+
+        http_stream.read_response().await.unwrap();
+        http_stream.respect_keepalive();
+        assert!(http_stream.reuse().await.is_some());
     }
 
     #[tokio::test]
