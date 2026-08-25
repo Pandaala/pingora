@@ -42,6 +42,14 @@ pub trait Connector: Send + Sync + Unpin + 'static {
         peer: &P,
     ) -> Option<Self::Session>;
 
+    /// Return a session to the connector for reuse.
+    ///
+    /// The proxy calls this method only when it determines that the session is
+    /// reusable. A session that cannot be reused is dropped without reaching
+    /// this method. Cleanup that must also run on non-reuse paths, such as
+    /// releasing permits, decrementing in-flight counters, or unregistering
+    /// the session, therefore needs a [`Drop`]-based fallback in
+    /// [`Self::Session`].
     async fn release_http_session<P: Peer + Send + Sync + 'static>(
         &self,
         mut session: Self::Session,
