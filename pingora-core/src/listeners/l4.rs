@@ -83,7 +83,7 @@ impl AsRef<str> for ServerAddress {
 }
 
 impl ServerAddress {
-    fn tcp_sock_opts(&self) -> Option<&TcpSocketOptions> {
+    pub(crate) fn tcp_sock_opts(&self) -> Option<&TcpSocketOptions> {
         match &self {
             Self::Tcp(_, op) => op.into(),
             _ => None,
@@ -119,6 +119,46 @@ pub struct TcpSocketOptions {
     /// Set the receive buffer size for accepted connections. See
     /// [SO_RCVBUF](https://man7.org/linux/man-pages/man7/socket.7.html).
     pub tcp_recv_buf: Option<usize>,
+    /// Expect every accepted connection to start with a PROXY protocol header
+    /// (v1 and v2 are auto-detected), as sent by L4 load balancers such as
+    /// AWS NLB. The addresses carried by the header replace the socket peer
+    /// and local addresses seen by the rest of the stack. Connections that do
+    /// not start with a valid header are rejected during the downstream
+    /// handshake.
+    ///
+    /// The header is unauthenticated, so anything that can reach this listener
+    /// directly can claim any source address. Only enable it on listeners that
+    /// are reachable exclusively through the trusted load balancer. See
+    /// [`crate::protocols::l4::proxy_protocol`] for the full trust model.
+    pub proxy_protocol: bool,
+    /// Restrict [`Self::proxy_protocol`] to connections from these peers.
+    ///
+    /// `None` (the default) keeps mandatory mode: every connection must carry a
+    /// header. `Some(_)` switches to source-conditional mode, where untrusted
+    /// peers are served as ordinary direct connections and their bytes are never
+    /// parsed — this is how one listener serves both load-balanced and direct
+    /// traffic without letting a direct client forge a source address.
+    ///
+    /// Note that in this mode a trusted peer which sends nothing is held until
+    /// the downstream handshake timeout while the probe waits for 12 bytes, so
+    /// it does not suit listeners fronting server-speaks-first protocols.
+    ///
+    /// Operational cautions for source-conditional mode:
+    /// - A trusted peer is honored only if it *actually sends* a header. If the
+    ///   load balancer is trusted but proxy-protocol injection is disabled on it,
+    ///   it relays the end client's first bytes verbatim, so an end client can
+    ///   forge a header that appears to come from the trusted address. Only trust
+    ///   peers guaranteed to inject their own header (or to be the true origin of
+    ///   the connection's first bytes).
+    /// - On a dual-stack (`[::]`) listener an IPv4 load balancer appears as an
+    ///   IPv4-mapped IPv6 address (`::ffff:a.b.c.d`); a trust impl that only
+    ///   matches `IpAddr::V4` will classify the real LB as untrusted. Normalize
+    ///   mapped addresses in the trust check.
+    /// - Prefer listing the exact load-balancer addresses over a broad CIDR: any
+    ///   host inside the trusted range can pin a connection to the handshake
+    ///   timeout with a partial header.
+    pub proxy_protocol_trusted_sources:
+        Option<std::sync::Arc<dyn crate::protocols::l4::proxy_protocol::ProxyProtocolTrust>>,
     // TODO: allow configuring reuseaddr, backlog, etc. from here?
 }
 
