@@ -561,7 +561,6 @@ mod test {
     #[cfg(feature = "any_tls")]
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
-    use tokio::time::sleep;
 
     #[tokio::test]
     async fn test_listen_tcp() {
@@ -779,7 +778,7 @@ mod test {
     async fn test_listen_tcp_proxy_protocol_v2() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let addr = "127.0.0.1:7107";
+        let addr = "127.0.0.1:0";
         let mut listeners = Listeners::new();
         let sock_opt = TcpSocketOptions {
             proxy_protocol: true,
@@ -795,6 +794,7 @@ mod test {
             .unwrap()
             .pop()
             .unwrap();
+        let addr = listener.l4.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.unwrap();
@@ -810,9 +810,6 @@ mod test {
             stream.read_exact(&mut buf).await.unwrap();
             assert_eq!(&buf, b"hello");
         });
-        // make sure the listener starts before the lines below
-        sleep(Duration::from_millis(10)).await;
-
         let mut client = TcpStream::connect(addr).await.unwrap();
         let mut header: Vec<u8> = vec![
             0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // sig
@@ -830,7 +827,7 @@ mod test {
     async fn test_listen_tcp_proxy_protocol_v1() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let addr = "127.0.0.1:7108";
+        let addr = "127.0.0.1:0";
         let mut listeners = Listeners::new();
         let sock_opt = TcpSocketOptions {
             proxy_protocol: true,
@@ -846,6 +843,7 @@ mod test {
             .unwrap()
             .pop()
             .unwrap();
+        let addr = listener.l4.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.unwrap();
@@ -856,8 +854,6 @@ mod test {
             stream.read_exact(&mut buf).await.unwrap();
             assert_eq!(&buf, b"hello");
         });
-        sleep(Duration::from_millis(10)).await;
-
         let mut client = TcpStream::connect(addr).await.unwrap();
         client
             .write_all(b"PROXY TCP4 192.168.0.1 10.0.0.2 56324 443\r\nhello")
@@ -870,7 +866,7 @@ mod test {
     async fn test_listen_tcp_proxy_protocol_missing_header() {
         use tokio::io::AsyncWriteExt;
 
-        let addr = "127.0.0.1:7109";
+        let addr = "127.0.0.1:0";
         let mut listeners = Listeners::new();
         let sock_opt = TcpSocketOptions {
             proxy_protocol: true,
@@ -886,14 +882,13 @@ mod test {
             .unwrap()
             .pop()
             .unwrap();
+        let addr = listener.l4.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.unwrap();
             // a connection without the header must fail the handshake
             assert!(stream.handshake().await.is_err());
         });
-        sleep(Duration::from_millis(10)).await;
-
         let mut client = TcpStream::connect(addr).await.unwrap();
         client.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
         server.await.unwrap();
@@ -903,7 +898,7 @@ mod test {
     async fn test_listen_tcp_proxy_protocol_local() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let addr = "127.0.0.1:7110";
+        let addr = "127.0.0.1:0";
         let mut listeners = Listeners::new();
         let sock_opt = TcpSocketOptions {
             proxy_protocol: true,
@@ -919,6 +914,7 @@ mod test {
             .unwrap()
             .pop()
             .unwrap();
+        let addr = listener.l4.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.unwrap();
@@ -931,8 +927,6 @@ mod test {
             stream.read_exact(&mut buf).await.unwrap();
             assert_eq!(&buf, b"ping");
         });
-        sleep(Duration::from_millis(10)).await;
-
         let mut client = TcpStream::connect(addr).await.unwrap();
         // v2 LOCAL, UNSPEC family, no payload: what an NLB health check sends
         client
@@ -956,7 +950,7 @@ mod test {
         use pingora_error::ErrorType;
         use tokio::io::AsyncWriteExt;
 
-        let addr = "127.0.0.1:7111";
+        let addr = "127.0.0.1:0";
         let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
         let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
         let mut listeners = Listeners::new();
@@ -978,6 +972,7 @@ mod test {
             .unwrap()
             .pop()
             .unwrap();
+        let addr = listener.l4.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
             // a valid header followed by a bogus ClientHello gets past the
@@ -991,8 +986,6 @@ mod test {
             let err = stream.handshake().await.unwrap_err();
             assert_eq!(err.etype(), &ErrorType::HandshakeError);
         });
-        sleep(Duration::from_millis(10)).await;
-
         let mut header: Vec<u8> = vec![
             0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, 0x21, 0x11,
             0x00, 0x0C,
@@ -1052,7 +1045,7 @@ mod test {
     async fn test_untrusted_peer_forged_header_is_not_honoured() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let addr = "127.0.0.1:7112";
+        let addr = "127.0.0.1:0";
         let mut listeners = Listeners::new();
         listeners.add_tcp_with_settings(addr, conditional_opts(Arc::new(TrustNobody)));
         let listener = listeners
@@ -1064,6 +1057,7 @@ mod test {
             .unwrap()
             .pop()
             .unwrap();
+        let addr = listener.l4.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.unwrap();
@@ -1088,8 +1082,6 @@ mod test {
                 &[0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A]
             );
         });
-        sleep(Duration::from_millis(10)).await;
-
         let mut client = TcpStream::connect(addr).await.unwrap();
         client.write_all(&v2_inet_header()).await.unwrap();
         server.await.unwrap();
@@ -1104,7 +1096,7 @@ mod test {
     async fn test_untrusted_peer_is_not_probed_before_the_trust_check() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let addr = "127.0.0.1:7115";
+        let addr = "127.0.0.1:0";
         let mut listeners = Listeners::new();
         listeners.add_tcp_with_settings(addr, conditional_opts(Arc::new(TrustNobody)));
         let listener = listeners
@@ -1116,6 +1108,7 @@ mod test {
             .unwrap()
             .pop()
             .unwrap();
+        let addr = listener.l4.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.unwrap();
@@ -1124,8 +1117,6 @@ mod test {
             stream.read_exact(&mut buf).await.unwrap();
             assert_eq!(&buf, b"hey");
         });
-        sleep(Duration::from_millis(10)).await;
-
         // Three bytes, connection held open. A trust check that runs first never
         // reads; a peek that runs first waits forever for 12.
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -1148,7 +1139,7 @@ mod test {
     async fn test_trusted_peer_without_header_is_served_directly() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let addr = "127.0.0.1:7113";
+        let addr = "127.0.0.1:0";
         let mut listeners = Listeners::new();
         listeners.add_tcp_with_settings(addr, conditional_opts(Arc::new(TrustLoopback)));
         let listener = listeners
@@ -1160,6 +1151,7 @@ mod test {
             .unwrap()
             .pop()
             .unwrap();
+        let addr = listener.l4.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.unwrap();
@@ -1179,8 +1171,6 @@ mod test {
             stream.read_exact(&mut buf).await.unwrap();
             assert_eq!(&buf, b"GET / HTTP/1.1\r\n\r\n");
         });
-        sleep(Duration::from_millis(10)).await;
-
         let mut client = TcpStream::connect(addr).await.unwrap();
         client.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
         server.await.unwrap();
@@ -1191,7 +1181,7 @@ mod test {
     async fn test_trusted_peer_with_header_is_honoured() {
         use tokio::io::AsyncWriteExt;
 
-        let addr = "127.0.0.1:7114";
+        let addr = "127.0.0.1:0";
         let mut listeners = Listeners::new();
         listeners.add_tcp_with_settings(addr, conditional_opts(Arc::new(TrustLoopback)));
         let listener = listeners
@@ -1203,6 +1193,7 @@ mod test {
             .unwrap()
             .pop()
             .unwrap();
+        let addr = listener.l4.local_addr().unwrap();
 
         let server = tokio::spawn(async move {
             let stream = listener.accept().await.unwrap();
@@ -1210,8 +1201,6 @@ mod test {
             let digest = stream.get_socket_digest().unwrap();
             assert_eq!(digest.peer_addr().unwrap().to_string(), "192.168.0.1:56324");
         });
-        sleep(Duration::from_millis(10)).await;
-
         let mut client = TcpStream::connect(addr).await.unwrap();
         client.write_all(&v2_inet_header()).await.unwrap();
         server.await.unwrap();
