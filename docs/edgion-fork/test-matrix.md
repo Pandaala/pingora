@@ -7,10 +7,14 @@ Run from the repository root:
 ```text
 cargo fmt --all -- --check
 cargo check -p pingora-core -p pingora-proxy
+cargo check -p pingora-core --features "connection_filter boringssl"
 cargo test -p pingora-core --lib
+cargo test -p pingora-core --lib --features connection_filter
 cargo test -p pingora-proxy --lib
 cargo test -p pingora-proxy --test test_request_body_seam
 cargo test -p pingora-proxy --test test_upstream_response_body_sink
+cargo test -p pingora-proxy --test test_terminal_body_dispatch
+cargo test -p pingora-proxy --test test_h2_upstream_no_error_reset
 ```
 
 Expected feature coverage:
@@ -21,36 +25,26 @@ Expected feature coverage:
 | `pingora-proxy --lib` | disposition truth tables, terminal latch, sink budget, EOS migration, retry guards |
 | `test_request_body_seam` | 54 H1/H2 request-pump, framing, retry and termination scenarios |
 | `test_upstream_response_body_sink` | 43 response streaming/cache/custom scenarios |
-
-## External-origin checks
-
-The following targets start the repository's openresty mock origin and require
-the `openresty` executable expected by `tests/utils/mock_origin.rs`:
-
-```text
-cargo test -p pingora-proxy --test test_terminal_body_dispatch
-cargo test -p pingora-proxy --test test_h2_upstream_no_error_reset
-```
-
-If openresty is absent, the first initialization panics with `No such file or
-directory`; the shared `once_cell::Lazy` is then poisoned, so later failures in
-the same binary are consequential environment failures rather than independent
-product failures.
+| `test_terminal_body_dispatch` | 9 self-contained terminal/trailer scenarios |
+| `test_h2_upstream_no_error_reset` | 8 self-contained H2 reset/completion scenarios |
 
 ## Validation snapshot
 
-Validated on 2026-08-25 against `main` at `e6e677f`:
+Validated on 2026-08-26 against `main` at `09696b5`:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo check -p pingora-core -p pingora-proxy`: passed.
-- `cargo test -p pingora-core --lib`: 610 passed, 2 ignored.
-- `cargo test -p pingora-proxy --lib`: 78 passed.
+- `cargo check -p pingora-core --features "connection_filter boringssl"`:
+  passed.
+- `cargo test -p pingora-core --lib`: 686 passed, 2 ignored.
+- `cargo test -p pingora-core --lib --features connection_filter`: 691 passed,
+  2 ignored.
+- `cargo test -p pingora-proxy --lib`: 107 passed.
 - `test_request_body_seam`: 54 passed.
 - `test_upstream_response_body_sink`: 43 passed.
-- Every source commit was checked independently in a detached worktree; the
-  standalone integration-test commit was also built with `--tests --no-run`.
-- The two external-origin targets compile. Their full runtime matrix is blocked
-  on this host because `openresty` is not installed.
+- `test_terminal_body_dispatch`: 9 passed.
+- `test_h2_upstream_no_error_reset`: 8 passed.
+- The standalone integration targets compile together with `--tests --no-run`.
 
 `cargo check -p pingora-core -p pingora-proxy --all-features` currently fails
 before compiling repository code because Cargo resolves `metrique 0.1.31`
@@ -64,6 +58,7 @@ rather than a regression in this feature stack.
 - No Cargo.toml, crate version or dependency change belongs to this feature
   stack unless a future feature explicitly needs one.
 - New integration tests remain standalone test targets.
-- The original `edgion` ref still resolves to the recorded SHA.
+- The original `edgion` and `edgion_v2` refs still resolve to their recorded
+  SHAs.
 - A rebase/merge-tree preview against the target main is reviewed before the
   branch is moved.

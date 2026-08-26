@@ -4,8 +4,9 @@
 
 Applications can register a `RequestBodyBuffer` before consuming the request
 body. The downstream session tees body bytes into that buffer, finalizes it at
-the real transport end, and can rewind it before an upstream retry. Replay is
-bounded and works for both H1 and H2 downstream sessions.
+the real transport end, and can rewind it before an upstream retry. Individual
+replay chunks are bounded and work for both H1 and H2 downstream sessions.
+Total capture size is a separate application policy.
 
 ## Public seam
 
@@ -29,6 +30,10 @@ already active.
   `consume` commits progress.
 - Replay chunks are bounded. An implementation returning a larger chunk fails
   closed.
+- `InMemoryRequestBodyBuffer` has no aggregate capture limit. It is a reference
+  implementation, not a safe production default for client-controlled bodies.
+  Production users need a per-request limit plus an aggregate admission budget
+  (and commonly bounded memory with file spill) across concurrent captures.
 - Draining an unread or partially read downstream body discards the registered
   buffer and prevents a later bodyless replay.
 - The buffer is released only after replay reaches EOF and a final response
@@ -36,6 +41,15 @@ already active.
 - `request_headers_end_stream` remains a transport fact. Registering a buffer
   may change the effective upstream body, but never rewrites what the client
   placed on the wire.
+- Buffer operations execute in the request pump. Implementations must bound
+  their own I/O latency; the API does not apply an independent timeout around
+  `write`, `finish`, `rewind`, `next_chunk`, or `consume`. The upstream peer
+  must also have a write timeout while replay is enabled, because downstream
+  disconnect is not observed while the pump is serving captured chunks.
+- Before early H1 capture, an application receiving `Expect: 100-continue`
+  must explicitly send 100 or reject with a final response. If it sends 100,
+  it must remove or otherwise handle the forwarded `Expect` header to avoid a
+  second informational response. Registering a buffer does not do this work.
 
 ## Implementation concentration
 

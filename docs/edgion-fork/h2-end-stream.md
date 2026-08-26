@@ -24,9 +24,12 @@ The client session combines four independent proofs:
 4. wire evidence whose DATA byte count matches bytes actually delivered.
 
 A reset before END_STREAM, an underflow, rejected trailers, flow-control loss,
-GOAWAY exclusion or a local reset invalidates the corresponding proof. The
-wire flag alone never decides response success; it is consulted only in the
-strict reset/error path.
+GOAWAY exclusion or a local reset invalidates the corresponding proof. A
+terminal HEADERS frame after DATA is only evidence that trailers must now be
+validated; it is not published as clean EOF by the wire watcher. Invalid
+trailers latch a body error, so a later reset cannot launder them into success.
+The wire flag alone never decides response success; it is consulted only in
+the strict reset/error path.
 
 ## Version-tolerant tests
 
@@ -34,6 +37,9 @@ Current `h2` releases may preserve END_STREAM after a later reset, while older
 ones exposed the overwritten state that motivated the watch. Behavioral tests
 therefore assert clean EOF or truncation, not a particular private receive
 state. The frame-scanner unit tests independently prove record/reset ordering.
+The workspace currently requires `h2 >= 0.4.16`; dependency upgrades must run
+these contract tests because the implementation observes wire frames around a
+library whose private reset behavior may change.
 
 ## Implementation concentration
 

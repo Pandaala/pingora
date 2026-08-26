@@ -7,10 +7,13 @@ current body slot, the terminal flag, a `ResponseBodySink`, and request context.
 It may mutate or suppress the current chunk, emit extra chunks, request a
 delay, or terminate the response.
 
-`ResponseBodySink` has a per-batch byte budget. Empty output is free; emitted
-bytes consume the budget and an overflow fails the response. `reset_batch`
-restores the budget but intentionally leaves termination sticky until the
-terminal boundary consumes it.
+`ResponseBodySink` has a per-pump-batch byte budget for additional chunks.
+Empty output is free; emitted bytes consume the budget and an overflow fails
+the response. Replacing the current chunk with a larger chunk is outside this
+budget and must be bounded by the filter. With the current synchronous drain
+topology, a batch contains at most the initial task plus the bounded channel's
+already queued tasks. `reset_batch` restores the budget but intentionally
+leaves termination sticky until the terminal boundary consumes it.
 
 ## Ordering and terminal dispatch
 
@@ -21,6 +24,9 @@ terminal boundary consumes it.
 - Failed responses claim without dispatching; truncation is never presented as
   a clean terminal body.
 - Upgrade responses retain `UpgradedBody` tagging for synthetic output.
+- Filters that change body length must report `changes_body_length()`. This is
+  required to prevent stale H1 Content-Length framing from clipping extra
+  output and to keep H2 framing valid.
 
 ## Cache interaction
 
@@ -49,7 +55,7 @@ length.
 
 - `test_upstream_response_body_sink.rs`: live/cache ordering, framing, range,
   termination and custom connector behavior.
-- `test_terminal_body_dispatch.rs`: end shapes and trailer handling; this target
-  requires the repository's openresty mock origin.
+- `test_terminal_body_dispatch.rs`: self-contained end-shape and trailer
+  handling against per-test origins.
 - Library tests pin the sink budget, EOS migration and terminal latch without
   external processes.

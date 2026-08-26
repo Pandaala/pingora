@@ -37,3 +37,12 @@ The expected shared-main conflict surface is intentionally concentrated:
   current helper is preferable to copying an old function.
 - Keep feature commits reviewable and single-purpose; follow-up fixes belong to
   the feature they correct rather than a generic final `fix` commit.
+
+## Consumer cutover
+
+The repository API is only half of a safe rollout. Before switching a consumer
+lock or deployment to a new Edgion commit, validate its listener configuration
+against the new binary, reject invalid trust-source input, and run the H1/H2
+request and response matrices used by that consumer. Update the consumer lock
+only after those checks pass; do not infer deployment from this branch's
+existence.

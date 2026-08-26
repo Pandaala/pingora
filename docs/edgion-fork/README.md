@@ -7,9 +7,10 @@ the implementation lives, and which tests pin each contract.
 ## Baseline
 
 - Source branch: `edgion` at `57f6183c38b5efbf9182f6a7a51bc7597cea265e`.
-- Edgion feature base: Pingora `0.8.1` at `719ef6cd54e40b530127751bab6c1afc5ae815a8`.
-- Rework base: `main` at `e6e677fe9b58555140ab7bd14feff035392b3530`.
-- The original `edgion` ref and worktree are not modified by this rework.
+- Original feature base: Pingora `0.8.1` at `719ef6cd54e40b530127751bab6c1afc5ae815a8`.
+- Migration base: `main` at `09696b51bc59315353d96686355861604d0bb48c`.
+- Migration branch: `edgion_v3`; the original `edgion` and `edgion_v2`
+  refs are not modified by this migration.
 
 The feature delta is the net change from `719ef6c` through `57f6183`. The
 earlier release, audit and CI commits on `edgion` are deliberately excluded;
@@ -42,7 +43,8 @@ current `main` remains authoritative for versions and upstream maintenance.
 6. H1 connection reuse is rejected whenever unread or rewritten request state
    makes the next request ambiguous. H2 termination is scoped to the stream.
 7. PROXY data is accepted only according to listener policy and is parsed
-   before TLS consumes the ClientHello.
+   before TLS consumes the ClientHello. Source trust is transport trust, not a
+   substitute for a correctly validated consumer configuration.
 
 ## Scope rule
 
