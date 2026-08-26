@@ -1197,6 +1197,24 @@ impl Server {
         let server_handle = thread::spawn(|| {
             test_main();
         });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let address = "127.0.0.1:6147";
+        loop {
+            if std::net::TcpStream::connect(address).is_ok() {
+                break;
+            }
+            assert!(
+                !server_handle.is_finished(),
+                "Pingora test server exited before binding {address}"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Pingora test server failed to bind {address} within 10s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
         Server {
             handle: server_handle,
         }
@@ -1294,6 +1312,15 @@ use super::mock_origin::MOCK_ORIGIN;
 pub fn init() {
     let _ = *TEST_SERVER;
     let _ = *MOCK_ORIGIN;
+    #[cfg(feature = "s2n")]
+    let _ = *TEST_PSK_TLS_SERVER;
+}
+
+/// Start the in-process Pingora test services without requiring the external
+/// OpenResty mock origin. Tests that provide every origin themselves should
+/// use this entry point so unrelated local tooling cannot block them.
+pub fn init_without_mock_origin() {
+    let _ = *TEST_SERVER;
     #[cfg(feature = "s2n")]
     let _ = *TEST_PSK_TLS_SERVER;
 }

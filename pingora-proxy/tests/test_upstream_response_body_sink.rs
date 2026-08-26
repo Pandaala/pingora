@@ -29,10 +29,9 @@ use futures::Stream as FuturesStream;
 use http::HeaderMap;
 use once_cell::sync::Lazy;
 use pingora_cache::{
-    key::CompactCacheKey,
     storage::{HitHandler, MissHandler, PurgeType, Storage},
     trace::{Span, SpanHandle},
-    CacheKey, CacheMeta, MemCache, RespCacheable,
+    CacheKey, CacheMeta, MemCache, PurgeOutcome, PurgeTarget, RespCacheable,
 };
 use pingora_core::server::Server;
 use pingora_core::services::ServiceWithDependents;
@@ -447,11 +446,11 @@ impl Storage for NonStreamingMemCache {
 
     async fn purge(
         &'static self,
-        key: &CompactCacheKey,
+        target: PurgeTarget<'_>,
         purge_type: PurgeType,
         trace: &SpanHandle,
-    ) -> Result<bool> {
-        self.inner.purge(key, purge_type, trace).await
+    ) -> Result<PurgeOutcome> {
+        self.inner.purge(target, purge_type, trace).await
     }
 
     async fn update_meta(
@@ -787,7 +786,6 @@ impl ProxyHttp for EmitProxy {
         // fixture with one path per case. See `ProxyHttp::cache_key_callback`
         // for what a real implementation needs to consider.
         Ok(CacheKey::new(
-            String::new(),
             session.req_header().uri.path().to_string(),
             String::new(),
         ))
@@ -1960,7 +1958,7 @@ async fn late_bodyless_cache_miss_finishes_admission_and_becomes_a_hit() {
 }
 
 async fn wait_for_complete_cache_entry(path: &str) {
-    let key = CacheKey::new(String::new(), path.to_string(), String::new());
+    let key = CacheKey::new(path.to_string(), String::new());
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let trace = Span::inactive().handle();

@@ -23,7 +23,7 @@ use http::{Response, StatusCode};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use utils::server_utils::init;
+use utils::server_utils::init_without_mock_origin;
 
 /// The upload has to be big enough that the proxy is provably still writing
 /// request body when the reset lands: the origin never reads the request body,
@@ -124,7 +124,7 @@ async fn spawn_h2_declared_empty_but_open_origin() -> u16 {
 
 #[tokio::test]
 async fn h2_header_end_stream_runs_terminal_body_hook() {
-    init();
+    init_without_mock_origin();
     let port = spawn_h2_header_only_origin().await;
     let response = reqwest::Client::new()
         .get("http://127.0.0.1:6147/bodyless")
@@ -140,7 +140,7 @@ async fn h2_header_end_stream_runs_terminal_body_hook() {
 
 #[tokio::test]
 async fn h2_content_length_zero_does_not_replace_the_real_end_stream_bit() {
-    init();
+    init_without_mock_origin();
     let port = spawn_h2_declared_empty_but_open_origin().await;
     let start = Instant::now();
     let response = reqwest::Client::new()
@@ -165,7 +165,7 @@ async fn h2_content_length_zero_does_not_replace_the_real_end_stream_bit() {
 /// nevertheless deliver the complete response the proxy already holds.
 #[tokio::test]
 async fn h2_upstream_complete_response_then_no_error_reset_delivers_the_response() {
-    init();
+    init_without_mock_origin();
     let port = spawn_reset_while_uploading_origin(true).await;
     let res = post_through_proxy(port)
         .await
@@ -249,7 +249,7 @@ async fn read_until(io: &mut TcpStream, marker: &str) -> String {
 /// under the client instead.
 #[tokio::test]
 async fn h2_upstream_no_error_reset_does_not_cost_the_downstream_connection() {
-    init();
+    init_without_mock_origin();
     let h2_port = spawn_ok_then_reset_origin(Duration::from_millis(100)).await;
     let h1_port = spawn_h1_origin().await;
 
@@ -301,7 +301,7 @@ async fn h2_upstream_no_error_reset_does_not_cost_the_downstream_connection() {
 /// this into a complete 200.
 #[tokio::test]
 async fn h2_upstream_truncated_response_then_no_error_reset_is_an_error() {
-    init();
+    init_without_mock_origin();
     let port = spawn_reset_while_uploading_origin(false).await;
     match post_through_proxy(port).await {
         // The proxy has already written 200 + partial body downstream when the
@@ -686,7 +686,7 @@ async fn spawn_fragmented_ok_then_reset_origin() -> u16 {
 /// accident; do not treat their passing as coverage for this line.
 #[tokio::test]
 async fn h2_upstream_no_error_reset_keeps_streaming_while_the_client_uploads() {
-    init();
+    init_without_mock_origin();
     let port = spawn_fragmented_ok_then_reset_origin().await;
     let res = post_through_proxy(port)
         .await

@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use utils::server_utils::{init, take_eos_dispatches};
+use utils::server_utils::{init_without_mock_origin, take_eos_dispatches};
 
 const CHUNKS: [&str; 3] = ["alpha", "beta", "gamma"];
 
@@ -194,7 +194,7 @@ async fn get_probed(port: u16, probe: &str) -> reqwest::Result<reqwest::Response
 /// client received an empty 200.
 #[tokio::test]
 async fn trailered_response_releases_the_withheld_body() {
-    init();
+    init_without_mock_origin();
     let port = spawn_origin(Termination::Trailers).await;
     let response = get(port, true).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -216,7 +216,7 @@ async fn trailered_response_releases_the_withheld_body() {
 /// marker, keeps the two observation channels checking each other.
 #[tokio::test]
 async fn trailered_response_dispatches_the_terminal_callback_exactly_once() {
-    init();
+    init_without_mock_origin();
     let port = spawn_origin(Termination::Trailers).await;
     let probe = format!("trailered-{}-{port}", std::process::id());
     let body = get_probed(port, &probe)
@@ -238,7 +238,7 @@ async fn trailered_response_dispatches_the_terminal_callback_exactly_once() {
 /// after the terminal marker would arrive truncated.
 #[tokio::test]
 async fn released_bytes_precede_the_trailer() {
-    init();
+    init_without_mock_origin();
     let port = spawn_origin(Termination::Trailers).await;
     let body = get(port, true).await.unwrap().text().await.unwrap();
     assert!(body.starts_with(&whole_body()), "body was {body:?}");
@@ -249,7 +249,7 @@ async fn released_bytes_precede_the_trailer() {
 /// before the fix: the terminal callback releases nothing and adds nothing.
 #[tokio::test]
 async fn trailered_response_is_unchanged_without_a_withholding_filter() {
-    init();
+    init_without_mock_origin();
     let port = spawn_origin(Termination::Trailers).await;
     let response = get(port, false).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -261,7 +261,7 @@ async fn trailered_response_is_unchanged_without_a_withholding_filter() {
 /// dispatch a second callback.
 #[tokio::test]
 async fn end_stream_on_last_data_still_dispatches_exactly_once() {
-    init();
+    init_without_mock_origin();
     let port = spawn_origin(Termination::EndStreamOnLastData).await;
     let body = get(port, true).await.unwrap().text().await.unwrap();
     assert_eq!(body, format!("{}|eos", whole_body()));
@@ -271,7 +271,7 @@ async fn end_stream_on_last_data_still_dispatches_exactly_once() {
 /// Same, for the empty-DATA-frame framing.
 #[tokio::test]
 async fn end_stream_on_empty_data_dispatches_exactly_once() {
-    init();
+    init_without_mock_origin();
     let port = spawn_origin(Termination::EndStreamOnEmptyData).await;
     let body = get(port, true).await.unwrap().text().await.unwrap();
     assert_eq!(body, format!("{}|eos", whole_body()));
@@ -283,7 +283,7 @@ async fn end_stream_on_empty_data_dispatches_exactly_once() {
 /// the latch, so the `Done` behind it must not dispatch again.
 #[tokio::test]
 async fn end_stream_on_headers_dispatches_exactly_once() {
-    init();
+    init_without_mock_origin();
     let port = spawn_origin(Termination::EndStreamOnHeaders).await;
     let body = get(port, true).await.unwrap().text().await.unwrap();
     assert_eq!(body, "|eos", "body was {body:?}");
@@ -307,7 +307,7 @@ async fn end_stream_on_headers_dispatches_exactly_once() {
 /// unit test in `proxy_common` covers that mutation.
 #[tokio::test]
 async fn aborted_response_never_dispatches_a_terminal_callback() {
-    init();
+    init_without_mock_origin();
     let (port, origin_reached) = spawn_aborting_origin().await;
     let probe = format!("aborted-{}-{port}", std::process::id());
 
@@ -367,7 +367,7 @@ async fn aborted_response_never_dispatches_a_terminal_callback() {
 /// `drain_emitted_chunks_before` unit tests instead.
 #[tokio::test]
 async fn cached_body_matches_the_wire_body_for_a_trailered_response() {
-    init();
+    init_without_mock_origin();
     let port = spawn_cacheable_trailered_origin().await;
     let url = format!(
         "http://127.0.0.1:6148/terminal-body-cache-{}",

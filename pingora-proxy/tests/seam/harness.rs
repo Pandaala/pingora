@@ -461,7 +461,6 @@ impl ProxyHttp for SeamProxy {
     fn cache_key_callback(&self, session: &Session, _ctx: &mut Self::CTX) -> Result<CacheKey> {
         let req = session.req_header();
         Ok(CacheKey::new(
-            "",
             format!("{}", req.uri),
             format!("{:?}", req.headers.get("x-cache-key")),
         ))
