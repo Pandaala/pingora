@@ -187,10 +187,22 @@ pub(crate) struct EndStreamWatch {
     /// Streams that are still in flight, i.e. neither ended nor torn down.
     /// Entries are removed as soon as their outcome is decided, which bounds
     /// this to the streams actually open on the connection.
-    pending: Mutex<HashMap<u32, Arc<StreamRecord>>>,
+    state: Mutex<WatchState>,
     /// Changes whenever application-side `forget` removes a live entry, so the
     /// scanner can lazily discard stale cache entries once per read batch.
     forget_generation: AtomicUsize,
+}
+
+#[derive(Debug)]
+enum WatchState {
+    Active(HashMap<u32, Arc<StreamRecord>>),
+    Poisoned,
+}
+
+impl Default for WatchState {
+    fn default() -> Self {
+        Self::Active(HashMap::new())
+    }
 }
 
 impl EndStreamWatch {
@@ -217,7 +229,7 @@ impl EndStreamWatch {
     /// lock, updates the map and releases it without calling back into `h2`.
     pub fn registration(&self) -> Registration<'_> {
         Registration {
-            pending: self.pending.lock(),
+            state: self.state.lock(),
         }
     }
 
@@ -234,7 +246,32 @@ impl EndStreamWatch {
     /// long-lived connection does not accumulate entries for streams whose
     /// outcome was never decided on the wire.
     pub fn forget(&self, stream_id: u32) {
-        if self.pending.lock().remove(&stream_id).is_some() {
+        let removed = match &mut *self.state.lock() {
+            WatchState::Active(pending) => pending.remove(&stream_id).is_some(),
+            WatchState::Poisoned => false,
+        };
+        if removed {
+            self.forget_generation.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// Permanently stop accepting or publishing evidence for this connection.
+    ///
+    /// The terminal state and stream map share the registration/publication
+    /// lock, so a concurrent operation is ordered entirely before or after
+    /// poisoning.
+    fn poison(&self) {
+        let newly_poisoned = {
+            let mut state = self.state.lock();
+            match &*state {
+                WatchState::Poisoned => false,
+                WatchState::Active(_) => {
+                    *state = WatchState::Poisoned;
+                    true
+                }
+            }
+        };
+        if newly_poisoned {
             self.forget_generation.fetch_add(1, Ordering::Release);
         }
     }
@@ -252,21 +289,32 @@ impl EndStreamWatch {
         if payload_bytes == 0 {
             return;
         }
-        if let Some(record) = self.pending.lock().get(&stream_id) {
-            record
-                .data_bytes
-                .fetch_add(payload_bytes, Ordering::Relaxed);
+        let state = self.state.lock();
+        if let WatchState::Active(pending) = &*state {
+            if let Some(record) = pending.get(&stream_id) {
+                record
+                    .data_bytes
+                    .fetch_add(payload_bytes, Ordering::Relaxed);
+            }
         }
     }
 
     /// Resolve a live stream for the scanner's bounded DATA fast path.
     fn data_record(&self, stream_id: u32) -> Option<Arc<StreamRecord>> {
-        self.pending.lock().get(&stream_id).cloned()
+        match &*self.state.lock() {
+            WatchState::Active(pending) => pending.get(&stream_id).cloned(),
+            WatchState::Poisoned => None,
+        }
     }
 
     fn cached_streams_live(&self, stream_ids: [Option<u32>; 2]) -> [bool; 2] {
-        let pending = self.pending.lock();
-        stream_ids.map(|stream_id| stream_id.is_some_and(|id| pending.contains_key(&id)))
+        let state = self.state.lock();
+        stream_ids.map(|stream_id| {
+            stream_id.is_some_and(|id| match &*state {
+                WatchState::Active(pending) => pending.contains_key(&id),
+                WatchState::Poisoned => false,
+            })
+        })
     }
 
     /// Finalize `stream_id`: count `payload_bytes` from the terminal frame and
@@ -288,7 +336,11 @@ impl EndStreamWatch {
     /// be handed to [`FrameScanner::drop_cache_after_publish`] before anything
     /// else touches the wire.
     fn publish(&self, stream_id: u32, payload_bytes: usize) -> TerminalFrameHandled {
-        if let Some(record) = self.pending.lock().remove(&stream_id) {
+        let record = match &mut *self.state.lock() {
+            WatchState::Active(pending) => pending.remove(&stream_id),
+            WatchState::Poisoned => None,
+        };
+        if let Some(record) = record {
             if payload_bytes != 0 {
                 record
                     .data_bytes
@@ -301,15 +353,20 @@ impl EndStreamWatch {
 
     /// The peer tore down `stream_id` without having flagged END_STREAM.
     fn note_stream_torn_down(&self, stream_id: u32) {
-        self.pending.lock().remove(&stream_id);
+        if let WatchState::Active(pending) = &mut *self.state.lock() {
+            pending.remove(&stream_id);
+        }
     }
 
     fn note_terminal_headers(&self, stream_id: u32) {
-        if let Some(record) = self.pending.lock().get(&stream_id) {
-            if record.data_bytes.load(Ordering::Relaxed) != 0 {
-                record
-                    .terminal_headers_after_data
-                    .store(true, Ordering::Release);
+        let state = self.state.lock();
+        if let WatchState::Active(pending) = &*state {
+            if let Some(record) = pending.get(&stream_id) {
+                if record.data_bytes.load(Ordering::Relaxed) != 0 {
+                    record
+                        .terminal_headers_after_data
+                        .store(true, Ordering::Release);
+                }
             }
         }
     }
@@ -330,7 +387,25 @@ impl EndStreamWatch {
     /// its first frame and send every in-flight stream back to the weaker
     /// end-of-body proofs.
     fn note_connection_torn_down(&self, last_stream_id: u32) {
-        self.pending.lock().retain(|id, _| *id <= last_stream_id);
+        if let WatchState::Active(pending) = &mut *self.state.lock() {
+            pending.retain(|id, _| *id <= last_stream_id);
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        match &*self.state.lock() {
+            WatchState::Active(pending) => pending.len(),
+            WatchState::Poisoned => 0,
+        }
+    }
+
+    #[cfg(test)]
+    fn has_pending(&self, stream_id: u32) -> bool {
+        match &*self.state.lock() {
+            WatchState::Active(pending) => pending.contains_key(&stream_id),
+            WatchState::Poisoned => false,
+        }
     }
 }
 
@@ -356,14 +431,16 @@ struct TerminalFrameHandled(u32);
 /// Exclusive access to the registration map, held across `h2`'s stream id
 /// allocation. See [`EndStreamWatch::registration`].
 pub(crate) struct Registration<'a> {
-    pending: MutexGuard<'a, HashMap<u32, Arc<StreamRecord>>>,
+    state: MutexGuard<'a, WatchState>,
 }
 
 impl Registration<'_> {
     /// Start watching `stream_id`, returning its (initially blank) record.
     pub fn register(mut self, stream_id: u32) -> Arc<StreamRecord> {
         let record = Arc::new(StreamRecord::default());
-        self.pending.insert(stream_id, record.clone());
+        if let WatchState::Active(pending) = &mut *self.state {
+            pending.insert(stream_id, record.clone());
+        }
         record
     }
 }
@@ -386,6 +463,10 @@ struct FrameScanner {
     /// Length field -- the first payload byte -- has been read. Only then is
     /// the frame's application payload size known.
     padded_data: Option<PaddedData>,
+    /// A DATA END_STREAM whose header has been parsed but whose payload has not
+    /// yet arrived in full. h2 cannot consume the frame before then, so neither
+    /// may the observer publish it.
+    terminal_data: Option<TerminalData>,
     /// The last two live streams resolved for non-terminal DATA frames. H2
     /// stream ids are never reused on a connection, so repeated frames for a
     /// cached id can update its record without consulting the shared map.
@@ -433,6 +514,12 @@ struct PaddedData {
     end_stream: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TerminalData {
+    stream_id: u32,
+    payload_bytes: usize,
+}
+
 /// The `last_stream_id` field of a GOAWAY frame, collected across however many
 /// reads its payload happens to be split over.
 #[derive(Debug, Default)]
@@ -458,6 +545,25 @@ impl LastStreamId {
 }
 
 impl FrameScanner {
+    fn has_partial_frame(&self) -> bool {
+        self.header_len != 0
+            || self.payload_left != 0
+            || self.goaway.is_some()
+            || self.padded_data.is_some()
+            || self.terminal_data.is_some()
+    }
+
+    fn poison(&mut self, watch: &EndStreamWatch) {
+        watch.poison();
+        self.header_len = 0;
+        self.payload_left = 0;
+        self.goaway = None;
+        self.padded_data = None;
+        self.terminal_data = None;
+        self.data_records = [None, None];
+        self.forget_generation = watch.forget_generation.load(Ordering::Acquire);
+    }
+
     fn discard_forgotten_data_records(&mut self, watch: &EndStreamWatch) {
         let generation = watch.forget_generation.load(Ordering::Acquire);
         if generation == self.forget_generation {
@@ -592,11 +698,21 @@ impl FrameScanner {
                     // is both safe and the conservative direction: undercounting
                     // makes the record fail the equality check, never pass it.
                     let data_len = padded.payload_len.saturating_sub(1 + pad_len);
-                    self.note_data_frame(padded.stream_id, data_len, padded.end_stream, watch);
+                    if padded.end_stream {
+                        self.terminal_data = Some(TerminalData {
+                            stream_id: padded.stream_id,
+                            payload_bytes: data_len,
+                        });
+                    } else {
+                        self.note_data(padded.stream_id, data_len, watch);
+                    }
                 }
                 self.payload_left -= skip;
                 bytes = &bytes[skip..];
                 if self.payload_left == 0 {
+                    if let Some(terminal) = self.terminal_data.take() {
+                        self.publish_end_stream(terminal.stream_id, terminal.payload_bytes, watch);
+                    }
                     self.finish_goaway(watch);
                 }
                 continue;
@@ -652,7 +768,14 @@ impl FrameScanner {
                         // -- deliberately NOT falling through to
                         // `publish_end_stream`.
                     } else {
-                        self.note_data_frame(stream_id, self.payload_left, end_stream, watch);
+                        if end_stream && self.payload_left != 0 {
+                            self.terminal_data = Some(TerminalData {
+                                stream_id,
+                                payload_bytes: self.payload_left,
+                            });
+                        } else {
+                            self.note_data_frame(stream_id, self.payload_left, end_stream, watch);
+                        }
                     }
                 }
                 // Do not publish END_STREAM from HEADERS here. At this wire
@@ -732,16 +855,21 @@ impl<S: AsyncRead + Unpin> AsyncRead for EndStreamWatchStream<S> {
         let already_filled = buf.filled().len();
         let me = self.get_mut();
         let res = Pin::new(&mut me.inner).poll_read(cx, buf);
-        // Scanned on `Ready(Err(..))` too: an `AsyncRead` may legitimately fill
-        // the buffer and then report the error that ended the stream, and those
-        // bytes are exactly the ones a teardown-shaped read carries. `h2` will
-        // process them, so the watch must too. (`Pending` never fills the
-        // buffer.)
-        if res.is_ready() {
-            let fresh = &buf.filled()[already_filled..];
-            if !fresh.is_empty() {
-                me.scanner.scan(fresh, &me.watch);
+        match &res {
+            Poll::Ready(Ok(())) => {
+                let fresh = &buf.filled()[already_filled..];
+                if fresh.is_empty() {
+                    if me.scanner.has_partial_frame() {
+                        me.scanner.poison(&me.watch);
+                    }
+                } else {
+                    me.scanner.scan(fresh, &me.watch);
+                }
             }
+            // h2's read buffer does not retain bytes returned together with an
+            // error, so observing them here would publish evidence h2 discards.
+            Poll::Ready(Err(_)) => me.scanner.poison(&me.watch),
+            Poll::Pending => {}
         }
         res
     }
@@ -799,6 +927,42 @@ mod tests {
         ];
         v.extend_from_slice(payload);
         v
+    }
+
+    /// One non-empty read followed by EOF, for pinning scanner state when the
+    /// transport closes in the middle of a frame.
+    struct ChunkThenEof(Option<Vec<u8>>);
+
+    impl AsyncRead for ChunkThenEof {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if let Some(bytes) = self.0.take() {
+                buf.put_slice(&bytes);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn read_chunk_then_eof(io: &mut EndStreamWatchStream<ChunkThenEof>) {
+        let mut storage = [0u8; 64];
+        let mut first = ReadBuf::new(&mut storage);
+        std::future::poll_fn(|cx| Pin::new(&mut *io).poll_read(cx, &mut first))
+            .await
+            .unwrap();
+        assert!(
+            !first.filled().is_empty(),
+            "the fixture must deliver a chunk"
+        );
+
+        let mut storage = [0u8; 1];
+        let mut eof = ReadBuf::new(&mut storage);
+        std::future::poll_fn(|cx| Pin::new(&mut *io).poll_read(cx, &mut eof))
+            .await
+            .unwrap();
+        assert!(eof.filled().is_empty(), "the second read must be EOF");
     }
 
     /// A padded DATA frame: `Pad Length` byte, then the payload, then `pad`
@@ -1017,6 +1181,12 @@ mod tests {
         v
     }
 
+    fn short_goaway_payload(len: usize, last_stream_id: u32) -> Vec<u8> {
+        let mut payload = goaway_payload(last_stream_id);
+        payload.truncate(len);
+        payload
+    }
+
     #[test]
     fn goaway_clears_pending_streams_only() {
         let watch = EndStreamWatch::default();
@@ -1059,7 +1229,7 @@ mod tests {
         scanner.scan(&wire, &watch);
         assert!(kept.end_stream_observed());
         assert!(!dropped.end_stream_observed());
-        assert!(watch.pending.lock().is_empty());
+        assert_eq!(watch.pending_len(), 0);
     }
 
     /// The identifier is read correctly however the payload is chopped up, and
@@ -1093,7 +1263,182 @@ mod tests {
         wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"hi"));
         scanner.scan(&wire, &watch);
         assert!(!flag.end_stream_observed());
-        assert!(watch.pending.lock().is_empty());
+        assert_eq!(watch.pending_len(), 0);
+    }
+
+    /// Current behavior for payloads too short to contain even the complete
+    /// `last_stream_id`: the scanner conservatively removes every stream.
+    #[test]
+    #[ignore = "characterizes unsafe pre-poison behavior; not a passing contract"]
+    fn goaway_declared_lengths_one_through_three_currently_clear_everything() {
+        for len in 1..=3 {
+            let watch = EndStreamWatch::default();
+            let record = watch.register(1);
+            let mut scanner = FrameScanner::default();
+            let mut wire = frame(FRAME_TYPE_GOAWAY, 0, 0, &short_goaway_payload(len, 1));
+            wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"late"));
+            scanner.scan(&wire, &watch);
+
+            assert!(!record.end_stream_observed(), "declared length={len}");
+            let later = watch.register(3);
+            scanner.scan(
+                &frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b"later"),
+                &watch,
+            );
+            assert!(
+                !later.end_stream_observed(),
+                "declared length={len} must poison later registrations"
+            );
+            assert_eq!(watch.pending_len(), 0, "declared length={len}");
+        }
+    }
+
+    /// Characterization of the unsafe pre-poison behavior. A GOAWAY must have
+    /// an eight-octet fixed payload, but the current scanner trusts a complete
+    /// four-octet `last_stream_id` even when the error code is truncated.
+    #[test]
+    #[ignore = "characterizes unsafe pre-poison behavior; not a passing contract"]
+    fn goaway_declared_lengths_four_through_seven_currently_trust_last_stream_id() {
+        for len in 4..=7 {
+            let watch = EndStreamWatch::default();
+            let kept = watch.register(1);
+            let excluded = watch.register(3);
+            let mut scanner = FrameScanner::default();
+            let mut wire = frame(FRAME_TYPE_GOAWAY, 0, 0, &short_goaway_payload(len, 1));
+            wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"kept"));
+            wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b"excluded"));
+            scanner.scan(&wire, &watch);
+
+            assert!(kept.vouches_for(4), "declared length={len}");
+            assert!(!excluded.end_stream_observed(), "declared length={len}");
+        }
+    }
+
+    /// Final contract: every short GOAWAY is a connection-level parse error.
+    /// Once poisoning exists, no later frame may publish a stream record.
+    #[test]
+    #[ignore = "requires the planned connection-poison state"]
+    fn final_contract_goaway_declared_lengths_one_through_seven_poison_the_scanner() {
+        for len in 1..=7 {
+            let watch = EndStreamWatch::default();
+            let record = watch.register(1);
+            let mut scanner = FrameScanner::default();
+            let mut wire = frame(FRAME_TYPE_GOAWAY, 0, 0, &short_goaway_payload(len, 1));
+            wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"late"));
+            scanner.scan(&wire, &watch);
+
+            assert!(!record.end_stream_observed(), "declared length={len}");
+            let later = watch.register(3);
+            scanner.scan(
+                &frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b"later"),
+                &watch,
+            );
+            assert!(
+                !later.end_stream_observed(),
+                "declared length={len} must poison later registrations"
+            );
+            assert_eq!(watch.pending_len(), 0, "declared length={len}");
+        }
+    }
+
+    /// Characterization: the current scanner ignores the GOAWAY frame's own
+    /// stream id and applies its otherwise valid payload.
+    #[test]
+    #[ignore = "characterizes unsafe pre-poison behavior; not a passing contract"]
+    fn goaway_on_a_nonzero_stream_currently_applies_its_last_stream_id() {
+        let watch = EndStreamWatch::default();
+        let record = watch.register(3);
+        let mut scanner = FrameScanner::default();
+        let mut wire = frame(FRAME_TYPE_GOAWAY, 0, 9, &goaway_payload(3));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b"body"));
+        scanner.scan(&wire, &watch);
+
+        assert!(record.vouches_for(4));
+    }
+
+    /// Final contract: GOAWAY is a connection frame and a nonzero stream id
+    /// poisons the scanner permanently.
+    #[test]
+    #[ignore = "requires the planned connection-poison state"]
+    fn final_contract_goaway_on_a_nonzero_stream_poisons_the_scanner() {
+        let watch = EndStreamWatch::default();
+        let record = watch.register(3);
+        let mut scanner = FrameScanner::default();
+        let mut wire = frame(FRAME_TYPE_GOAWAY, 0, 9, &goaway_payload(3));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b"late"));
+        scanner.scan(&wire, &watch);
+
+        assert!(!record.end_stream_observed());
+        let later = watch.register(5);
+        scanner.scan(
+            &frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 5, b"later"),
+            &watch,
+        );
+        assert!(!later.end_stream_observed());
+        assert_eq!(watch.pending_len(), 0);
+    }
+
+    /// A second, lower last-stream id is the normal graceful-drain sequence;
+    /// it narrows the surviving set and never retracts an already published
+    /// stream.
+    #[test]
+    fn decreasing_goaway_last_stream_id_narrows_the_surviving_set() {
+        let watch = EndStreamWatch::default();
+        let kept = watch.register(1);
+        let excluded = watch.register(3);
+        let mut scanner = FrameScanner::default();
+        let mut wire = frame(FRAME_TYPE_GOAWAY, 0, 0, &goaway_payload(3));
+        wire.extend_from_slice(&frame(FRAME_TYPE_GOAWAY, 0, 0, &goaway_payload(1)));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"a"));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b"b"));
+        scanner.scan(&wire, &watch);
+
+        assert!(kept.vouches_for(1));
+        assert!(!excluded.end_stream_observed());
+    }
+
+    /// Characterization: map removal makes an increasing second GOAWAY unable
+    /// to resurrect excluded streams, but the current scanner does not mark
+    /// the illegal sequence as a connection-level failure.
+    #[test]
+    #[ignore = "characterizes unsafe pre-poison behavior; not a passing contract"]
+    fn increasing_goaway_last_stream_id_currently_keeps_the_lower_survivor() {
+        let watch = EndStreamWatch::default();
+        let survivor = watch.register(1);
+        let already_excluded = watch.register(3);
+        let mut scanner = FrameScanner::default();
+        let mut wire = frame(FRAME_TYPE_GOAWAY, 0, 0, &goaway_payload(1));
+        wire.extend_from_slice(&frame(FRAME_TYPE_GOAWAY, 0, 0, &goaway_payload(3)));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"a"));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b"b"));
+        scanner.scan(&wire, &watch);
+
+        assert!(survivor.vouches_for(1));
+        assert!(!already_excluded.end_stream_observed());
+    }
+
+    /// Final contract: RFC 9113 forbids a later GOAWAY from increasing the
+    /// last-stream id, so the sequence poisons even streams below the old
+    /// threshold.
+    #[test]
+    #[ignore = "requires tracking the prior GOAWAY and poisoning increases"]
+    fn final_contract_increasing_goaway_last_stream_id_poisons_the_scanner() {
+        let watch = EndStreamWatch::default();
+        let survivor = watch.register(1);
+        let mut scanner = FrameScanner::default();
+        let mut wire = frame(FRAME_TYPE_GOAWAY, 0, 0, &goaway_payload(1));
+        wire.extend_from_slice(&frame(FRAME_TYPE_GOAWAY, 0, 0, &goaway_payload(3)));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"late"));
+        scanner.scan(&wire, &watch);
+
+        assert!(!survivor.end_stream_observed());
+        let later = watch.register(3);
+        scanner.scan(
+            &frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b"later"),
+            &watch,
+        );
+        assert!(!later.end_stream_observed());
+        assert_eq!(watch.pending_len(), 0);
     }
 
     /// An empty GOAWAY payload must be dispatched at the header, not left
@@ -1107,6 +1452,161 @@ mod tests {
         wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"hi"));
         scanner.scan(&wire, &watch);
         assert!(!flag.end_stream_observed());
+    }
+
+    /// Characterization: EOF is not currently reported to `FrameScanner`, so
+    /// a staged partial frame header leaves the registration live.
+    #[tokio::test]
+    #[ignore = "characterizes unsafe pre-poison behavior; not a passing contract"]
+    async fn eof_in_a_partial_frame_header_currently_leaves_the_stream_pending() {
+        let watch = EndStreamWatch::new();
+        let record = watch.registration().register(1);
+        let wire = frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"body");
+        let mut io =
+            EndStreamWatchStream::new(ChunkThenEof(Some(wire[..5].to_vec())), watch.clone());
+
+        read_chunk_then_eof(&mut io).await;
+
+        assert!(!record.end_stream_observed());
+        assert!(watch.has_pending(1));
+    }
+
+    /// Final contract: EOF with an incomplete frame header is a connection
+    /// parse failure and must retire every pending record.
+    #[tokio::test]
+    async fn final_contract_eof_in_a_partial_frame_header_poisons_the_scanner() {
+        let wire = frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"body");
+        for split in 1..FRAME_HEADER_LEN {
+            let watch = EndStreamWatch::new();
+            let record = watch.registration().register(1);
+            let mut io = EndStreamWatchStream::new(
+                ChunkThenEof(Some(wire[..split].to_vec())),
+                watch.clone(),
+            );
+
+            read_chunk_then_eof(&mut io).await;
+
+            assert!(!record.end_stream_observed(), "split={split}");
+            let later = watch.registration().register(3);
+            let mut scanner = FrameScanner::default();
+            scanner.scan(
+                &frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b"later"),
+                &watch,
+            );
+            assert!(!later.end_stream_observed(), "split={split}");
+            assert_eq!(watch.pending_len(), 0, "split={split}");
+        }
+    }
+
+    /// END_STREAM is not evidence until the complete DATA frame has reached
+    /// h2. This matters especially for padding-only terminal frames, whose
+    /// application byte count can still match the body delivered so far.
+    #[tokio::test]
+    async fn final_contract_eof_in_a_terminal_data_payload_never_publishes() {
+        let cases = [
+            ("plain", frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"body")),
+            ("padding-only-after-body", {
+                let mut wire = frame(FRAME_TYPE_DATA, 0, 1, b"body");
+                wire.extend_from_slice(&padded_data_frame(FLAG_END_STREAM, 1, b"", 3));
+                wire
+            }),
+        ];
+
+        for (name, wire) in cases {
+            let terminal_header = if name == "plain" {
+                0
+            } else {
+                frame(FRAME_TYPE_DATA, 0, 1, b"body").len()
+            };
+            let payload_len = wire.len() - terminal_header - FRAME_HEADER_LEN;
+            for payload_bytes in 0..payload_len {
+                let watch = EndStreamWatch::new();
+                let record = watch.registration().register(1);
+                let split = terminal_header + FRAME_HEADER_LEN + payload_bytes;
+                let mut io = EndStreamWatchStream::new(
+                    ChunkThenEof(Some(wire[..split].to_vec())),
+                    watch.clone(),
+                );
+
+                read_chunk_then_eof(&mut io).await;
+
+                assert!(
+                    !record.end_stream_observed(),
+                    "case={name}, payload_bytes={payload_bytes}"
+                );
+                let later = watch.registration().register(3);
+                let mut scanner = FrameScanner::default();
+                scanner.scan(
+                    &frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b"later"),
+                    &watch,
+                );
+                assert!(
+                    !later.end_stream_observed(),
+                    "case={name}, payload_bytes={payload_bytes}"
+                );
+            }
+        }
+    }
+
+    /// Characterization: after a complete GOAWAY header but only part of its
+    /// declared payload, EOF leaves the GOAWAY undispatched and registrations
+    /// untouched.
+    #[tokio::test]
+    #[ignore = "characterizes unsafe pre-poison behavior; not a passing contract"]
+    async fn eof_in_a_goaway_payload_currently_leaves_streams_pending() {
+        let watch = EndStreamWatch::new();
+        let first = watch.registration().register(1);
+        let second = watch.registration().register(3);
+        let wire = frame(FRAME_TYPE_GOAWAY, 0, 0, &goaway_payload(1));
+        let mut io = EndStreamWatchStream::new(
+            ChunkThenEof(Some(wire[..FRAME_HEADER_LEN + 6].to_vec())),
+            watch.clone(),
+        );
+
+        read_chunk_then_eof(&mut io).await;
+
+        assert!(!first.end_stream_observed());
+        assert!(!second.end_stream_observed());
+        assert_eq!(watch.pending_len(), 2);
+    }
+
+    /// Final contract: EOF before all bytes in a declared GOAWAY payload have
+    /// arrived poisons the whole connection, irrespective of the partial
+    /// `last_stream_id` already staged.
+    #[tokio::test]
+    async fn final_contract_eof_in_a_goaway_payload_poisons_the_scanner() {
+        let wire = frame(FRAME_TYPE_GOAWAY, 0, 0, &goaway_payload(1));
+        for payload_bytes in 0..goaway_payload(1).len() {
+            let watch = EndStreamWatch::new();
+            let first = watch.registration().register(1);
+            let second = watch.registration().register(3);
+            let mut io = EndStreamWatchStream::new(
+                ChunkThenEof(Some(wire[..FRAME_HEADER_LEN + payload_bytes].to_vec())),
+                watch.clone(),
+            );
+
+            read_chunk_then_eof(&mut io).await;
+
+            assert!(
+                !first.end_stream_observed(),
+                "payload_bytes={payload_bytes}"
+            );
+            assert!(
+                !second.end_stream_observed(),
+                "payload_bytes={payload_bytes}"
+            );
+            let later = watch.registration().register(5);
+            let mut scanner = FrameScanner::default();
+            scanner.scan(
+                &frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 5, b"later"),
+                &watch,
+            );
+            assert!(
+                !later.end_stream_observed(),
+                "payload_bytes={payload_bytes}"
+            );
+            assert!(watch.pending_len() == 0, "payload_bytes={payload_bytes}");
+        }
     }
 
     /// The registration lock is what closes the window in which `h2` has
@@ -1150,9 +1650,11 @@ mod tests {
         );
     }
 
-    /// Bytes an `AsyncRead` delivered together with the error that ended the
-    /// stream still reach `h2`, so they must still be scanned.
+    /// Characterization of unsafe current behavior: bytes paired with a read
+    /// error do not reach h2, so treating their END_STREAM as evidence breaks
+    /// observer/decoder equivalence.
     #[tokio::test]
+    #[ignore = "characterizes unsafe pre-poison behavior; not a passing contract"]
     async fn bytes_delivered_with_an_error_are_scanned() {
         struct DataThenError(Option<Vec<u8>>);
         impl AsyncRead for DataThenError {
@@ -1167,17 +1669,55 @@ mod tests {
             }
         }
 
+        let wire = frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"hello");
         let watch = EndStreamWatch::new();
         let flag = watch.registration().register(1);
-        let mut io = EndStreamWatchStream::new(
-            DataThenError(Some(frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"hello"))),
-            watch,
-        );
+        let mut io = EndStreamWatchStream::new(DataThenError(Some(wire.clone())), watch);
         let mut buf = [0u8; 64];
         let mut read_buf = ReadBuf::new(&mut buf);
         let res = std::future::poll_fn(|cx| Pin::new(&mut io).poll_read(cx, &mut read_buf)).await;
         assert!(res.is_err());
+        assert_eq!(read_buf.filled(), wire);
         assert!(flag.end_stream_observed());
+    }
+
+    /// Final contract: h2 discards bytes paired with `Ready(Err)`, so the
+    /// observer must poison without publishing them or admitting later facts.
+    #[tokio::test]
+    async fn final_contract_bytes_delivered_with_an_error_are_not_scanned() {
+        struct DataThenError(Option<Vec<u8>>);
+        impl AsyncRead for DataThenError {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                buf.put_slice(&self.0.take().expect("polled after error"));
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, "reset")))
+            }
+        }
+
+        let watch = EndStreamWatch::new();
+        let first = watch.registration().register(1);
+        let wire = frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"hello");
+        let mut io = EndStreamWatchStream::new(DataThenError(Some(wire)), watch.clone());
+        let mut storage = [0u8; 64];
+        let mut read_buf = ReadBuf::new(&mut storage);
+        assert!(
+            std::future::poll_fn(|cx| Pin::new(&mut io).poll_read(cx, &mut read_buf))
+                .await
+                .is_err()
+        );
+        assert!(!first.end_stream_observed());
+
+        let later = watch.registration().register(3);
+        let mut scanner = FrameScanner::default();
+        scanner.scan(
+            &frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b"later"),
+            &watch,
+        );
+        assert!(!later.end_stream_observed());
+        assert_eq!(watch.pending_len(), 0);
     }
 
     /// Only the registered stream's own END_STREAM counts.
@@ -1216,7 +1756,7 @@ mod tests {
             watch.register(id);
             scanner.scan(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, id, b"x"), &watch);
         }
-        assert!(watch.pending.lock().is_empty());
+        assert_eq!(watch.pending_len(), 0);
     }
 
     #[test]
@@ -1237,6 +1777,26 @@ mod tests {
 
         assert!(!record.end_stream_observed());
         assert!(!record.vouches_for(11));
+    }
+
+    /// Forgetting an abandoned stream must not poison a distinct later stream
+    /// on the same H2 connection. Stream ids are monotonically increasing and
+    /// are never reused.
+    #[test]
+    fn local_forget_retires_the_old_record_without_poisoning_a_new_registration() {
+        let watch = EndStreamWatch::default();
+        let old = watch.register(1);
+        let mut scanner = FrameScanner::default();
+        scanner.scan(&frame(FRAME_TYPE_DATA, 0, 1, b"old"), &watch);
+
+        watch.forget(1);
+        let replacement = watch.register(3);
+        scanner.scan(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b"new"), &watch);
+
+        assert!(!old.end_stream_observed());
+        assert!(!old.vouches_for(6));
+        assert!(replacement.vouches_for(3));
+        assert_eq!(watch.pending_len(), 0);
     }
 
     #[test]
@@ -1334,7 +1894,7 @@ mod tests {
             watch.forget(stream_id);
         }
 
-        assert!(watch.pending.lock().is_empty());
+        assert_eq!(watch.pending_len(), 0);
         assert!(
             records
                 .iter()

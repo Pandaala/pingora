@@ -23,19 +23,24 @@
 //! the addresses so the rest of the stack sees the real client address.
 //!
 //! Enable per listener via [`crate::listeners::TcpSocketOptions::proxy_protocol`].
-//! A listener with proxy protocol enabled requires every connection to start
-//! with a valid header (like HAProxy `accept-proxy`); connections without one
-//! are rejected during the downstream handshake.
+//! Without a trusted-source policy, every connection must start with a valid
+//! header (like HAProxy `accept-proxy`) or the downstream handshake is rejected.
+//! With [`crate::listeners::TcpSocketOptions::proxy_protocol_trusted_sources`],
+//! only trusted transport peers are inspected and the policy is opportunistic:
+//! a trusted peer without a recognizable PROXY header is served as a normal
+//! direct connection. Network controls must therefore ensure that trusted peers
+//! inject the header instead of forwarding attacker-controlled leading bytes.
 //!
 //! # Trust model
 //!
-//! **The PROXY protocol header is not authenticated.** Any peer that can open
-//! a connection to the listener can claim an arbitrary source address, which
-//! defeats every IP-based decision made downstream (ACLs, rate limits, logs).
-//! Only enable it on listeners that are reachable *exclusively* through the
-//! trusted load balancer, and enforce that with network controls (security
-//! groups, firewall rules, a private subnet). This is the same requirement
-//! HAProxy `accept-proxy` and nginx `proxy_protocol` carry.
+//! **The PROXY protocol header is not authenticated.** Any peer whose header is
+//! accepted can claim an arbitrary source address, which defeats every IP-based
+//! decision made downstream (ACLs, rate limits, logs). In mandatory mode this
+//! means the listener must be reachable *exclusively* through trusted load
+//! balancers, enforced with network controls (security groups, firewall rules,
+//! or a private subnet). In conditional mode, keep the trusted-source policy as
+//! narrow as possible and ensure each trusted peer injects the header rather
+//! than forwarding attacker-controlled leading bytes.
 //!
 //! Note that with the `connection_filter` feature, `should_accept()` runs at
 //! accept time, before this header is parsed, so it always observes the load

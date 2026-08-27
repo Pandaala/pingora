@@ -737,7 +737,14 @@ impl Http2Session {
                 self.response_body_eof = true;
                 Poll::Ready(None)
             }
-            Err(err) => Poll::Ready(Some(Err(err))),
+            Err(err) => {
+                // Keep the poll API's state machine aligned with
+                // `read_response_body`: once trailer validation fails, a later
+                // `read_trailers` call must not retry the consumed stream and
+                // turn the response-body failure into a successful EOF.
+                self.response_body_error = true;
+                Poll::Ready(Some(Err(err)))
+            }
         }
     }
 
@@ -1387,7 +1394,17 @@ mod tests_h2 {
     /// latched at a poll, and the declared `content-length`) rather than
     /// silently passing through source (iv).
     async fn client_session(client_io: tokio::io::DuplexStream) -> Http2Session {
-        let (send_req, connection) = h2::client::handshake(client_io).await.unwrap();
+        unwatched_client_session_with(client_io, |b| b).await
+    }
+
+    /// [`client_session`] with the `h2` client settings tuned. This is the
+    /// baseline counterpart of [`watched_client_session_with`].
+    async fn unwatched_client_session_with(
+        client_io: tokio::io::DuplexStream,
+        tune: impl FnOnce(&mut client::Builder) -> &mut client::Builder,
+    ) -> Http2Session {
+        let mut builder = client::Builder::new();
+        let (send_req, connection) = tune(&mut builder).handshake(client_io).await.unwrap();
         let (closed_tx, closed_rx) = tokio::sync::watch::channel(false);
         let ping_timeout = Arc::new(AtomicBool::new(false));
         tokio::spawn(async move {
@@ -1750,8 +1767,9 @@ mod tests_h2 {
     fn serve_raw_burst_then_no_error_reset(
         mut server_io: tokio::io::DuplexStream,
         response_frames: Vec<u8>,
-    ) {
+    ) -> tokio::sync::oneshot::Receiver<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (flushed_tx, flushed_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let mut buf = [0u8; 4096];
             // Empty SETTINGS, then the ACK of whatever the client sent.
@@ -1763,7 +1781,9 @@ mod tests_h2 {
                 .write_all(&raw_frame(0x4, 0x1, 0, b""))
                 .await
                 .unwrap();
-            // Wait for the request HEADERS before answering.
+            // Wait for a complete request HEADERS frame on stream 1 before
+            // answering. Do not search arbitrary byte windows: SETTINGS
+            // payloads may contain the HEADERS frame-type byte by chance.
             let mut seen = Vec::new();
             loop {
                 let Ok(n) = server_io.read(&mut buf).await else {
@@ -1773,7 +1793,7 @@ mod tests_h2 {
                     return;
                 }
                 seen.extend_from_slice(&buf[..n]);
-                if seen.len() > CLIENT_PREFACE_MIN && seen.windows(4).any(|w| w[3] == 0x1) {
+                if contains_request_headers_on_stream_one(&seen) {
                     break;
                 }
             }
@@ -1781,14 +1801,64 @@ mod tests_h2 {
             burst.extend_from_slice(&raw_frame(0x3, 0, 1, &[0, 0, 0, 0]));
             server_io.write_all(&burst).await.unwrap();
             server_io.flush().await.unwrap();
+            let _ = flushed_tx.send(());
             while server_io.read(&mut buf).await.unwrap_or(0) != 0 {}
         });
+        flushed_rx
     }
 
-    /// The client connection preface plus its SETTINGS frame; enough of a
-    /// threshold that the `0x1` byte scanned for above is a HEADERS frame type
-    /// and not part of the preface.
-    const CLIENT_PREFACE_MIN: usize = 33;
+    #[derive(Clone, Copy, Debug)]
+    enum EndStreamObservation {
+        Watched,
+        Unwatched,
+    }
+
+    /// Open a request against a hand-written response whose complete frame
+    /// sequence and following NO_ERROR reset are processed before the first
+    /// body poll. This is the ordering that used to let h2's reset state hide
+    /// the terminal-frame result.
+    async fn raw_reset_session(
+        response_frames: Vec<u8>,
+        observation: EndStreamObservation,
+    ) -> Http2Session {
+        let (client_io, server_io) = duplex(65536);
+        let flushed = serve_raw_burst_then_no_error_reset(server_io, response_frames);
+        let mut h2s = match observation {
+            EndStreamObservation::Watched => watched_client_session(client_io).await,
+            EndStreamObservation::Unwatched => client_session(client_io).await,
+        };
+        send_open_request(&mut h2s).await;
+        flushed
+            .await
+            .expect("the raw origin must flush the terminal response burst");
+        h2s
+    }
+
+    const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+    fn contains_request_headers_on_stream_one(bytes: &[u8]) -> bool {
+        if !bytes.starts_with(CLIENT_PREFACE) {
+            return false;
+        }
+        let mut offset = CLIENT_PREFACE.len();
+        while bytes.len() >= offset + 9 {
+            let len = ((bytes[offset] as usize) << 16)
+                | ((bytes[offset + 1] as usize) << 8)
+                | bytes[offset + 2] as usize;
+            let end = offset + 9 + len;
+            if bytes.len() < end {
+                return false;
+            }
+            let frame_type = bytes[offset + 3];
+            let stream_id =
+                u32::from_be_bytes(bytes[offset + 5..offset + 9].try_into().unwrap()) & 0x7fff_ffff;
+            if frame_type == 0x1 && stream_id == 1 {
+                return true;
+            }
+            offset = end;
+        }
+        false
+    }
 
     /// An HTTP/2 frame, built by hand.
     fn raw_frame(frame_type: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
@@ -1812,11 +1882,262 @@ mod tests_h2 {
     /// `:status: 200` (HPACK static index 8) plus `content-length: 10` as a
     /// literal field without indexing whose NAME is static index 28.
     const RESP_200_CONTENT_LENGTH_10: &[u8] = &[0x88, 0x0F, 0x0D, 0x02, b'1', b'0'];
+    const RESP_200_CONTENT_LENGTH_5: &[u8] = &[0x88, 0x0F, 0x0D, 0x01, b'5'];
+
+    /// HPACK static status-code entries used by the hand-written response
+    /// sequences below. 100 and 103 have no static value and are literal
+    /// values under the indexed `:status` name (static index 8).
+    const RESP_200: &[u8] = &[0x88];
+    const RESP_100: &[u8] = &[0x08, 0x03, b'1', b'0', b'0'];
+    const RESP_103: &[u8] = &[0x08, 0x03, b'1', b'0', b'3'];
 
     /// `x-trailer: 1` as a literal field without indexing with a new name.
     const TRAILER_BLOCK: &[u8] = &[
         0x00, 0x09, b'x', b'-', b't', b'r', b'a', b'i', b'l', b'e', b'r', 0x01, b'1',
     ];
+
+    fn response_with_trailers(body: &[u8], trailers: &[u8]) -> Vec<u8> {
+        let mut frames = raw_frame(0x1, 0x4, 1, RESP_200);
+        if !body.is_empty() {
+            frames.extend_from_slice(&raw_frame(0x0, 0, 1, body));
+        }
+        frames.extend_from_slice(&raw_frame(0x1, 0x4 | FLAG_END_STREAM_RAW, 1, trailers));
+        frames
+    }
+
+    async fn assert_clean_response(
+        mut h2s: Http2Session,
+        expected_body: Option<&'static [u8]>,
+        expected_trailers: Option<HeaderMap>,
+    ) {
+        match expected_body {
+            Some(expected) => {
+                assert_eq!(h2s.read_response_body().await.unwrap().unwrap(), expected)
+            }
+            None => assert!(h2s.read_response_body().await.unwrap().is_none()),
+        }
+        assert!(
+            h2s.read_response_body().await.unwrap().is_none(),
+            "the response must remain at clean EOF"
+        );
+        assert_eq!(h2s.read_trailers().await.unwrap(), expected_trailers);
+    }
+
+    async fn assert_clean_empty_trailers(
+        mut h2s: Http2Session,
+        expected_body: Option<&'static [u8]>,
+    ) {
+        match expected_body {
+            Some(expected) => {
+                assert_eq!(h2s.read_response_body().await.unwrap().unwrap(), expected);
+                assert!(h2s.read_response_body().await.unwrap().is_none());
+            }
+            None => assert!(h2s.read_response_body().await.unwrap().is_none()),
+        }
+        assert!(
+            h2s.read_trailers()
+                .await
+                .unwrap()
+                .is_some_and(|trailers| trailers.is_empty()),
+            "an explicitly validated empty trailer block must remain distinguishable from None"
+        );
+    }
+
+    /// Reading body EOF again must not re-poll h2 and discard an already
+    /// validated empty trailer map. The narrowed client will short-circuit on
+    /// its EOF/trailer latch before touching the reader again.
+    #[tokio::test]
+    #[ignore = "current repeated body EOF poll can consume validated empty trailers"]
+    async fn h2_repeated_body_eof_preserves_validated_empty_trailers() {
+        let mut h2s = raw_reset_session(
+            response_with_trailers(&[], &[]),
+            EndStreamObservation::Unwatched,
+        )
+        .await;
+        assert!(h2s.read_response_body().await.unwrap().is_none());
+        assert!(h2s.read_response_body().await.unwrap().is_none());
+        assert!(h2s
+            .read_trailers()
+            .await
+            .unwrap()
+            .is_some_and(|trailers| trailers.is_empty()));
+    }
+
+    /// h2 itself accepts an empty terminal trailer block both with and without
+    /// DATA. The adapter must not reinterpret `Some(empty)` as an invalid
+    /// terminal block merely because DATA preceded it.
+    #[tokio::test]
+    async fn h2_unwatched_valid_empty_trailers_are_clean_with_or_without_data() {
+        for body in [&b""[..], &b"hello"[..]] {
+            let h2s = raw_reset_session(
+                response_with_trailers(body, &[]),
+                EndStreamObservation::Unwatched,
+            )
+            .await;
+            assert_clean_empty_trailers(h2s, (!body.is_empty()).then_some(&b"hello"[..])).await;
+        }
+    }
+
+    /// Target contract for the narrowed watcher. The current byte-count watch
+    /// treats validated empty trailers after DATA as unvalidated terminal
+    /// HEADERS, so this remains ignored until that implementation is replaced.
+    #[tokio::test]
+    #[ignore = "current watcher falsely rejects validated empty trailers after DATA"]
+    async fn h2_watched_valid_empty_trailers_are_clean_with_or_without_data() {
+        for body in [&b""[..], &b"hello"[..]] {
+            let h2s = raw_reset_session(
+                response_with_trailers(body, &[]),
+                EndStreamObservation::Watched,
+            )
+            .await;
+            assert_clean_empty_trailers(h2s, (!body.is_empty()).then_some(&b"hello"[..])).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn h2_valid_nonempty_trailers_survive_a_pre_poll_reset() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-trailer", "1".parse().unwrap());
+        for observation in [
+            EndStreamObservation::Unwatched,
+            EndStreamObservation::Watched,
+        ] {
+            let h2s =
+                raw_reset_session(response_with_trailers(b"hello", TRAILER_BLOCK), observation)
+                    .await;
+            assert_clean_response(h2s, Some(b"hello"), Some(trailers.clone())).await;
+        }
+    }
+
+    /// Target contract for terminal HEADERS even when the response has no DATA.
+    /// The current watcher publishes its terminal-headers marker only after it
+    /// has counted DATA, allowing h2's following reset to launder this codec
+    /// error into a clean EOF.
+    #[tokio::test]
+    #[ignore = "current watcher misses invalid terminal HEADERS on zero-DATA responses"]
+    async fn h2_watched_zero_data_invalid_trailers_remain_an_error() {
+        let mut h2s = raw_reset_session(
+            response_with_trailers(&[], RESP_200),
+            EndStreamObservation::Watched,
+        )
+        .await;
+        let err = h2s
+            .read_response_body()
+            .await
+            .expect_err("a response pseudo-header in trailers must remain an error");
+        assert_eq!(err.etype(), &ReadError);
+        h2s.read_trailers()
+            .await
+            .expect_err("the invalid trailer result must stay latched");
+    }
+
+    /// The h2-only baseline demonstrates why a terminal-HEADERS observation is
+    /// still required after DATA accounting is removed: with no watcher, the
+    /// reset overwrites the codec error and the invalid zero-DATA trailers look
+    /// exactly like a clean body end.
+    #[tokio::test]
+    async fn h2_unwatched_zero_data_invalid_trailers_are_laundered_baseline() {
+        let h2s = raw_reset_session(
+            response_with_trailers(&[], RESP_200),
+            EndStreamObservation::Unwatched,
+        )
+        .await;
+        assert_clean_response(h2s, None, None).await;
+    }
+
+    #[tokio::test]
+    async fn h2_header_only_response_survives_a_pre_poll_reset() {
+        let frames = raw_frame(0x1, 0x4 | FLAG_END_STREAM_RAW, 1, RESP_200);
+        for observation in [
+            EndStreamObservation::Watched,
+            EndStreamObservation::Unwatched,
+        ] {
+            let h2s = raw_reset_session(frames.clone(), observation).await;
+            assert_clean_response(h2s, None, None).await;
+        }
+    }
+
+    fn prepend_informational(prefixes: &[&[u8]], mut final_frames: Vec<u8>) -> Vec<u8> {
+        let mut frames = Vec::new();
+        for block in prefixes {
+            frames.extend_from_slice(&raw_frame(0x1, 0x4, 1, block));
+        }
+        frames.append(&mut final_frames);
+        frames
+    }
+
+    /// Informational responses are consumed by h2's response future and must
+    /// not affect how the adapter classifies the final response. Exercise one
+    /// and multiple prefixes across every legal terminal shape.
+    #[tokio::test]
+    async fn h2_informational_prefixes_preserve_final_response_shapes() {
+        let mut nonempty = HeaderMap::new();
+        nonempty.insert("x-trailer", "1".parse().unwrap());
+
+        let cases = [
+            (
+                vec![RESP_100],
+                raw_frame(0x1, 0x4 | FLAG_END_STREAM_RAW, 1, RESP_200),
+                None,
+                None,
+            ),
+            (
+                vec![RESP_100, RESP_103],
+                {
+                    let mut frames = raw_frame(0x1, 0x4, 1, RESP_200);
+                    frames.extend_from_slice(&raw_frame(0x0, FLAG_END_STREAM_RAW, 1, b"hello"));
+                    frames
+                },
+                Some(&b"hello"[..]),
+                None,
+            ),
+            (vec![RESP_103], response_with_trailers(&[], &[]), None, None),
+            (
+                vec![RESP_100, RESP_103],
+                response_with_trailers(b"hello", TRAILER_BLOCK),
+                Some(&b"hello"[..]),
+                Some(nonempty),
+            ),
+        ];
+
+        for observation in [
+            EndStreamObservation::Watched,
+            EndStreamObservation::Unwatched,
+        ] {
+            for (prefixes, final_frames, body, trailers) in &cases {
+                let frames = prepend_informational(prefixes, final_frames.clone());
+                let h2s = raw_reset_session(frames, observation).await;
+                assert_clean_response(h2s, *body, trailers.clone()).await;
+            }
+        }
+    }
+
+    /// An informational response cannot end the stream. This must fail while
+    /// reading the response header; neither a terminal-frame observation nor a
+    /// following NO_ERROR reset may turn it into a final response.
+    #[tokio::test]
+    async fn h2_informational_end_stream_is_a_header_error() {
+        let frames = raw_frame(0x1, 0x4 | FLAG_END_STREAM_RAW, 1, RESP_100);
+        for observation in [
+            EndStreamObservation::Watched,
+            EndStreamObservation::Unwatched,
+        ] {
+            let (client_io, server_io) = duplex(65536);
+            let _ = serve_raw_burst_then_no_error_reset(server_io, frames.clone());
+            let mut h2s = match observation {
+                EndStreamObservation::Watched => watched_client_session(client_io).await,
+                EndStreamObservation::Unwatched => client_session(client_io).await,
+            };
+
+            let mut req = RequestHeader::build("POST", b"/", None).unwrap();
+            req.insert_header(http::header::HOST, "example.com")
+                .unwrap();
+            h2s.write_request_header(Box::new(req), false).unwrap();
+            h2s.read_response_header().await.expect_err(
+                "END_STREAM on an informational response must fail the response future",
+            );
+        }
+    }
 
     /// C1: a response that declares `content-length: 10`, sends 5 bytes, then
     /// puts END_STREAM on a frame `h2` THROWS AWAY.
@@ -1840,7 +2161,7 @@ mod tests_h2 {
         let mut frames = raw_frame(0x1, 0x4, 1, RESP_200_CONTENT_LENGTH_10);
         frames.extend_from_slice(&raw_frame(0x0, 0, 1, b"hello"));
         frames.extend_from_slice(&raw_frame(0x0, FLAG_END_STREAM_RAW, 1, b"xy"));
-        serve_raw_burst_then_no_error_reset(server_io, frames);
+        let _ = serve_raw_burst_then_no_error_reset(server_io, frames);
 
         let mut h2s = watched_client_session(client_io).await;
         send_open_request(&mut h2s).await;
@@ -1891,7 +2212,7 @@ mod tests_h2 {
         let mut frames = raw_frame(0x1, 0x4, 1, RESP_200_CONTENT_LENGTH_10);
         frames.extend_from_slice(&raw_frame(0x0, 0, 1, b"hello"));
         frames.extend_from_slice(&raw_frame(0x1, 0x4 | FLAG_END_STREAM_RAW, 1, TRAILER_BLOCK));
-        serve_raw_burst_then_no_error_reset(server_io, frames);
+        let _ = serve_raw_burst_then_no_error_reset(server_io, frames);
 
         let mut h2s = watched_client_session(client_io).await;
         send_open_request(&mut h2s).await;
@@ -1931,7 +2252,7 @@ mod tests_h2 {
         frames.extend_from_slice(&raw_frame(0x0, 0, 1, b"hello"));
         // HPACK static index 8 is `:status: 200`, which is illegal in trailers.
         frames.extend_from_slice(&raw_frame(0x1, 0x4 | FLAG_END_STREAM_RAW, 1, &[0x88]));
-        serve_raw_burst_then_no_error_reset(server_io, frames);
+        let _ = serve_raw_burst_then_no_error_reset(server_io, frames);
 
         let mut h2s = watched_client_session(client_io).await;
         send_open_request(&mut h2s).await;
@@ -1959,6 +2280,210 @@ mod tests_h2 {
             .expect_err("invalid trailers must remain a trailer-read error");
     }
 
+    /// A caller may consume exactly the declared body bytes and then ask for
+    /// trailers without issuing a body EOF read. That API order must not let a
+    /// same-burst reset wash an illegal terminal pseudo-header into `None`.
+    #[tokio::test]
+    async fn h2_unwatched_direct_trailer_read_launders_invalid_terminal_headers_as_empty() {
+        let mut frames = raw_frame(0x1, 0x4, 1, RESP_200_CONTENT_LENGTH_5);
+        frames.extend_from_slice(&raw_frame(0x0, 0, 1, b"hello"));
+        frames.extend_from_slice(&raw_frame(0x1, 0x4 | FLAG_END_STREAM_RAW, 1, RESP_200));
+
+        let mut h2s = raw_reset_session(frames, EndStreamObservation::Unwatched).await;
+        assert_eq!(h2s.read_response_body().await.unwrap().unwrap(), "hello");
+        assert!(
+            h2s.read_trailers()
+                .await
+                .unwrap()
+                .is_some_and(|trailers| trailers.is_empty()),
+            "the h2-only laundering baseline turns invalid trailers into an empty map"
+        );
+    }
+
+    /// This is the pseudo-only companion to the mixed-field decoder contract.
+    /// It deliberately runs without the watcher first: the h2 source itself
+    /// must reject trailer pseudo-headers before any reset can hide the error.
+    #[tokio::test]
+    #[ignore = "requires decoder-level rejection of pseudo-headers in trailers"]
+    async fn h2_pseudo_only_trailers_never_complete() {
+        let mut frames = raw_frame(0x1, 0x4, 1, RESP_200_CONTENT_LENGTH_5);
+        frames.extend_from_slice(&raw_frame(0x0, 0, 1, b"hello"));
+        frames.extend_from_slice(&raw_frame(0x1, 0x4 | FLAG_END_STREAM_RAW, 1, RESP_200));
+
+        for observation in [
+            EndStreamObservation::Unwatched,
+            EndStreamObservation::Watched,
+        ] {
+            let mut h2s = raw_reset_session(frames.clone(), observation).await;
+            assert_eq!(h2s.read_response_body().await.unwrap().unwrap(), "hello");
+            assert!(
+                h2s.read_response_body().await.is_err(),
+                "async body EOF must reject pseudo-only trailers for {observation:?}"
+            );
+            assert!(
+                h2s.read_trailers().await.is_err(),
+                "direct trailers must observe the same permanent error for {observation:?}"
+            );
+        }
+    }
+
+    /// This isolates the watched direct-trailer API from Pingora's body-EOF
+    /// latch. h2 must not queue malformed trailers, and the final client latch
+    /// must reject the resulting missing trailer event before it becomes EOF.
+    #[tokio::test]
+    #[ignore = "requires decoder-level rejection of pseudo-headers in trailers"]
+    async fn h2_direct_trailer_first_rejects_pseudo_trailers() {
+        let mut mixed = RESP_200.to_vec();
+        mixed.extend_from_slice(TRAILER_BLOCK);
+
+        for invalid_trailers in [RESP_200, mixed.as_slice()] {
+            let mut frames = raw_frame(0x1, 0x4, 1, RESP_200_CONTENT_LENGTH_5);
+            frames.extend_from_slice(&raw_frame(0x0, 0, 1, b"hello"));
+            frames.extend_from_slice(&raw_frame(
+                0x1,
+                0x4 | FLAG_END_STREAM_RAW,
+                1,
+                invalid_trailers,
+            ));
+
+            let mut h2s = raw_reset_session(frames, EndStreamObservation::Watched).await;
+            assert_eq!(h2s.read_response_body().await.unwrap().unwrap(), "hello");
+            assert!(
+                h2s.read_trailers().await.is_err(),
+                "direct first trailer read must reject malformed trailers"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "current direct read_trailers() does not consult terminal HEADERS state"]
+    async fn h2_watched_direct_trailer_read_latches_invalid_terminal_headers() {
+        let mut frames = raw_frame(0x1, 0x4, 1, RESP_200_CONTENT_LENGTH_5);
+        frames.extend_from_slice(&raw_frame(0x0, 0, 1, b"hello"));
+        frames.extend_from_slice(&raw_frame(0x1, 0x4 | FLAG_END_STREAM_RAW, 1, RESP_200));
+
+        let mut h2s = raw_reset_session(frames, EndStreamObservation::Watched).await;
+        assert_eq!(h2s.read_response_body().await.unwrap().unwrap(), "hello");
+        for _ in 0..2 {
+            let err = h2s
+                .read_trailers()
+                .await
+                .expect_err("invalid terminal headers must stay permanently failed");
+            assert_eq!(err.etype(), &ReadError);
+        }
+    }
+
+    /// A pseudo-header followed by an ordinary trailer is more dangerous than
+    /// the pseudo-only case: h2 can discard the pseudo field yet still expose
+    /// the ordinary field as a nonempty map. Any terminal state machine that
+    /// trusts `Some(nonempty)` without decoder-level pseudo-header rejection
+    /// would accept and cache this malformed response.
+    #[tokio::test]
+    #[ignore = "requires decoder-level rejection of pseudo-headers in trailers"]
+    async fn h2_mixed_pseudo_and_regular_trailers_never_complete() {
+        let mut invalid_trailers = RESP_200.to_vec();
+        invalid_trailers.extend_from_slice(TRAILER_BLOCK);
+        let mut frames = raw_frame(0x1, 0x4, 1, RESP_200_CONTENT_LENGTH_5);
+        frames.extend_from_slice(&raw_frame(0x0, 0, 1, b"hello"));
+        frames.extend_from_slice(&raw_frame(
+            0x1,
+            0x4 | FLAG_END_STREAM_RAW,
+            1,
+            &invalid_trailers,
+        ));
+
+        for observation in [
+            EndStreamObservation::Unwatched,
+            EndStreamObservation::Watched,
+        ] {
+            let mut h2s = raw_reset_session(frames.clone(), observation).await;
+            assert_eq!(h2s.read_response_body().await.unwrap().unwrap(), "hello");
+            assert!(
+                h2s.read_response_body().await.is_err(),
+                "async body EOF must reject mixed pseudo/regular trailers for {observation:?}"
+            );
+            assert!(
+                h2s.read_trailers().await.is_err(),
+                "direct trailers must observe the same permanent error for {observation:?}"
+            );
+        }
+    }
+
+    /// The decoder rejects the mixed pseudo form before it can become a
+    /// nonempty map; the terminal-HEADERS marker then prevents the same-burst
+    /// reset from turning its missing poll-trailer event into EOF.
+    #[tokio::test]
+    #[ignore = "requires decoder rejection and final terminal-HEADERS poll latch"]
+    async fn h2_watched_poll_mixed_pseudo_and_regular_trailers_never_complete() {
+        let mut invalid_trailers = RESP_200.to_vec();
+        invalid_trailers.extend_from_slice(TRAILER_BLOCK);
+        let mut frames = raw_frame(0x1, 0x4, 1, RESP_200_CONTENT_LENGTH_5);
+        frames.extend_from_slice(&raw_frame(0x0, 0, 1, b"hello"));
+        frames.extend_from_slice(&raw_frame(
+            0x1,
+            0x4 | FLAG_END_STREAM_RAW,
+            1,
+            &invalid_trailers,
+        ));
+
+        let mut h2s = raw_reset_session(frames, EndStreamObservation::Watched).await;
+        let first = std::future::poll_fn(|cx| h2s.poll_read_response_body(cx))
+            .await
+            .expect("the first body poll must yield DATA")
+            .expect("the first body poll must succeed");
+        assert_eq!(first, "hello");
+
+        let terminal = std::future::poll_fn(|cx| h2s.poll_read_response_body(cx))
+            .await
+            .expect("the terminal body poll must report a trailer error");
+        assert!(
+            terminal.is_err(),
+            "poll body EOF must reject mixed pseudo/regular trailers"
+        );
+        assert!(
+            h2s.read_trailers().await.is_err(),
+            "direct trailers must remain failed after poll error"
+        );
+    }
+
+    /// The poll API must latch the same terminal trailer failure as the async
+    /// API. Otherwise a caller can observe the body error and then retry
+    /// `read_trailers`, after the failing h2 result has already been consumed.
+    #[tokio::test]
+    async fn h2_poll_body_invalid_trailers_latches_the_trailer_error() {
+        let (client_io, server_io) = duplex(65536);
+        let mut frames = raw_frame(0x1, 0x4, 1, &[0x88]);
+        frames.extend_from_slice(&raw_frame(0x0, 0, 1, b"hello"));
+        frames.extend_from_slice(&raw_frame(0x1, 0x4 | FLAG_END_STREAM_RAW, 1, &[0x88]));
+        let _ = serve_raw_burst_then_no_error_reset(server_io, frames);
+
+        let mut h2s = watched_client_session(client_io).await;
+        send_open_request(&mut h2s).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let first = std::future::poll_fn(|cx| h2s.poll_read_response_body(cx))
+            .await
+            .expect("the first body poll must yield DATA")
+            .expect("the first body poll must succeed");
+        assert_eq!(first, "hello");
+
+        let err = std::future::poll_fn(|cx| h2s.poll_read_response_body(cx))
+            .await
+            .expect("the terminal body poll must report the trailer failure")
+            .expect_err("invalid trailers must remain a poll-body error");
+        assert_eq!(err.reason(), Some(Reason::PROTOCOL_ERROR));
+        assert!(
+            h2s.response_body_error,
+            "the poll API must latch the trailer validation failure"
+        );
+
+        for _ in 0..2 {
+            h2s.read_trailers()
+                .await
+                .expect_err("a latched trailer failure must remain permanent");
+        }
+    }
+
     /// The half of the guard the two tests above do NOT pin on their own: a
     /// response with no `content-length` at all, whose END_STREAM-bearing DATA
     /// frame `h2` drops for overrunning the STREAM receive window.
@@ -1979,7 +2504,7 @@ mod tests_h2 {
         let mut frames = raw_frame(0x1, 0x4, 1, &[0x88]); // `:status: 200`, no content-length
         frames.extend_from_slice(&raw_frame(0x0, 0, 1, b"hello"));
         frames.extend_from_slice(&raw_frame(0x0, FLAG_END_STREAM_RAW, 1, &[b'z'; 2000]));
-        serve_raw_burst_then_no_error_reset(server_io, frames);
+        let _ = serve_raw_burst_then_no_error_reset(server_io, frames);
 
         let mut h2s = watched_client_session_with(client_io, |b| {
             b.initial_window_size(1024)

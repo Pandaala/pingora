@@ -26,7 +26,7 @@ use pingora_cache::cache_control::CacheControl;
 use pingora_cache::hashtable::ConcurrentHashTable;
 use pingora_cache::key::HashBinary;
 use pingora_cache::lock::CacheKeyLockImpl;
-use pingora_cache::storage::{HandleMiss, MissFinishType, Storage};
+use pingora_cache::storage::{HandleHit, HandleMiss, MissFinishType, Storage};
 use pingora_cache::{
     eviction::simple_lru::Manager, filters::resp_cacheable, lock::CacheLock, predictor::Predictor,
     set_compression_dict_path, CacheKey, CacheMeta, CacheMetaDefaults, CachePhase, MemCache,
@@ -567,6 +567,25 @@ static DEFER_ADMISSION_POLICY: DeferAdmissionPolicy = DeferAdmissionPolicy;
 static CACHE_VARY_ALLOWED_HEADERS: Lazy<Option<HashSet<&str>>> =
     Lazy::new(|| Some(vec!["accept", "accept-encoding"].into_iter().collect()));
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CacheEntryState {
+    None,
+    Partial,
+    Complete,
+}
+
+/// Test-only inspection using public cache interfaces. A complete memory hit
+/// is seekable, while a streaming partial hit is intentionally not.
+pub async fn cache_entry_state(host: &str, path_and_query: &str) -> CacheEntryState {
+    let key = CacheKey::new(format!("{host}{path_and_query}"), String::new());
+    let trace = pingora_cache::trace::Span::inactive().handle();
+    match CACHE_BACKEND.lookup(&key, &trace).await.unwrap() {
+        None => CacheEntryState::None,
+        Some((_meta, hit)) if hit.can_seek() => CacheEntryState::Complete,
+        Some(_) => CacheEntryState::Partial,
+    }
+}
+
 struct DeferAdmissionPolicy;
 
 impl AdmissionPolicy for DeferAdmissionPolicy {
@@ -635,6 +654,9 @@ impl HandleMiss for FinishFailMissHandler {
 // #[allow(clippy::upper_case_acronyms)]
 pub struct CacheCTX {
     upstream_status: Option<u16>,
+    conn_reused: bool,
+    upstream_client_addr: Option<SocketAddr>,
+    upstream_server_addr: Option<SocketAddr>,
     /// Response bytes withheld by the `x-retain-until-eos` processor.
     withheld_body: Vec<u8>,
 }
@@ -658,6 +680,9 @@ impl ProxyHttp for ExampleProxyCache {
     fn new_ctx(&self) -> Self::CTX {
         CacheCTX {
             upstream_status: None,
+            conn_reused: false,
+            upstream_client_addr: None,
+            upstream_server_addr: None,
             withheld_body: Vec::new(),
         }
     }
@@ -714,6 +739,15 @@ impl ProxyHttp for ExampleProxyCache {
         if session.get_header_bytes("x-h2") == b"true" {
             // default is 1, 1
             peer.options.set_http_version(2, 2);
+
+            if let Some(window) = req.headers.get("x-h2-stream-window-size") {
+                peer.options.h2_stream_window_size =
+                    Some(window.to_str().unwrap().parse().unwrap());
+            }
+            if let Some(window) = req.headers.get("x-h2-connection-window-size") {
+                peer.options.h2_connection_window_size =
+                    Some(window.to_str().unwrap().parse().unwrap());
+            }
         }
 
         Ok(peer)
@@ -936,6 +970,11 @@ impl ProxyHttp for ExampleProxyCache {
         _sink: &mut ResponseBodySink,
         ctx: &mut Self::CTX,
     ) -> Result<Option<Duration>> {
+        if session.get_header_bytes("x-test-local-response-body-failure") == b"true"
+            && body.as_ref().is_some_and(|body| !body.is_empty())
+        {
+            return Error::e_explain(InternalError, "test local response body filter failure");
+        }
         if session.get_header_bytes("x-retain-until-eos") == b"true" {
             if let Some(bytes) = body.take() {
                 ctx.withheld_body.extend_from_slice(&bytes);
@@ -984,6 +1023,21 @@ impl ProxyHttp for ExampleProxyCache {
     where
         Self::CTX: Send + Sync,
     {
+        if ctx.conn_reused {
+            upstream_response.insert_header("x-conn-reuse", "1")?;
+        }
+        upstream_response.insert_header(
+            "x-upstream-client-addr",
+            ctx.upstream_client_addr
+                .as_ref()
+                .map_or_else(|| "unset".into(), |addr| addr.to_string()),
+        )?;
+        upstream_response.insert_header(
+            "x-upstream-server-addr",
+            ctx.upstream_server_addr
+                .as_ref()
+                .map_or_else(|| "unset".into(), |addr| addr.to_string()),
+        )?;
         if session.cache.enabled() {
             match session.cache.phase() {
                 CachePhase::Hit => upstream_response.insert_header("x-cache-status", "hit")?,
@@ -1014,6 +1068,27 @@ impl ProxyHttp for ExampleProxyCache {
         if let Some(up_stat) = ctx.upstream_status {
             upstream_response.insert_header("x-upstream-status", up_stat.to_string())?;
         }
+        Ok(())
+    }
+
+    async fn connected_to_upstream(
+        &self,
+        _http_session: &mut Session,
+        reused: bool,
+        _peer: &HttpPeer,
+        #[cfg(unix)] _fd: std::os::unix::io::RawFd,
+        #[cfg(windows)] _sock: std::os::windows::io::RawSocket,
+        digest: Option<&Digest>,
+        ctx: &mut CacheCTX,
+    ) -> Result<()> {
+        ctx.conn_reused = reused;
+        let socket_digest = digest
+            .expect("upstream connector digest should be set for HTTP sessions")
+            .socket_digest
+            .as_ref()
+            .expect("socket digest should be set for HTTP sessions");
+        ctx.upstream_client_addr = socket_digest.local_addr().cloned();
+        ctx.upstream_server_addr = socket_digest.peer_addr().cloned();
         Ok(())
     }
 
