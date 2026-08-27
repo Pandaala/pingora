@@ -803,7 +803,10 @@ pub fn cl0_without_end_stream_sends_one_eos(combo: Combo) {
 /// With the stream held, all three requests below run against a connection
 /// the origin has NOT closed and h2 has NOT torn down, so the proxy's own
 /// gates are what is being observed. Both mutations above were re-run against
-/// THIS version in a scratch copy, and both now fail it:
+/// THIS version in a scratch copy. The `spawn_stream` GOAWAY-branch mutation
+/// fails it on its own; the `more_streams_allowed` one did too until H2-008
+/// added a second shutdown gate, and now needs that gate deleted alongside it
+/// (re-measured 2026-08-27, see the second bullet):
 /// - the follow-up request reaches `spawn_stream` on the pooled, GOAWAY'd
 ///   connection, where `new_stream()` fails with
 ///   `GoAway(NO_ERROR, Remote)`. The fork turns that into `Ok(None)` -- "no
@@ -814,10 +817,23 @@ pub fn cl0_without_end_stream_sends_one_eos(combo: Combo) {
 /// - the THIRD request is what pins the pool hygiene half. On the correct
 ///   code conn 0 is not returned to the in-use pool (it is shutting down), so
 ///   the third request finds conn 1 and reuses it: two connections total.
-///   Without the `!self.is_shutting_down()` guard, conn 0 goes back into the
-///   pool ahead of conn 1 and the third request picks it up again, gets
-///   `Ok(None)` a second time, and dials a THIRD connection (observed: the
-///   connection-count assertion failing 3 != 2, both H2 cells).
+///   With that hygiene gone, conn 0 goes back into the pool ahead of conn 1
+///   and the third request picks it up again, gets `Ok(None)` a second time,
+///   and dials a THIRD connection (observed: the connection-count assertion
+///   failing 3 != 2, both H2 cells).
+///
+///   Which deletion produces that was re-measured on 2026-08-27, when H2-008
+///   added a second shutdown gate: pool hygiene is now enforced in TWO places,
+///   and deleting either alone leaves this test green. Removing
+///   `!self.is_shutting_down()` from `ConnectionRef::more_streams_allowed`
+///   lets conn 0 back into the pool, but `Connector::reused_http_session`'s
+///   `!c.is_shutting_down()` selection filter then rejects and evicts it and
+///   the third request still lands on conn 1. Removing that selection filter
+///   alone changes nothing, because `more_streams_allowed` never re-pooled
+///   conn 0 in the first place. Both were deleted together to reproduce the
+///   3 != 2 above. What this test pins is therefore the RULE -- a
+///   shutting-down connection is not reusable -- and not either
+///   implementation of it.
 ///
 /// Not pinned here: the same guard in `Connector::release_http_session`
 /// (`conn.is_closed() || conn.is_shutting_down()`). It only acts when the

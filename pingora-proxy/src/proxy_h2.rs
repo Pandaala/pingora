@@ -474,20 +474,24 @@ async fn write_upstream_body_watching_stall(
             Some(closed) = OptionFuture::from(stream_close.as_mut()) => {
                 return UpstreamBodyWriteEnd::DownstreamClosed(closed);
             }
-            // Tokio's timer rather than `pingora_timeout`, which the write
-            // path itself uses, and deliberately so. `pingora_timeout` is built
-            // for short deadlines created and cancelled in bulk; its timers are
-            // kept in `TimerManager` until they EXPIRE, with no cancellation
-            // cleanup (see `set_fast_timeout_to_tokio_threshold`'s own note).
-            // This probe is the opposite profile -- ten seconds long and, on
-            // every write that behaves, cancelled microseconds after it is
-            // created -- so a fast timer would leave a dead entry behind for
-            // ten seconds each time. Tokio removes it on cancel.
+            // `pingora_timeout`, the same timer `write_body` itself uses, and
+            // not `tokio::time`. This is a per-body-chunk timer, so its cost
+            // scales with request rate: `pingora_timeout` measures ~4ns per
+            // create/cancel against Tokio's ~107ns, and deadlines rounded to
+            // the same 10ms tick SHARE one timer, so concurrent probes mostly
+            // subscribe to an existing one instead of allocating.
+            //
+            // A cancelled fast timer does leave its entry in `TimerManager`
+            // until the deadline passes, which is why the crate falls back to
+            // Tokio for long deadlines -- but its own threshold for "long" is
+            // fifteen minutes, and the sharing bounds the residue at one entry
+            // per 10ms tick of the interval per thread, independent of request
+            // rate. Ten seconds is not in that territory.
             //
             // Nothing is created at all on the common path: `select!` does not
             // evaluate a branch's future expression while its precondition is
             // false, so a caller with a `write_timeout` pays nothing here.
-            _ = time::sleep(UPSTREAM_STALL_PROBE_INTERVAL), if probe_stall => {
+            _ = pingora_timeout::sleep(UPSTREAM_STALL_PROBE_INTERVAL), if probe_stall => {
                 if body_write.upstream_response_ended.observed() {
                     return UpstreamBodyWriteEnd::StalledAfterResponse;
                 }
