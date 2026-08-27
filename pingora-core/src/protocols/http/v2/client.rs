@@ -146,6 +146,13 @@ impl PeerEndStream {
         self.0.as_ref().is_some_and(|r| r.vouches_for(body_recv))
     }
 
+    /// The shared record behind this handle, for the callers that have to mark
+    /// it rather than read it: `Http2Session::note_local_reset` and
+    /// `Http2Session::drop`.
+    fn record(&self) -> Option<&StreamRecord> {
+        self.0.as_deref()
+    }
+
     fn terminal_headers_observed(&self) -> bool {
         self.0
             .as_ref()
@@ -209,7 +216,15 @@ fn benign_post_eof_stream_end(e: &h2::Error) -> bool {
 impl Drop for Http2Session {
     fn drop(&mut self) {
         if let (Some(watch), Some(id)) = (self.conn.end_stream_watch(), self.stream_id) {
-            watch.forget(id);
+            // Invalidate rather than merely forget. Dropping the session drops
+            // `send_body` too, and `h2` cancels a still-open stream when its
+            // last handle goes away -- the same local-reset shape
+            // `note_local_reset` guards, minus the explicit call. Since
+            // [`Self::peer_end_stream`] is public, a caller may still hold a
+            // clone of the record at this point, and a map removal would not
+            // reach it. This never retracts evidence published earlier, so a
+            // session dropped after a clean response is unaffected.
+            watch.invalidate(id, self.peer_end_stream.record());
         }
         self.conn.release_stream();
     }
@@ -384,11 +399,22 @@ impl Http2Session {
     /// cleanly" for a body `h2` has been discarding -- a truncation laundered
     /// into a clean EOF, exactly what the guard exists to prevent.
     ///
-    /// Dropping the registration makes that unreachable: a flag already set
-    /// before the reset is still sound (the body was whole before we gave up on
-    /// it), and one not yet set can no longer be set, because the scanner will
-    /// not find the entry. What is left are sources (i)-(iii), which a local
-    /// reset cannot corrupt.
+    /// Invalidating the shared record makes that unreachable: a flag already
+    /// set before the reset is still sound (the body was whole before we gave
+    /// up on it), and one not yet set can no longer be set, because publication
+    /// refuses an invalidated record under the same lock. What is left are
+    /// sources (i)-(iii), which a local reset cannot corrupt.
+    ///
+    /// # Why this must run BEFORE the reset is sent
+    ///
+    /// The two are not interchangeable. Between a queued RST_STREAM and this
+    /// call, the connection's read task can publish the peer's END_STREAM for
+    /// the stream, which removes the pending entry AND sets the flag on the
+    /// record every [`PeerEndStream`] clone already holds -- the session's own
+    /// and the h2 pump's. Running afterwards would then find nothing to remove
+    /// and have nothing to retract, so the local failure this side had already
+    /// decided on would be overwritten by the peer's evidence. Every caller
+    /// therefore invalidates first and resets second.
     ///
     /// The byte count source (iv) carries would catch the discarded frames on
     /// its own (they are counted on the wire and never delivered), so this is
@@ -397,7 +423,7 @@ impl Http2Session {
     /// reset happens between two whole frames and nothing is discarded at all.
     pub fn note_local_reset(&mut self) {
         if let (Some(watch), Some(id)) = (self.conn.end_stream_watch(), self.stream_id) {
-            watch.forget(id);
+            watch.invalidate(id, self.peer_end_stream.record());
         }
     }
 
@@ -914,12 +940,13 @@ impl Http2Session {
 
     /// Give up the http session abruptly.
     pub fn shutdown(&mut self) {
-        if !self.ended || !self.response_finished() {
+        if (!self.ended || !self.response_finished()) && self.send_body.is_some() {
+            // A locally reset stream may no longer be judged by the wire flag,
+            // and giving it up has to happen BEFORE the reset is queued -- see
+            // `note_local_reset`.
+            self.note_local_reset();
             if let Some(send_body) = self.send_body.as_mut() {
                 send_body.send_reset(h2::Reason::INTERNAL_ERROR);
-                // A locally reset stream may no longer be judged by the wire
-                // flag; see `note_local_reset`.
-                self.note_local_reset();
             }
         }
     }

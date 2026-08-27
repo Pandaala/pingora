@@ -119,6 +119,9 @@ const FRAME_TYPE_RST_STREAM: u8 = 0x3;
 const FRAME_TYPE_GOAWAY: u8 = 0x7;
 const FLAG_END_STREAM: u8 = 0x1;
 const FLAG_PADDED: u8 = 0x8;
+/// A GOAWAY payload is `last_stream_id` (4 octets) plus `error_code`
+/// (4 octets), optionally followed by opaque debug data (RFC 9113 §6.8).
+const GOAWAY_MIN_PAYLOAD_LEN: usize = 8;
 
 /// What the wire watch recorded for ONE stream: whether the peer flagged
 /// END_STREAM before anything tore that stream down, and how many DATA payload
@@ -141,6 +144,20 @@ pub(crate) struct StreamRecord {
     /// headers, valid trailers, or an invalid header block; only h2's decoded
     /// result can decide.
     terminal_headers: AtomicBool,
+    /// Set once by the application, under the publication lock, when THIS side
+    /// gives up on the stream -- before its local RST_STREAM reaches the wire.
+    /// Never cleared.
+    ///
+    /// This lives on the record rather than being expressed by the map removal
+    /// alone because the record is SHARED: the session and the scanner's
+    /// bounded cache both hold `Arc` clones of it, and a removal cannot reach
+    /// them. See [`EndStreamWatch::invalidate`].
+    ///
+    /// Only `end_stream` and `terminal_headers` are gated on it. `data_bytes`
+    /// deliberately is NOT: it is readable only through [`Self::vouches_for`],
+    /// which `end_stream` already blocks, so gating it would buy nothing and
+    /// would put a branch on the per-frame counting path.
+    invalidated: AtomicBool,
 }
 
 impl StreamRecord {
@@ -185,25 +202,45 @@ impl StreamRecord {
 /// synchronization.
 #[derive(Debug, Default)]
 pub(crate) struct EndStreamWatch {
-    /// Streams that are still in flight, i.e. neither ended nor torn down.
-    /// Entries are removed as soon as their outcome is decided, which bounds
-    /// this to the streams actually open on the connection.
+    /// The streams still in flight, the GOAWAY ceiling that bounds which of
+    /// them may still be published, and the terminal poison state -- all under
+    /// one lock, so registration, publication and terminalization are linearly
+    /// ordered. Entries are removed as soon as their outcome is decided, which
+    /// bounds the map to the streams actually open on the connection.
     state: Mutex<WatchState>,
-    /// Changes whenever application-side `forget` removes a live entry, so the
-    /// scanner can lazily discard stale cache entries once per read batch.
+    /// Changes whenever an application-side removal ([`Self::invalidate`]) or a
+    /// connection-wide terminalization retires a live entry, so the scanner can
+    /// lazily discard stale cache entries once per read batch.
     forget_generation: AtomicUsize,
 }
 
 #[derive(Debug)]
 enum WatchState {
-    Active(HashMap<u32, Arc<StreamRecord>>),
+    Active(ActiveWatch),
     Poisoned,
 }
 
 impl Default for WatchState {
     fn default() -> Self {
-        Self::Active(HashMap::new())
+        Self::Active(ActiveWatch::default())
     }
+}
+
+/// Everything a connection that has not been poisoned keeps, guarded by the one
+/// lock that also orders registration, publication and poisoning.
+///
+/// The GOAWAY ceiling lives here rather than in the [`FrameScanner`] because a
+/// registration arriving from an application thread has to be checked against
+/// it too: the scanner's one-time prune only reaches entries that were already
+/// in `pending` when the GOAWAY was read.
+#[derive(Debug, Default)]
+struct ActiveWatch {
+    /// Streams that are still in flight, i.e. neither ended nor torn down.
+    pending: HashMap<u32, Arc<StreamRecord>>,
+    /// The `last_stream_id` of the lowest GOAWAY seen on this connection, once
+    /// one has been seen. Streams above it can never be published, whether they
+    /// were registered before the GOAWAY or after it.
+    goaway_ceiling: Option<u32>,
 }
 
 impl EndStreamWatch {
@@ -243,13 +280,51 @@ impl EndStreamWatch {
         self.registration().register(stream_id)
     }
 
-    /// Stop watching `stream_id`. Called when the session is dropped so that a
-    /// long-lived connection does not accumulate entries for streams whose
-    /// outcome was never decided on the wire.
+    /// Stop watching `stream_id` WITHOUT marking its record.
+    ///
+    /// Production code has no such site left: an application that stops
+    /// watching a stream is always giving up on it, which is
+    /// [`Self::invalidate`]'s job. This name survives because several tests
+    /// below assert that a removal WITHOUT the mark behaves differently, and
+    /// they only read as contracts while the two operations are named apart.
+    /// It delegates rather than duplicating the body so the two cannot drift.
+    #[cfg(test)]
     pub fn forget(&self, stream_id: u32) {
-        let removed = match &mut *self.state.lock() {
-            WatchState::Active(pending) => pending.remove(&stream_id).is_some(),
-            WatchState::Poisoned => false,
+        self.invalidate(stream_id, None);
+    }
+
+    /// Irreversibly give up wire evidence for `stream_id`, because THIS side is
+    /// about to reset it.
+    ///
+    /// MUST be called BEFORE the local RST_STREAM is handed to `h2`. From the
+    /// moment that reset is queued, `h2` starts DROPPING the DATA it decodes
+    /// for the stream while a peer RST_STREAM landing afterwards can still
+    /// surface as a remote `NO_ERROR`, so any END_STREAM published from that
+    /// point on describes a body nobody will ever receive. Calling this first
+    /// is what makes the two orderings decidable: publication either happened
+    /// strictly before this side gave up -- in which case the evidence predates
+    /// the reset and stays sound -- or it is refused outright.
+    ///
+    /// `record` is the caller's own handle rather than a map lookup, and that
+    /// is the whole point. Removing the map entry alone says nothing to the
+    /// `Arc` clones the session and the scanner's bounded cache already hold;
+    /// a publication that won the race would have left them reading
+    /// `end_stream == true` with no way to retract it. Marking the
+    /// shared record reaches every clone, including one whose map entry is
+    /// already gone.
+    ///
+    /// The flag is stored under the same lock [`Self::publish`] takes, so the
+    /// two are linearly ordered rather than racing.
+    pub fn invalidate(&self, stream_id: u32, record: Option<&StreamRecord>) {
+        let removed = {
+            let mut state = self.state.lock();
+            if let Some(record) = record {
+                record.invalidated.store(true, Ordering::Release);
+            }
+            match &mut *state {
+                WatchState::Active(active) => active.pending.remove(&stream_id).is_some(),
+                WatchState::Poisoned => false,
+            }
         };
         if removed {
             self.forget_generation.fetch_add(1, Ordering::Release);
@@ -262,18 +337,22 @@ impl EndStreamWatch {
     /// lock, so a concurrent operation is ordered entirely before or after
     /// poisoning.
     fn poison(&self) {
-        let newly_poisoned = {
-            let mut state = self.state.lock();
-            match &*state {
-                WatchState::Poisoned => false,
-                WatchState::Active(_) => {
-                    *state = WatchState::Poisoned;
-                    true
-                }
-            }
-        };
+        let newly_poisoned = Self::poison_locked(&mut self.state.lock());
         if newly_poisoned {
             self.forget_generation.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// Move `state` to [`WatchState::Poisoned`], reporting whether this call is
+    /// the one that did it. The caller owns the lock and therefore also owns
+    /// the `forget_generation` bump that has to follow a `true`.
+    fn poison_locked(state: &mut WatchState) -> bool {
+        match state {
+            WatchState::Poisoned => false,
+            WatchState::Active(_) => {
+                *state = WatchState::Poisoned;
+                true
+            }
         }
     }
 
@@ -291,8 +370,8 @@ impl EndStreamWatch {
             return;
         }
         let state = self.state.lock();
-        if let WatchState::Active(pending) = &*state {
-            if let Some(record) = pending.get(&stream_id) {
+        if let WatchState::Active(active) = &*state {
+            if let Some(record) = active.pending.get(&stream_id) {
                 record
                     .data_bytes
                     .fetch_add(payload_bytes, Ordering::Relaxed);
@@ -303,7 +382,7 @@ impl EndStreamWatch {
     /// Resolve a live stream for the scanner's bounded DATA fast path.
     fn data_record(&self, stream_id: u32) -> Option<Arc<StreamRecord>> {
         match &*self.state.lock() {
-            WatchState::Active(pending) => pending.get(&stream_id).cloned(),
+            WatchState::Active(active) => active.pending.get(&stream_id).cloned(),
             WatchState::Poisoned => None,
         }
     }
@@ -312,7 +391,7 @@ impl EndStreamWatch {
         let state = self.state.lock();
         stream_ids.map(|stream_id| {
             stream_id.is_some_and(|id| match &*state {
-                WatchState::Active(pending) => pending.contains_key(&id),
+                WatchState::Active(active) => active.pending.contains_key(&id),
                 WatchState::Poisoned => false,
             })
         })
@@ -336,34 +415,51 @@ impl EndStreamWatch {
     /// longer freezes `data_bytes`, so the returned [`TerminalFrameHandled`] must
     /// be handed to [`FrameScanner::drop_cache_after_publish`] before anything
     /// else touches the wire.
+    ///
+    /// The lock is held across the stores, not just across the removal. An
+    /// application that is giving up on the stream marks the record under this
+    /// same lock ([`Self::invalidate`]), and a store that escaped it could land
+    /// after that mark and resurrect evidence for a stream this side has
+    /// already reset.
     fn publish(&self, stream_id: u32, payload_bytes: usize) -> TerminalFrameHandled {
-        let record = match &mut *self.state.lock() {
-            WatchState::Active(pending) => pending.remove(&stream_id),
+        let mut state = self.state.lock();
+        let record = match &mut *state {
+            WatchState::Active(active) => active.pending.remove(&stream_id),
             WatchState::Poisoned => None,
         };
         if let Some(record) = record {
-            if payload_bytes != 0 {
-                record
-                    .data_bytes
-                    .fetch_add(payload_bytes, Ordering::Relaxed);
+            if !record.invalidated.load(Ordering::Acquire) {
+                if payload_bytes != 0 {
+                    record
+                        .data_bytes
+                        .fetch_add(payload_bytes, Ordering::Relaxed);
+                }
+                record.end_stream.store(true, Ordering::Release);
             }
-            record.end_stream.store(true, Ordering::Release);
         }
+        drop(state);
         TerminalFrameHandled(stream_id)
     }
 
     /// The peer tore down `stream_id` without having flagged END_STREAM.
     fn note_stream_torn_down(&self, stream_id: u32) {
-        if let WatchState::Active(pending) = &mut *self.state.lock() {
-            pending.remove(&stream_id);
+        if let WatchState::Active(active) = &mut *self.state.lock() {
+            active.pending.remove(&stream_id);
         }
     }
 
+    /// A HEADERS frame carrying END_STREAM was seen for `stream_id`.
+    ///
+    /// Gated on the invalidation flag for the same reason [`Self::publish`] is:
+    /// a stream this side has given up on must not gain wire evidence of any
+    /// kind afterwards.
     fn note_terminal_headers(&self, stream_id: u32) {
         let state = self.state.lock();
-        if let WatchState::Active(pending) = &*state {
-            if let Some(record) = pending.get(&stream_id) {
-                record.terminal_headers.store(true, Ordering::Release);
+        if let WatchState::Active(active) = &*state {
+            if let Some(record) = active.pending.get(&stream_id) {
+                if !record.invalidated.load(Ordering::Acquire) {
+                    record.terminal_headers.store(true, Ordering::Release);
+                }
             }
         }
     }
@@ -383,16 +479,50 @@ impl EndStreamWatch {
     /// the in-flight streams finish -- would otherwise clear the whole map on
     /// its first frame and send every in-flight stream back to the weaker
     /// end-of-body proofs.
-    fn note_connection_torn_down(&self, last_stream_id: u32) {
-        if let WatchState::Active(pending) = &mut *self.state.lock() {
-            pending.retain(|id, _| *id <= last_stream_id);
+    ///
+    /// The threshold is RETAINED, not just applied once: a stream registered
+    /// after this returns is checked against it too (see
+    /// [`Registration::register`]). Pruning the map alone would leave the
+    /// window RFC 9113 §6.8 closes on the peer's side wide open on ours -- a
+    /// later registration above the ceiling could still publish END_STREAM for
+    /// a stream `h2` errored out the moment it processed the GOAWAY.
+    ///
+    /// RFC 9113 §6.8 also forbids a later GOAWAY from RAISING `last_stream_id`.
+    /// A peer that does it anyway is either broken or trying to re-admit a
+    /// stream this connection has already written off, and there is no reading
+    /// of the frame sequence under which the evidence stays trustworthy, so
+    /// the whole connection is poisoned instead.
+    ///
+    /// Returns `false` when the GOAWAY was rejected and the connection
+    /// poisoned, which the caller must treat as terminal.
+    fn note_connection_torn_down(&self, last_stream_id: u32) -> bool {
+        let mut state = self.state.lock();
+        let active = match &mut *state {
+            WatchState::Active(active) => active,
+            // Nothing to apply and nothing to salvage; report the terminal
+            // state rather than an accepted GOAWAY.
+            WatchState::Poisoned => return false,
+        };
+        if active
+            .goaway_ceiling
+            .is_some_and(|ceiling| last_stream_id > ceiling)
+        {
+            let newly_poisoned = Self::poison_locked(&mut state);
+            drop(state);
+            if newly_poisoned {
+                self.forget_generation.fetch_add(1, Ordering::Release);
+            }
+            return false;
         }
+        active.goaway_ceiling = Some(last_stream_id);
+        active.pending.retain(|id, _| *id <= last_stream_id);
+        true
     }
 
     #[cfg(test)]
     fn pending_len(&self) -> usize {
         match &*self.state.lock() {
-            WatchState::Active(pending) => pending.len(),
+            WatchState::Active(active) => active.pending.len(),
             WatchState::Poisoned => 0,
         }
     }
@@ -400,7 +530,7 @@ impl EndStreamWatch {
     #[cfg(test)]
     fn has_pending(&self, stream_id: u32) -> bool {
         match &*self.state.lock() {
-            WatchState::Active(pending) => pending.contains_key(&stream_id),
+            WatchState::Active(active) => active.pending.contains_key(&stream_id),
             WatchState::Poisoned => false,
         }
     }
@@ -433,10 +563,21 @@ pub(crate) struct Registration<'a> {
 
 impl Registration<'_> {
     /// Start watching `stream_id`, returning its (initially blank) record.
+    ///
+    /// A poisoned connection, or a stream above a GOAWAY's `last_stream_id`,
+    /// still gets a record so that the caller needs no special case -- but it
+    /// is never entered into the map, so nothing on the wire can ever publish
+    /// it. Both are permanent: `h2` will not deliver such a stream's body, so a
+    /// blank record is exactly the right answer for the rest of its life.
     pub fn register(mut self, stream_id: u32) -> Arc<StreamRecord> {
         let record = Arc::new(StreamRecord::default());
-        if let WatchState::Active(pending) = &mut *self.state {
-            pending.insert(stream_id, record.clone());
+        if let WatchState::Active(active) = &mut *self.state {
+            if active
+                .goaway_ceiling
+                .is_none_or(|ceiling| stream_id <= ceiling)
+            {
+                active.pending.insert(stream_id, record.clone());
+            }
         }
         record
     }
@@ -552,6 +693,14 @@ impl FrameScanner {
 
     fn poison(&mut self, watch: &EndStreamWatch) {
         watch.poison();
+        self.reset_after_poison(watch);
+    }
+
+    /// Drop every piece of half-parsed wire state and every cached record, for
+    /// a `watch` that is ALREADY poisoned. Nothing here can publish afterwards;
+    /// the point is to stop the cache from counting into records nobody will
+    /// look at again, and to leave the scanner in a defined state.
+    fn reset_after_poison(&mut self, watch: &EndStreamWatch) {
         self.header_len = 0;
         self.payload_left = 0;
         self.goaway = None;
@@ -710,7 +859,9 @@ impl FrameScanner {
                     if let Some(terminal) = self.terminal_data.take() {
                         self.publish_end_stream(terminal.stream_id, terminal.payload_bytes, watch);
                     }
-                    self.finish_goaway(watch);
+                    if !self.finish_goaway(watch) {
+                        return;
+                    }
                 }
                 continue;
             }
@@ -790,36 +941,61 @@ impl FrameScanner {
                     self.clear_data_state(stream_id);
                 }
                 FRAME_TYPE_GOAWAY => {
-                    self.goaway = Some(LastStreamId::default());
-                    if self.payload_left == 0 {
-                        // Malformed (a GOAWAY payload is at least 8 bytes).
-                        self.finish_goaway(watch);
+                    // GOAWAY is a connection-control frame carrying a fixed
+                    // eight-octet header (`last_stream_id` plus `error_code`)
+                    // before any optional debug data. Either violation is a
+                    // connection error in `h2`, after which it delivers
+                    // nothing further -- so the frame names no trustworthy
+                    // ceiling and everything already recorded on this
+                    // connection has to be given up rather than trusted with a
+                    // guessed threshold.
+                    if stream_id != 0 || self.payload_left < GOAWAY_MIN_PAYLOAD_LEN {
+                        self.poison(watch);
+                        return;
                     }
+                    self.goaway = Some(LastStreamId::default());
                 }
                 _ => {}
             }
         }
     }
 
-    /// Dispatch the GOAWAY whose payload has just been fully skipped.
+    /// Dispatch the GOAWAY whose complete declared payload has just been
+    /// skipped -- the earliest point at which `h2` can act on the frame, and
+    /// therefore the earliest point at which its `last_stream_id` may be
+    /// applied. An EOF before that poisons instead, via
+    /// [`Self::has_partial_frame`].
     ///
-    /// A payload too short to carry the field cannot be trusted to name any
-    /// stream, so it clears every registration -- the conservative direction,
-    /// and the same one the pre-`last_stream_id` version of this took for every
-    /// GOAWAY.
-    fn finish_goaway(&mut self, watch: &EndStreamWatch) {
-        if let Some(goaway) = self.goaway.take() {
-            let last_stream_id = goaway.get().unwrap_or(0);
-            watch.note_connection_torn_down(last_stream_id);
-            for cached in &mut self.data_records {
-                if cached
-                    .as_ref()
-                    .is_some_and(|cached| cached.stream_id > last_stream_id)
-                {
-                    *cached = None;
-                }
+    /// Returns `false` when the GOAWAY was rejected and the connection
+    /// poisoned, meaning the caller must stop scanning.
+    #[must_use]
+    fn finish_goaway(&mut self, watch: &EndStreamWatch) -> bool {
+        let Some(goaway) = self.goaway.take() else {
+            return true;
+        };
+        let Some(last_stream_id) = goaway.get() else {
+            // Unreachable: a declared payload shorter than eight octets was
+            // already rejected at the frame header, and a payload that never
+            // arrived in full poisons at EOF. Fail closed rather than fall back
+            // to a guessed threshold if that ever stops holding.
+            self.poison(watch);
+            return false;
+        };
+        if !watch.note_connection_torn_down(last_stream_id) {
+            // Already poisoned under the watch's lock; only the scanner's own
+            // state is left to drop.
+            self.reset_after_poison(watch);
+            return false;
+        }
+        for cached in &mut self.data_records {
+            if cached
+                .as_ref()
+                .is_some_and(|cached| cached.stream_id > last_stream_id)
+            {
+                *cached = None;
             }
         }
+        true
     }
 }
 
@@ -1264,10 +1440,10 @@ mod tests {
         }
     }
 
-    /// A GOAWAY too short to carry `last_stream_id` names no stream, so nothing
-    /// may be trusted afterwards.
+    /// A GOAWAY too short to carry `last_stream_id` names no stream, so the
+    /// connection is poisoned and nothing may be trusted afterwards.
     #[test]
-    fn malformed_short_goaway_clears_everything() {
+    fn malformed_short_goaway_poisons_the_scanner() {
         let watch = EndStreamWatch::default();
         let flag = watch.register(1);
         let mut scanner = FrameScanner::default();
@@ -1326,30 +1502,36 @@ mod tests {
         }
     }
 
-    /// Final contract: every short GOAWAY is a connection-level parse error.
-    /// Once poisoning exists, no later frame may publish a stream record.
+    /// Final contract: every GOAWAY whose declared payload is shorter than the
+    /// fixed eight octets is a connection-level parse error, at every point the
+    /// reads happen to be split. No later frame may publish a stream record,
+    /// and no later registration may be entered into the map.
     #[test]
-    #[ignore = "requires the planned connection-poison state"]
-    fn final_contract_goaway_declared_lengths_one_through_seven_poison_the_scanner() {
-        for len in 1..=7 {
-            let watch = EndStreamWatch::default();
-            let record = watch.register(1);
-            let mut scanner = FrameScanner::default();
+    fn final_contract_goaway_declared_lengths_zero_through_seven_poison_the_scanner() {
+        for len in 0..=7 {
             let mut wire = frame(FRAME_TYPE_GOAWAY, 0, 0, &short_goaway_payload(len, 1));
             wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"late"));
-            scanner.scan(&wire, &watch);
+            for split in 1..=wire.len() {
+                let watch = EndStreamWatch::default();
+                let record = watch.register(1);
+                let mut scanner = FrameScanner::default();
+                for chunk in wire.chunks(split) {
+                    scanner.scan(chunk, &watch);
+                }
 
-            assert!(!record.end_stream_observed(), "declared length={len}");
-            let later = watch.register(3);
-            scanner.scan(
-                &frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b"later"),
-                &watch,
-            );
-            assert!(
-                !later.end_stream_observed(),
-                "declared length={len} must poison later registrations"
-            );
-            assert_eq!(watch.pending_len(), 0, "declared length={len}");
+                let case = format!("declared length={len}, split={split}");
+                assert!(!record.end_stream_observed(), "{case}");
+                let later = watch.register(3);
+                scanner.scan(
+                    &frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b"later"),
+                    &watch,
+                );
+                assert!(
+                    !later.end_stream_observed(),
+                    "{case} must poison later registrations"
+                );
+                assert_eq!(watch.pending_len(), 0, "{case}");
+            }
         }
     }
 
@@ -1371,7 +1553,6 @@ mod tests {
     /// Final contract: GOAWAY is a connection frame and a nonzero stream id
     /// poisons the scanner permanently.
     #[test]
-    #[ignore = "requires the planned connection-poison state"]
     fn final_contract_goaway_on_a_nonzero_stream_poisons_the_scanner() {
         let watch = EndStreamWatch::default();
         let record = watch.register(3);
@@ -1433,7 +1614,6 @@ mod tests {
     /// last-stream id, so the sequence poisons even streams below the old
     /// threshold.
     #[test]
-    #[ignore = "requires tracking the prior GOAWAY and poisoning increases"]
     fn final_contract_increasing_goaway_last_stream_id_poisons_the_scanner() {
         let watch = EndStreamWatch::default();
         let survivor = watch.register(1);
@@ -1453,10 +1633,83 @@ mod tests {
         assert_eq!(watch.pending_len(), 0);
     }
 
-    /// An empty GOAWAY payload must be dispatched at the header, not left
-    /// waiting for payload bytes that never come.
+    /// Final contract: the GOAWAY ceiling outlives the frame that carried it.
+    /// A stream registered AFTER the GOAWAY is one `h2` errored out the moment
+    /// it processed that frame, so its END_STREAM must never be published --
+    /// while a stream at or below the ceiling keeps publishing normally.
     #[test]
-    fn empty_goaway_payload_is_dispatched_immediately() {
+    fn final_contract_goaway_ceiling_persists_for_later_registrations() {
+        let watch = EndStreamWatch::default();
+        let kept = watch.register(3);
+        let mut scanner = FrameScanner::default();
+        scanner.scan(&frame(FRAME_TYPE_GOAWAY, 0, 0, &goaway_payload(3)), &watch);
+
+        let later = watch.register(5);
+        let mut wire = frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 5, b"later");
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b"kept"));
+        scanner.scan(&wire, &watch);
+
+        assert!(
+            !later.end_stream_observed(),
+            "a stream above the ceiling must not publish, however late it registers"
+        );
+        assert!(
+            kept.vouches_for(4),
+            "the ceiling must not retract survivors"
+        );
+    }
+
+    /// The reserved bit of the GOAWAY frame's own stream identifier is ignored
+    /// on receipt (RFC 9113 §4.1), so it still names stream 0 and the frame
+    /// stays legal.
+    #[test]
+    fn goaway_frame_reserved_stream_id_bit_is_masked_and_stays_legal() {
+        let watch = EndStreamWatch::default();
+        let kept = watch.register(1);
+        let excluded = watch.register(3);
+        let mut scanner = FrameScanner::default();
+        let mut wire = frame(FRAME_TYPE_GOAWAY, 0, 0x8000_0000, &goaway_payload(1));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"a"));
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b"b"));
+        scanner.scan(&wire, &watch);
+
+        assert!(kept.vouches_for(1));
+        assert!(!excluded.end_stream_observed());
+    }
+
+    /// The error code and any trailing debug data do not change which streams
+    /// a GOAWAY excludes: only `last_stream_id` does. A non-`NO_ERROR` GOAWAY
+    /// is still a well-formed frame at this layer.
+    #[test]
+    fn goaway_error_code_and_debug_data_variants_apply_the_same_ceiling() {
+        // NO_ERROR, PROTOCOL_ERROR, ENHANCE_YOUR_CALM.
+        for error_code in [0u32, 1, 11] {
+            for debug_data in [&b""[..], &b"shutting down"[..]] {
+                let watch = EndStreamWatch::default();
+                let kept = watch.register(1);
+                let excluded = watch.register(3);
+                let mut scanner = FrameScanner::default();
+
+                let mut payload = 1u32.to_be_bytes().to_vec();
+                payload.extend_from_slice(&error_code.to_be_bytes());
+                payload.extend_from_slice(debug_data);
+                let mut wire = frame(FRAME_TYPE_GOAWAY, 0, 0, &payload);
+                wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"a"));
+                wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b"b"));
+                scanner.scan(&wire, &watch);
+
+                let case = format!("error_code={error_code}, debug_data={}", debug_data.len());
+                assert!(kept.vouches_for(1), "{case}");
+                assert!(!excluded.end_stream_observed(), "{case}");
+            }
+        }
+    }
+
+    /// An empty GOAWAY payload must be decided at the header, not left waiting
+    /// for payload bytes that never come. It is shorter than the fixed eight
+    /// octets, so the decision is rejection.
+    #[test]
+    fn empty_goaway_payload_is_rejected_at_the_header() {
         let watch = EndStreamWatch::default();
         let flag = watch.register(1);
         let mut scanner = FrameScanner::default();
@@ -1811,6 +2064,105 @@ mod tests {
         assert_eq!(watch.pending_len(), 0);
     }
 
+    /// H2-006's deterministic barrier: this side gives up on the stream FIRST,
+    /// and only then does the peer's terminal evidence -- a complete body
+    /// followed by RST_STREAM(NO_ERROR), the RFC 9113 section 8.1 shape --
+    /// reach the scanner. Every handle on the record, the session's and the h2
+    /// pump's alike, must still read as "no wire proof".
+    #[test]
+    fn a_local_invalidation_blocks_the_peers_later_terminal_evidence() {
+        let watch = EndStreamWatch::default();
+        let session_handle = watch.register(1);
+        // The proxy's request-body pump samples its own clone of the same
+        // record before the exchange starts.
+        let pump_handle = session_handle.clone();
+        let mut scanner = FrameScanner::default();
+        scanner.scan(&frame(FRAME_TYPE_DATA, 0, 1, b"body"), &watch);
+
+        watch.invalidate(1, Some(&session_handle));
+
+        let mut wire = frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"!");
+        wire.extend_from_slice(&frame(FRAME_TYPE_RST_STREAM, 0, 1, &[0, 0, 0, 0]));
+        scanner.scan(&wire, &watch);
+
+        assert!(!session_handle.end_stream_observed());
+        assert!(!pump_handle.end_stream_observed());
+        assert!(!session_handle.vouches_for(5));
+        assert!(!pump_handle.vouches_for(5));
+        assert_eq!(watch.pending_len(), 0);
+    }
+
+    /// The invalidation flag carries the guarantee on its own, independently of
+    /// the map removal that accompanies it: a record still in the map does not
+    /// gain END_STREAM once it is marked. That is what makes the invariant hold
+    /// for the `Arc` clones a removal cannot reach.
+    #[test]
+    fn publication_refuses_an_invalidated_record_still_in_the_map() {
+        let watch = EndStreamWatch::default();
+        let record = watch.register(1);
+        record.invalidated.store(true, Ordering::Release);
+        let mut scanner = FrameScanner::default();
+
+        scanner.scan(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"body"), &watch);
+
+        assert!(!record.end_stream_observed());
+        assert!(!record.vouches_for(4));
+        assert_eq!(watch.pending_len(), 0);
+    }
+
+    #[test]
+    fn terminal_headers_are_refused_for_an_invalidated_record() {
+        let watch = EndStreamWatch::default();
+        let record = watch.register(1);
+        record.invalidated.store(true, Ordering::Release);
+        let mut scanner = FrameScanner::default();
+
+        scanner.scan(
+            &frame(FRAME_TYPE_HEADERS, FLAG_END_STREAM | 0x4, 1, b"\x88"),
+            &watch,
+        );
+
+        assert!(!record.terminal_headers_observed());
+        assert!(!record.end_stream_observed());
+    }
+
+    /// Evidence that was already published when the application gave up is NOT
+    /// retracted: the peer flagged the end of its body strictly before this
+    /// side decided to reset, so the body was whole before we walked away from
+    /// it. `note_local_reset` documents this as deliberate, and
+    /// `upstream_write_error_outcome` in `pingora-proxy` depends on it.
+    #[test]
+    fn invalidation_does_not_retract_evidence_published_before_it() {
+        let watch = EndStreamWatch::default();
+        let record = watch.register(1);
+        let mut scanner = FrameScanner::default();
+        scanner.scan(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"body"), &watch);
+
+        watch.invalidate(1, Some(&record));
+
+        assert!(record.end_stream_observed());
+        assert!(record.vouches_for(4));
+    }
+
+    /// Invalidating an abandoned stream must not cost a distinct later stream
+    /// its evidence, and the later stream must not inherit the abandoned one's.
+    #[test]
+    fn an_invalidated_stream_neither_poisons_nor_feeds_a_later_one() {
+        let watch = EndStreamWatch::default();
+        let abandoned = watch.register(1);
+        let mut scanner = FrameScanner::default();
+        scanner.scan(&frame(FRAME_TYPE_DATA, 0, 1, b"old"), &watch);
+
+        watch.invalidate(1, Some(&abandoned));
+        let replacement = watch.register(3);
+        scanner.scan(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 3, b"new"), &watch);
+
+        assert!(!abandoned.end_stream_observed());
+        assert!(!abandoned.vouches_for(3));
+        assert!(replacement.vouches_for(3));
+        assert_eq!(watch.pending_len(), 0);
+    }
+
     #[test]
     fn a_cached_record_is_frozen_after_end_stream() {
         let watch = EndStreamWatch::default();
@@ -2139,6 +2491,13 @@ mod tests {
         let stream_ids: Vec<u32> = (1..=9u32).step_by(2).collect();
 
         let mut wire = Vec::new();
+        // RFC 9113 §6.8 forbids a later GOAWAY from raising `last_stream_id`,
+        // and the scanner now poisons when one does -- which would turn the
+        // whole tail of a history into no-ops in all four configurations and
+        // hollow out the differential. Keep the generated sequence monotone
+        // non-increasing so the comparison keeps its reach; the illegal
+        // direction has its own dedicated contract test.
+        let mut goaway_ceiling = u32::MAX;
         for _ in 0..24 {
             let stream_id = stream_ids[rng.below(stream_ids.len())];
             let payload = vec![0x5a; rng.below(6)];
@@ -2163,12 +2522,15 @@ mod tests {
                     b"\x88",
                 )),
                 7 => wire.extend_from_slice(&frame(FRAME_TYPE_RST_STREAM, 0, stream_id, &[0; 4])),
-                8 => wire.extend_from_slice(&frame(
-                    FRAME_TYPE_GOAWAY,
-                    0,
-                    0,
-                    &goaway_payload(stream_id),
-                )),
+                8 => {
+                    goaway_ceiling = goaway_ceiling.min(stream_id);
+                    wire.extend_from_slice(&frame(
+                        FRAME_TYPE_GOAWAY,
+                        0,
+                        0,
+                        &goaway_payload(goaway_ceiling),
+                    ));
+                }
                 // CONTINUATION: a type the scanner must skip by length only.
                 _ => wire.extend_from_slice(&frame(0x9, 0, stream_id, &payload)),
             }

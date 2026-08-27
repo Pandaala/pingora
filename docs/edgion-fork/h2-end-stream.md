@@ -31,6 +31,37 @@ trailers latch a body error, so a later reset cannot launder them into success.
 The wire flag alone never decides response success; it is consulted only in
 the strict reset/error path.
 
+## GOAWAY eligibility
+
+A GOAWAY's `last_stream_id` is retained as a connection ceiling, not applied
+once. Streams above it can never publish wire evidence, whether they were
+registered before the frame or after it, because `h2` errors such a stream out
+as soon as it processes the GOAWAY and never delivers its body.
+
+The ceiling is only taken from a frame the peer is allowed to send. A GOAWAY on
+a nonzero stream id, one whose declared payload is shorter than the fixed eight
+octets, one truncated by EOF, or a later GOAWAY that raises `last_stream_id`
+are all connection errors after which `h2` delivers nothing further. None of
+them names a threshold worth trusting, so each poisons the observer for the
+rest of the connection instead of contributing a guessed ceiling. Poisoning
+only withdraws wire evidence: affected responses fall back to the other three
+proofs, and the byte stream handed to `h2` is unchanged either way.
+
+## Local reset ordering
+
+Giving up wire evidence for a stream this side resets is an irreversible mark
+on the shared record, and it is made BEFORE the local RST_STREAM is queued.
+Dropping the pending-map entry is not sufficient on its own: the session and
+the request-body pump already hold `Arc` clones of that record, so a
+publication winning the race would set END_STREAM on handles no later removal
+can reach. Publication reads the mark under the same lock, which makes the two
+orderings decidable rather than racy.
+
+Evidence published strictly before the mark is kept. The peer flagged the end
+of its body before this side decided to walk away, so the body was whole at
+that point; retracting it would fail exchanges whose response was already in
+hand.
+
 ## Version-tolerant tests
 
 Current `h2` releases may preserve END_STREAM after a later reset, while older

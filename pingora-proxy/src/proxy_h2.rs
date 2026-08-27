@@ -647,14 +647,15 @@ where
                 // The sibling upstream future was dropped mid-flight, so the request
                 // stream is still open: reset it to stop the upstream from working on
                 // a request nobody will read.
-                client_body.send_reset(h2::Reason::CANCEL);
                 // A locally reset stream may no longer be judged by the wire
                 // END_STREAM record: `h2` starts DROPPING the DATA it decodes,
                 // while a peer RST_STREAM landing afterwards can still surface
                 // as a remote NO_ERROR. Nothing reads this stream after this
                 // point, so this is enforcement of an invariant rather than a
-                // fix -- see `Http2Session::note_local_reset`.
+                // fix -- see `Http2Session::note_local_reset`, which also
+                // explains why it has to run BEFORE the reset is queued.
                 client_session.note_local_reset();
+                client_body.send_reset(h2::Reason::CANCEL);
                 release_cache_on_terminate(session);
                 // Downstream hygiene is keyed by the DOWNSTREAM protocol, not by the
                 // upstream one this pump was selected for: an H1 client proxied to an
@@ -681,8 +682,9 @@ where
                 DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(downstream_can_reuse),
                 _,
             ))) => {
-                client_body.send_reset(h2::Reason::CANCEL);
+                // Invalidate before resetting; see `note_local_reset`.
                 client_session.note_local_reset();
+                client_body.send_reset(h2::Reason::CANCEL);
                 (downstream_can_reuse, None)
             }
             Some(Err(e)) => {
@@ -694,6 +696,15 @@ where
                 // Also cancel the upstream stream when downstream goes away/resets so the
                 // upstream peer can release the stream promptly.
                 // TODO: implement for write timeouts?
+                //
+                // Whether or not the explicit reset below is sent, this arm
+                // abandons the upstream request stream: `client_body` is
+                // dropped on return and `h2` cancels a still-open stream when
+                // its last handle goes away. Source (iv) is given up either
+                // way, so record it unconditionally -- and ahead of the reset,
+                // because a record published in between could no longer be
+                // retracted. See `Http2Session::note_local_reset`.
+                client_session.note_local_reset();
                 if upstream_read_timeout || downstream_error {
                     client_body.send_reset(h2::Reason::CANCEL);
                     if upstream_read_timeout {
@@ -702,13 +713,6 @@ where
                         client_session.conn.mark_shutdown();
                     }
                 }
-                // Whether or not the explicit reset above was sent, this arm
-                // abandons the upstream request stream: `client_body` is
-                // dropped on return and `h2` cancels a still-open stream when
-                // its last handle goes away. Source (iv) is given up either
-                // way, so record it here rather than only on the explicit
-                // reset -- see `Http2Session::note_local_reset`.
-                client_session.note_local_reset();
                 (false, Some(e))
             }
         }
