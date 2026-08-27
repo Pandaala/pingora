@@ -62,6 +62,11 @@ pub struct Http2Session {
     // the later public `read_trailers` call.
     response_trailers: Option<Option<HeaderMap>>,
     response_body_error: bool,
+    // Set only after the final response headers pass Pingora validation and
+    // h2 reports that those initial headers carried END_STREAM. This keeps a
+    // wire-level terminal HEADERS observation from misclassifying a valid
+    // header-only response as lost trailers.
+    response_initial_end_stream: bool,
     /// The read timeout, which will be applied to both reading the header and the body.
     /// The timeout is reset on every read. This is not a timeout on the overall duration of the
     /// response.
@@ -141,10 +146,10 @@ impl PeerEndStream {
         self.0.as_ref().is_some_and(|r| r.vouches_for(body_recv))
     }
 
-    fn terminal_headers_after_data(&self) -> bool {
+    fn terminal_headers_observed(&self) -> bool {
         self.0
             .as_ref()
-            .is_some_and(|r| r.terminal_headers_after_data())
+            .is_some_and(|r| r.terminal_headers_observed())
     }
 }
 
@@ -221,6 +226,7 @@ impl Http2Session {
             response_body_reader: None,
             response_trailers: None,
             response_body_error: false,
+            response_initial_end_stream: false,
             read_timeout: None,
             write_timeout: None,
             conn,
@@ -532,6 +538,8 @@ impl Http2Session {
         self.response_body_declared_len = super::server::declared_body_length(&resp.headers);
         let response_header = ResponseHeader::from(resp);
         validate_response_header(&response_header)?;
+        self.response_initial_end_stream = body_reader.is_end_stream();
+        self.response_body_eof = self.response_initial_end_stream;
         self.response_header = Some(response_header);
         self.response_body_reader = Some(body_reader);
 
@@ -556,6 +564,8 @@ impl Http2Session {
             return Poll::Ready(Err(Reason::PROTOCOL_ERROR.into()));
         }
 
+        self.response_initial_end_stream = body_reader.is_end_stream();
+        self.response_body_eof = self.response_initial_end_stream;
         self.response_header = Some(response_header);
         self.response_body_reader = Some(body_reader);
 
@@ -658,7 +668,8 @@ impl Http2Session {
             match trailers {
                 Ok(trailers) => {
                     if trailers.as_ref().is_none_or(HeaderMap::is_empty)
-                        && self.peer_end_stream.terminal_headers_after_data()
+                        && self.peer_end_stream.terminal_headers_observed()
+                        && !self.response_initial_end_stream
                     {
                         self.response_body_error = true;
                         return Error::e_explain(
@@ -728,7 +739,8 @@ impl Http2Session {
         match ready!(body_reader.poll_trailers(cx)) {
             Ok(trailers) => {
                 if trailers.as_ref().is_none_or(HeaderMap::is_empty)
-                    && self.peer_end_stream.terminal_headers_after_data()
+                    && self.peer_end_stream.terminal_headers_observed()
+                    && !self.response_initial_end_stream
                 {
                     self.response_body_error = true;
                     return Poll::Ready(Some(Err(Reason::PROTOCOL_ERROR.into())));
@@ -1978,11 +1990,11 @@ mod tests_h2 {
         }
     }
 
-    /// Target contract for the narrowed watcher. The current byte-count watch
-    /// treats validated empty trailers after DATA as unvalidated terminal
-    /// HEADERS, so this remains ignored until that implementation is replaced.
+    /// Target contract after h2 can distinguish a validated empty trailer map
+    /// from a pseudo-header block whose forbidden fields were discarded. The
+    /// current fail-closed adapter rejects both shapes, so this remains deferred.
     #[tokio::test]
-    #[ignore = "current watcher falsely rejects validated empty trailers after DATA"]
+    #[ignore = "current fail-closed adapter cannot accept validated empty trailers"]
     async fn h2_watched_valid_empty_trailers_are_clean_with_or_without_data() {
         for body in [&b""[..], &b"hello"[..]] {
             let h2s = raw_reset_session(
@@ -2009,12 +2021,9 @@ mod tests_h2 {
         }
     }
 
-    /// Target contract for terminal HEADERS even when the response has no DATA.
-    /// The current watcher publishes its terminal-headers marker only after it
-    /// has counted DATA, allowing h2's following reset to launder this codec
-    /// error into a clean EOF.
+    /// Terminal HEADERS must remain observable even when the response has no
+    /// DATA, or h2's following reset can launder this codec error into clean EOF.
     #[tokio::test]
-    #[ignore = "current watcher misses invalid terminal HEADERS on zero-DATA responses"]
     async fn h2_watched_zero_data_invalid_trailers_remain_an_error() {
         let mut h2s = raw_reset_session(
             response_with_trailers(&[], RESP_200),
@@ -2026,6 +2035,24 @@ mod tests_h2 {
             .await
             .expect_err("a response pseudo-header in trailers must remain an error");
         assert_eq!(err.etype(), &ReadError);
+        h2s.read_trailers()
+            .await
+            .expect_err("the invalid trailer result must stay latched");
+    }
+
+    #[tokio::test]
+    async fn h2_watched_poll_zero_data_invalid_trailers_remain_an_error() {
+        let mut h2s = raw_reset_session(
+            response_with_trailers(&[], RESP_200),
+            EndStreamObservation::Watched,
+        )
+        .await;
+        let err = std::future::poll_fn(|cx| h2s.poll_read_response_body(cx))
+            .await
+            .expect("the terminal body poll must report the trailer failure")
+            .expect_err("a response pseudo-header in trailers must remain an error");
+        assert_eq!(err.reason(), Some(Reason::PROTOCOL_ERROR));
+        assert!(h2s.response_body_error);
         h2s.read_trailers()
             .await
             .expect_err("the invalid trailer result must stay latched");
@@ -2057,6 +2084,34 @@ mod tests_h2 {
         }
     }
 
+    /// Delay the first response-future poll until after the origin has flushed
+    /// both header-only EOS and its reset. h2 >= 0.4.16 preserves received EOS
+    /// across that reset; the client must latch it when the queued final response
+    /// is eventually accepted instead of mistaking the wire marker for trailers.
+    #[tokio::test]
+    async fn h2_header_only_response_latches_eos_after_delayed_header_poll() {
+        let (client_io, server_io) = duplex(65536);
+        let frames = raw_frame(0x1, 0x4 | FLAG_END_STREAM_RAW, 1, RESP_200);
+        let flushed = serve_raw_burst_then_no_error_reset(server_io, frames);
+        let mut h2s = watched_client_session(client_io).await;
+
+        let mut req = RequestHeader::build("POST", b"/", None).unwrap();
+        req.insert_header(http::header::HOST, "example.com")
+            .unwrap();
+        h2s.write_request_header(Box::new(req), false).unwrap();
+        flushed
+            .await
+            .expect("the raw origin must flush header-only EOS and reset");
+        await_reset_processed(&h2s).await;
+
+        h2s.read_response_header().await.unwrap();
+        assert!(
+            h2s.response_initial_end_stream,
+            "received initial EOS must survive a reset before the first header poll"
+        );
+        assert_clean_response(h2s, None, None).await;
+    }
+
     fn prepend_informational(prefixes: &[&[u8]], mut final_frames: Vec<u8>) -> Vec<u8> {
         let mut frames = Vec::new();
         for block in prefixes {
@@ -2068,7 +2123,7 @@ mod tests_h2 {
 
     /// Informational responses are consumed by h2's response future and must
     /// not affect how the adapter classifies the final response. Exercise one
-    /// and multiple prefixes across every legal terminal shape.
+    /// and multiple prefixes across every currently unambiguous terminal shape.
     #[tokio::test]
     async fn h2_informational_prefixes_preserve_final_response_shapes() {
         let mut nonempty = HeaderMap::new();
@@ -2091,7 +2146,6 @@ mod tests_h2 {
                 Some(&b"hello"[..]),
                 None,
             ),
-            (vec![RESP_103], response_with_trailers(&[], &[]), None, None),
             (
                 vec![RESP_100, RESP_103],
                 response_with_trailers(b"hello", TRAILER_BLOCK),
@@ -2110,6 +2164,17 @@ mod tests_h2 {
                 assert_clean_response(h2s, *body, trailers.clone()).await;
             }
         }
+    }
+
+    /// Deferred with the other valid-empty controls: the current h2 public API
+    /// cannot distinguish this from a trailer pseudo-header block whose fields
+    /// were discarded before a same-burst reset.
+    #[tokio::test]
+    #[ignore = "requires decoder-level rejection before valid empty trailers can be accepted"]
+    async fn h2_watched_informational_prefix_preserves_valid_empty_trailers() {
+        let frames = prepend_informational(&[RESP_103], response_with_trailers(&[], &[]));
+        let h2s = raw_reset_session(frames, EndStreamObservation::Watched).await;
+        assert_clean_empty_trailers(h2s, None).await;
     }
 
     /// An informational response cannot end the stream. This must fail while
@@ -2225,7 +2290,7 @@ mod tests_h2 {
             !h2s.peer_end_stream.observed(),
             "unvalidated trailers must not publish clean-EOF evidence"
         );
-        assert!(h2s.peer_end_stream.terminal_headers_after_data());
+        assert!(h2s.peer_end_stream.terminal_headers_observed());
 
         let err = h2s.read_response_body().await.expect_err(
             "5 of a declared 10 bytes must not read as a clean EOF just because the \
@@ -2266,7 +2331,7 @@ mod tests_h2 {
             "unvalidated trailer END_STREAM must not be completion evidence"
         );
         assert!(
-            h2s.peer_end_stream.terminal_headers_after_data(),
+            h2s.peer_end_stream.terminal_headers_observed(),
             "the wire watcher must retain the unvalidated terminal trailers"
         );
 

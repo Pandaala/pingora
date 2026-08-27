@@ -137,9 +137,10 @@ pub(crate) struct StreamRecord {
     /// i.e. exactly what `h2` hands to the reader for a frame it queues --
     /// carried on the wire for this stream before `end_stream` was set.
     data_bytes: AtomicUsize,
-    /// A HEADERS END_STREAM observed after response DATA. This may be valid
-    /// trailers or an invalid header block; only h2's decoded result can decide.
-    terminal_headers_after_data: AtomicBool,
+    /// A HEADERS END_STREAM observed on the wire. This may be valid initial
+    /// headers, valid trailers, or an invalid header block; only h2's decoded
+    /// result can decide.
+    terminal_headers: AtomicBool,
 }
 
 impl StreamRecord {
@@ -170,8 +171,8 @@ impl StreamRecord {
             && self.data_bytes.load(Ordering::Relaxed) == body_recv
     }
 
-    pub fn terminal_headers_after_data(&self) -> bool {
-        self.terminal_headers_after_data.load(Ordering::Acquire)
+    pub fn terminal_headers_observed(&self) -> bool {
+        self.terminal_headers.load(Ordering::Acquire)
     }
 }
 
@@ -362,11 +363,7 @@ impl EndStreamWatch {
         let state = self.state.lock();
         if let WatchState::Active(pending) = &*state {
             if let Some(record) = pending.get(&stream_id) {
-                if record.data_bytes.load(Ordering::Relaxed) != 0 {
-                    record
-                        .terminal_headers_after_data
-                        .store(true, Ordering::Release);
-                }
+                record.terminal_headers.store(true, Ordering::Release);
             }
         }
     }
@@ -1091,6 +1088,21 @@ mod tests {
         ));
         scanner.scan(&wire, &watch);
         assert!(!record.vouches_for(5));
+        assert!(record.terminal_headers_observed());
+    }
+
+    /// Terminal HEADERS are relevant even when no response DATA preceded them:
+    /// malformed zero-DATA trailers can otherwise be hidden by a later reset.
+    #[test]
+    fn terminal_headers_are_recorded_without_data() {
+        let watch = EndStreamWatch::default();
+        let record = watch.register(1);
+        let mut scanner = FrameScanner::default();
+        scanner.scan(
+            &frame(FRAME_TYPE_HEADERS, FLAG_END_STREAM | 0x4, 1, b"\x88"),
+            &watch,
+        );
+        assert!(record.terminal_headers_observed());
     }
 
     /// Once a stream's outcome is decided its record is frozen: a protocol
