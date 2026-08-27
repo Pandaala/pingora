@@ -520,6 +520,15 @@ impl ProxyHttp for ExampleProxyHttp {
             peer.options.read_timeout = Some(std::time::Duration::from_millis(ms));
         }
 
+        if let Some(ms) = req
+            .headers
+            .get("x-write-timeout-ms")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            peer.options.write_timeout = Some(std::time::Duration::from_millis(ms));
+        }
+
         Ok(peer)
     }
 

@@ -25,6 +25,7 @@ use http::{header::CONTENT_LENGTH, Method, StatusCode};
 use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
 use pingora_core::protocols::http::v2::{
     client::{Http2Session, PeerEndStream},
+    server::Idle,
     write_body,
 };
 
@@ -238,29 +239,69 @@ struct UpstreamBodyWrite {
 /// cleanly, reset or not, and it stays set for the life of the exchange. Taken
 /// alone it would therefore swallow every request-body write failure that can
 /// happen after the response arrives, including ones that have nothing to do
-/// with the peer having stopped listening -- most importantly a locally
-/// configured `write_timeout` expiring. An origin that answers a POST in full
-/// and then simply stops granting flow-control window would silently truncate
-/// the upstream request body and be logged a success. So the classification
-/// also requires the failure SHAPE to mean "the stream is gone"; see
-/// [`upstream_write_failed_because_stream_gone`].
+/// with the peer having stopped listening -- an application body filter's own
+/// error, the `Bodyless` contract violation, a cache failure. So the
+/// classification also requires the failure SHAPE to be one the peer's
+/// behavior explains. Exactly two shapes qualify:
+///
+/// - [`upstream_write_failed_because_stream_gone`] -- h2 will never take
+///   another byte on this stream, because the stream is closed or the whole
+///   connection is.
+/// - [`upstream_write_stalled_after_response`] -- the stream is still there,
+///   but the peer granted no flow-control capacity for a whole `write_timeout`
+///   window after having already flagged its response complete.
+///
+/// # Why the stalled shape is accepted, having once been refused
+///
+/// The second shape used to be refused on the grounds that a locally
+/// configured `write_timeout` is not a peer signal, and that swallowing it
+/// would truncate the upstream request body and report a success. That
+/// reasoning rests on a premise which holds for the reset shape and fails for
+/// this one: that the response is already safely in hand. It is not. The pump
+/// awaits the request-body write INLINE in the duplex loop's downstream arm
+/// (see `bidirection_down_to_up`), so while that write is blocked the loop is
+/// not draining `rx` either, and the upstream response tasks sit undelivered
+/// in a `TASK_BUFFER_SIZE` channel. Failing the exchange therefore answers the
+/// client with a 502 while a complete response is sitting in the proxy's own
+/// buffer -- and with no `write_timeout` configured at all the write never
+/// returns and the client is answered never (that is what the stall probe in
+/// `send_body_to2` bounds).
+///
+/// Delivering the response the origin actually sent is the best of those three
+/// outcomes, and it conceals nothing:
+///
+/// - The origin learns. The request half never receives its END_STREAM, so
+///   dropping the `SendStream` at the end of the exchange makes h2 emit
+///   RST_STREAM(CANCEL) -- the standard "upload aborted" signal. An origin
+///   that really was still consuming the body sees a truncated request rather
+///   than a whole one.
+/// - The operator learns. The swallow is logged at `warn` with the failure
+///   attached.
+/// - The response is not laundered. As above, completeness is still decided
+///   exclusively by the read half.
 fn upstream_write_error_outcome(
     e: Box<Error>,
     terminal_event_delivered: bool,
     body_write: &UpstreamBodyWrite,
 ) -> Result<UpstreamBodyOutcome> {
-    if body_write.upstream_response_ended.observed()
-        && upstream_write_failed_because_stream_gone(&e)
-    {
+    if !body_write.upstream_response_ended.observed() {
+        return Err(e.into_up());
+    }
+    if upstream_write_failed_because_stream_gone(&e) {
         warn!(
             "upstream stopped receiving the request body after flagging its response complete: {e}"
         );
-        Ok(UpstreamBodyOutcome::UpstreamDoneReceiving {
-            terminal_event_delivered,
-        })
+    } else if upstream_write_stalled_after_response(&e) {
+        warn!(
+            "upstream granted no request-body capacity for a whole write window after flagging \
+             its response complete; the upstream request body is truncated: {e}"
+        );
     } else {
-        Err(e.into_up())
+        return Err(e.into_up());
     }
+    Ok(UpstreamBodyOutcome::UpstreamDoneReceiving {
+        terminal_event_delivered,
+    })
 }
 
 /// Whether a failed `write_body` means the upstream request stream is GONE, as
@@ -280,12 +321,36 @@ fn upstream_write_failed_because_stream_gone(e: &Error) -> bool {
         WriteError => true,
         // A LOCAL deadline, from `peer.options.write_timeout`. The stream may be
         // perfectly alive and the peer merely slow (or withholding flow-control
-        // window). Swallowing this would truncate the upstream request body and
-        // report success, so it is not a peer signal and must not be treated as
-        // one.
+        // window), so it is NOT evidence that the stream is gone and the answer
+        // here stays `false`. It is nonetheless swallowed when the peer had
+        // already flagged its response complete -- but through the separate
+        // [`upstream_write_stalled_after_response`] shape, which asks a
+        // different question. See `upstream_write_error_outcome`.
         WriteTimedout => false,
         _ => false,
     }
+}
+
+/// Whether a failed `write_body` means the upstream request stream is STALLED
+/// after having already answered, as opposed to being GONE.
+///
+/// Deliberately a separate question from
+/// [`upstream_write_failed_because_stream_gone`]: that one asks whether h2 will
+/// ever take another byte on this stream, and a local deadline genuinely does
+/// not answer it. This one is only ever asked in conjunction with
+/// `upstream_response_ended`, and the conjunction is what carries the meaning.
+/// Neither half means anything alone -- a timeout without the wire flag is just
+/// a slow origin and must keep failing the exchange, and the wire flag without
+/// a timeout is the ordinary early-response shape that must keep uploading,
+/// because RFC 9113 lets a server that has answered in full go on receiving the
+/// request body.
+fn upstream_write_stalled_after_response(e: &Error) -> bool {
+    // The one shape `write_body` gives a stall. Note that `write_timeout`
+    // bounds ONE `reserve_and_send`, i.e. one capacity grant, and is re-armed
+    // for each -- so this is "the peer granted nothing for a whole window", not
+    // "the chunk was too large to finish in time". A peer that keeps granting
+    // window, however slowly, never produces it.
+    matches!(e.etype, WriteTimedout)
 }
 
 /// How long the downstream request body may be drained for once the pump has
@@ -329,6 +394,108 @@ fn bound_undrained_downstream_body(session: &mut Session) {
     session
         .as_mut()
         .set_total_drain_timeout(Some(ABANDONED_BODY_DRAIN_TIMEOUT));
+}
+
+/// How often a request-body write that is blocked on upstream flow control
+/// re-checks whether the upstream has already flagged its response complete.
+///
+/// This is a PROBE interval, not a deadline: its expiry decides nothing on its
+/// own. It only creates the opportunity to sample `upstream_response_ended`,
+/// which is the fact that makes abandoning the upload safe. With no such
+/// evidence the write goes on waiting exactly as it did before.
+///
+/// Armed ONLY when the caller configured no `write_timeout` of its own. A
+/// consumer that set one has already said how long a stalled write may last,
+/// and a probe firing first would silently override that configuration; the
+/// stalled case then arrives through [`upstream_write_stalled_after_response`]
+/// instead, on the operator's schedule. So this is not a knob for how patient
+/// the proxy should be. It is the bound that keeps an explicitly unbounded
+/// configuration from meaning "wait forever" once the origin has answered in
+/// full -- h2 has no signal for "this peer will never grant window again", so
+/// without something like this the wait has no end at all.
+///
+/// Generous for a reason: unlike `write_timeout`, which `write_body` re-arms
+/// around each capacity grant and which therefore measures a LACK OF PROGRESS,
+/// this probe cannot see progress made within a chunk. It must stay far above
+/// any plausible time a healthy origin takes to accept one chunk, so that the
+/// only writes it ever ends are the ones that were never going to finish. One
+/// chunk is one downstream read -- an h2 DATA frame, or an H1 read buffer --
+/// so tens of kilobytes at most; ten seconds is three orders of magnitude more
+/// than an origin that is still draining the upload needs for one of them.
+const UPSTREAM_STALL_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How one request-body write ended.
+enum UpstreamBodyWriteEnd {
+    /// `write_body` returned, successfully or not.
+    Wrote(Result<()>),
+    /// The DOWNSTREAM H2 stream closed while the write was in flight.
+    DownstreamClosed(Result<h2::Reason>),
+    /// The upstream granted no request-body capacity for a whole
+    /// [`UPSTREAM_STALL_PROBE_INTERVAL`] on a stream whose response it had
+    /// ALREADY flagged complete on the wire, with no `write_timeout` to bound
+    /// the wait. Same conclusion as [`upstream_write_stalled_after_response`],
+    /// reached without a configured deadline.
+    StalledAfterResponse,
+}
+
+/// Write one request-body event upstream, watching for the two things that can
+/// make the write pointless while it is blocked on upstream flow control.
+///
+/// Both watchers exist because a wait on `poll_capacity` has no end of its own:
+/// h2 reports "the stream is closed" and "the stream was reset", but nothing
+/// distinguishes a peer that is about to grant window from one that never will.
+async fn write_upstream_body_watching_stall(
+    client_body: &mut h2::SendStream<Bytes>,
+    data: Bytes,
+    end: bool,
+    body_write: &UpstreamBodyWrite,
+    // `Idle` borrows the downstream session mutably and is `Unpin`, so the loop
+    // re-polls it by reference rather than moving it into a branch.
+    mut stream_close: Option<Idle<'_>>,
+) -> UpstreamBodyWriteEnd {
+    let write = write_body(client_body, data, end, body_write.timeout);
+    tokio::pin!(write);
+    // Only a write nobody else bounded needs the probe; see the constant.
+    let probe_stall = body_write.timeout.is_none();
+
+    loop {
+        tokio::select! {
+            biased;
+            // `&mut write`, NOT `write`: a probe tick must not cancel the
+            // write. `write_body` tracks how much of the chunk it has already
+            // put on the wire in its own local state, so dropping the future
+            // would lose that -- a partial chunk cannot be resumed without
+            // re-sending bytes. Re-polling the same future continues exactly
+            // where it stopped, which is what lets the probe tick harmlessly.
+            res = &mut write => return UpstreamBodyWriteEnd::Wrote(res),
+            // Disabled for non-H2 downstreams: `OptionFuture::from(None)` is
+            // immediately `Ready(None)`, and the failed pattern match takes
+            // this branch out of the select rather than resolving it.
+            Some(closed) = OptionFuture::from(stream_close.as_mut()) => {
+                return UpstreamBodyWriteEnd::DownstreamClosed(closed);
+            }
+            // Tokio's timer rather than `pingora_timeout`, which the write
+            // path itself uses, and deliberately so. `pingora_timeout` is built
+            // for short deadlines created and cancelled in bulk; its timers are
+            // kept in `TimerManager` until they EXPIRE, with no cancellation
+            // cleanup (see `set_fast_timeout_to_tokio_threshold`'s own note).
+            // This probe is the opposite profile -- ten seconds long and, on
+            // every write that behaves, cancelled microseconds after it is
+            // created -- so a fast timer would leave a dead entry behind for
+            // ten seconds each time. Tokio removes it on cancel.
+            //
+            // Nothing is created at all on the common path: `select!` does not
+            // evaluate a branch's future expression while its precondition is
+            // false, so a caller with a `write_timeout` pays nothing here.
+            _ = time::sleep(UPSTREAM_STALL_PROBE_INTERVAL), if probe_stall => {
+                if body_write.upstream_response_ended.observed() {
+                    return UpstreamBodyWriteEnd::StalledAfterResponse;
+                }
+                // No wire evidence, so nothing has been learned: go on waiting,
+                // exactly as this write did before the probe existed.
+            }
+        }
+    }
 }
 
 // add scheme and authority as required by h2 lib
@@ -2009,28 +2176,51 @@ where
          * closure. A write blocked on upstream flow control would otherwise keep the
          * downstream stream handles referenced while a downstream RST_STREAM goes
          * unobserved, pinning the downstream connection window credit until the
-         * write completes. */
-        let write_result = if let Some(stream_close) =
-            session.downstream_session.watch_h2_stream_close()
-        {
-            tokio::select! {
-                biased;
-                res = write_body(client_body, data, end, body_write.timeout) => {
-                    res
+         * write completes. The same write is also watched for an upstream that has
+         * answered in full and then stopped granting capacity; see
+         * `write_upstream_body_watching_stall`. */
+        // Bound with `let` rather than matched in place: the future borrows both
+        // `client_body` and the downstream session, and a match scrutinee would
+        // hold those borrows across the arms below.
+        let write_end = write_upstream_body_watching_stall(
+            client_body,
+            data,
+            end,
+            body_write,
+            session.downstream_session.watch_h2_stream_close(),
+        )
+        .await;
+
+        let write_result = match write_end {
+            UpstreamBodyWriteEnd::Wrote(res) => res,
+            UpstreamBodyWriteEnd::DownstreamClosed(close_result) => {
+                return match close_result {
+                    Ok(reason) => Error::e_explain(
+                        H2Error,
+                        format!("downstream H2 stream closed (reason: {reason}) while writing body to upstream"),
+                    ),
+                    Err(e) => Err(e),
                 }
-                close_result = stream_close => {
-                    return match close_result {
-                        Ok(reason) => Error::e_explain(
-                            H2Error,
-                            format!("downstream H2 stream closed (reason: {reason}) while writing body to upstream"),
-                        ),
-                        Err(e) => Err(e),
-                    }
-                    .map_err(|e| e.into_down());
-                }
+                .map_err(|e| e.into_down());
             }
-        } else {
-            write_body(client_body, data, end, body_write.timeout).await
+            UpstreamBodyWriteEnd::StalledAfterResponse => {
+                // The write future is gone by now, so the capacity it was
+                // holding out for can be handed back to the connection instead
+                // of staying reserved for a stream nothing will write again.
+                client_body.reserve_capacity(0);
+                warn!(
+                    "upstream granted no request-body capacity for \
+                     {UPSTREAM_STALL_PROBE_INTERVAL:?} after flagging its response complete; \
+                     abandoning the upload so the response can be delivered"
+                );
+                // `eos_write_optional` needs no arm of its own: it is only ever
+                // set for an EMPTY write, which `write_body` completes without
+                // waiting for capacity at all, so this outcome cannot arise for
+                // one.
+                return Ok(UpstreamBodyOutcome::UpstreamDoneReceiving {
+                    terminal_event_delivered: end,
+                });
+            }
         };
 
         if let Err(e) = write_result {
@@ -2421,9 +2611,15 @@ fn test_bodyless_with_a_real_body_always_closes_at_header_time() {
 /// `upstream_response_ended` is set for every upstream response the peer ended
 /// cleanly, and it stays set. If it were the whole condition, then after any
 /// such response EVERY request-body write failure would be swallowed and the
-/// exchange logged a success -- including a `write_timeout` expiring against an
-/// origin that answered in full and then stopped granting flow-control window,
-/// which truncates the upstream request body and previously produced a 502.
+/// exchange logged a success -- including an application body filter's own
+/// error and the `Bodyless` contract violation, which have nothing to do with
+/// the peer.
+///
+/// This function answers only "is the stream GONE". A `write_timeout` does not
+/// make it gone and still answers `false` here; it reaches the swallow through
+/// [`upstream_write_stalled_after_response`] instead, which asks a different
+/// question. Keeping the two apart is the point -- see
+/// `test_a_stalled_write_is_a_separate_swallowable_shape`.
 #[test]
 fn test_only_stream_gone_write_failures_may_be_swallowed() {
     // The two shapes `write_body` produces when h2 will never take another byte
@@ -2458,6 +2654,86 @@ fn test_only_stream_gone_write_failures_may_be_swallowed() {
         assert!(
             !upstream_write_failed_because_stream_gone(&e),
             "{etype:?} is not the upstream closing its request stream"
+        );
+    }
+}
+
+/// The second swallowable shape: the stream is NOT gone, the peer simply
+/// stopped granting request-body capacity after having answered in full.
+///
+/// Kept distinct from the stream-gone question on purpose. A `write_timeout`
+/// is a LOCAL deadline and says nothing about the peer by itself, which is why
+/// it must never widen [`upstream_write_failed_because_stream_gone`]; it only
+/// carries meaning in conjunction with the wire END_STREAM flag, and
+/// `upstream_write_error_outcome` is the only place that conjunction is formed.
+#[test]
+fn test_a_stalled_write_is_a_separate_swallowable_shape() {
+    let timed_out = Error::explain(
+        WriteTimedout,
+        "while writing h2 request body, timeout: 1s".to_string(),
+    );
+    assert!(
+        upstream_write_stalled_after_response(&timed_out),
+        "an expired write window is the stalled shape"
+    );
+    assert!(
+        !upstream_write_failed_because_stream_gone(&timed_out),
+        "and it must NOT be laundered into the stream-gone shape"
+    );
+
+    // The stream-gone shapes are not stalls: they are answered by the other
+    // predicate, and the two must not overlap.
+    for (etype, context) in [
+        (H2Error, "cannot reserve capacity"),
+        (WriteError, "while writing h2 request body"),
+    ] {
+        let e = Error::explain(etype, context.to_string());
+        assert!(
+            !upstream_write_stalled_after_response(&e),
+            "{context} means the stream is gone, not stalled"
+        );
+    }
+
+    // Nothing else is a stall either.
+    for etype in [InternalError, ReadError, ReadTimedout, ConnectError] {
+        let e = Error::explain(etype.clone(), "".to_string());
+        assert!(
+            !upstream_write_stalled_after_response(&e),
+            "{etype:?} is not the upstream withholding capacity"
+        );
+    }
+}
+
+/// Neither swallowable shape may fire without the wire END_STREAM flag.
+///
+/// The flag is the whole reason the exchange survives a failed request-body
+/// write: it is what says the origin already answered. `PeerEndStream::default`
+/// is the no-watch-installed case, where the flag can never be set -- and every
+/// failure must then cost the exchange, exactly as it did before either shape
+/// existed.
+#[test]
+fn test_no_write_failure_is_swallowed_without_wire_end_stream() {
+    let body_write = UpstreamBodyWrite {
+        timeout: None,
+        stream_closed: false,
+        disposition: UpstreamRequestBodyDisposition::Ordinary,
+        eos_write_optional: false,
+        upstream_response_ended: PeerEndStream::default(),
+    };
+    assert!(
+        !body_write.upstream_response_ended.observed(),
+        "a default PeerEndStream is the no-evidence case"
+    );
+
+    for (etype, context) in [
+        (H2Error, "cannot reserve capacity"),
+        (WriteError, "while writing h2 request body"),
+        (WriteTimedout, "while writing h2 request body, timeout: 1s"),
+    ] {
+        let e = Error::explain(etype.clone(), context.to_string());
+        assert!(
+            upstream_write_error_outcome(e, true, &body_write).is_err(),
+            "{etype:?} must fail the exchange with no wire END_STREAM evidence"
         );
     }
 }
