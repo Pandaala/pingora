@@ -37,6 +37,12 @@ ClientHello. The generic pre-TLS callback remains available and runs
 afterwards; it can inspect the rewritten digest but does not retroactively
 change the earlier connection-filter decision.
 
+Listener accept paths snapshot the transport peer into both `peer_addr` and
+`raw_peer_addr`. The latter therefore remains the original socket peer after
+the stream closes. A valid PROXY header leaves `raw_peer_addr` unchanged while
+carried source and destination addresses replace `peer_addr` and `local_addr`,
+respectively. Headers without usable addresses keep the accepted digest.
+
 ## Parser rules
 
 - v1 grammar and maximum length are strict.

@@ -144,12 +144,14 @@ impl SocketDigest {
     }
 
     /// The transport peer, ignoring any PROXY protocol override applied to
-    /// [`Self::peer_addr`]. Resolved from the fd only if something asks.
+    /// [`Self::peer_addr`].
     ///
-    /// Unlike `peer_addr`, which the accept path fills in eagerly, this is
-    /// normally lazy over the stored fd, so call it while the connection is
-    /// still open — after close the fd may have been recycled. The same caveat
-    /// already applies to [`Self::local_addr`] and [`Self::original_dst`].
+    /// Listener accept paths fill this eagerly so a retained digest cannot
+    /// resolve through a recycled fd after the connection closes. Digests made
+    /// directly with [`Self::from_raw_fd`] or `from_raw_socket` still resolve it
+    /// lazily, so callers using those constructors must query it while the
+    /// socket is open. The same caveat applies to [`Self::local_addr`] and
+    /// [`Self::original_dst`].
     ///
     /// The PROXY protocol path is the exception: when a header replaces the
     /// digest, `apply_proxy_protocol` primes this cell with the transport peer

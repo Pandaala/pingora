@@ -83,6 +83,10 @@ trace = ["pingora-cache/trace"]
 name = "connection_filter"
 required-features = ["connection_filter"]
 
+[[bench]]
+name = "response_body_filter"
+harness = false
+
 # or locally cargo doc --config "build.rustdocflags='--cfg doc_async_trait'"
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "doc_async_trait"]

@@ -1003,6 +1003,70 @@ mod test {
         server.await.unwrap();
     }
 
+    /// A valid PROXY header must be removed before TLS, while its rewritten and
+    /// transport addresses remain available after a successful handshake.
+    #[tokio::test]
+    #[cfg(feature = "openssl_derived")]
+    async fn test_listen_tls_proxy_protocol_delivers_data_and_addresses() {
+        use crate::protocols::tls::SslStream;
+        use crate::tls::ssl;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+        let mut listeners = Listeners::new();
+        let sock_opt = TcpSocketOptions {
+            proxy_protocol: true,
+            ..Default::default()
+        };
+        listeners.add_tls_with_settings(
+            "127.0.0.1:0",
+            Some(sock_opt),
+            TlsSettings::intermediate(&cert_path, &key_path).unwrap(),
+        );
+        let listener = listeners
+            .build(
+                #[cfg(unix)]
+                None,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let addr = listener.l4.local_addr().unwrap();
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let raw_peer_addr = client.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            let mut stream = stream.handshake().await.unwrap();
+            let digest = stream.get_socket_digest().unwrap();
+            assert_eq!(digest.peer_addr().unwrap().to_string(), "192.168.0.1:56324");
+            assert_eq!(digest.local_addr().unwrap().to_string(), "10.0.0.2:443");
+            let raw = digest.raw_peer_addr().unwrap().as_inet().unwrap();
+            assert_eq!(*raw, raw_peer_addr);
+
+            let mut buf = [0; 4];
+            stream.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"ping");
+        });
+
+        client.write_all(&v2_inet_header()).await.unwrap();
+
+        let ssl_context = ssl::SslContext::builder(ssl::SslMethod::tls())
+            .unwrap()
+            .build();
+        let mut ssl = ssl::Ssl::new(&ssl_context).unwrap();
+        ssl.set_hostname("localhost").unwrap();
+        ssl.set_verify(ssl::SslVerifyMode::NONE);
+        let mut client = SslStream::new(ssl, client).unwrap();
+        client.connect().await.unwrap();
+        client.write_all(b"ping").await.unwrap();
+
+        server.await.unwrap();
+    }
+
     #[derive(Debug)]
     struct TrustNobody;
 
