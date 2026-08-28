@@ -53,6 +53,9 @@ The `status` inside each record is authoritative. This index does not rewrite
 
 ## Open review findings
 
+- [2026-08-28 fork feature and malformed-input audit](fork-feature-malformed-input-audit-2026-08-28.md),
+  including the new canonical pending issue for custom-upstream early-response
+  request-body abandonment.
 - [003: ResponseBodySink chunk-count bound](findings/003-medium-response-body-sink-does-not-bound-chunk-count.md)
 - [004: watcher dependency evidence](findings/004-medium-end-stream-watch-is-not-pinned-to-an-audited-h2.md)
 - [007: async response filter boxing](findings/007-low-async-response-filter-adds-per-chunk-boxing.md),
