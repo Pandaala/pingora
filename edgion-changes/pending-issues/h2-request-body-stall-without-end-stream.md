@@ -43,4 +43,4 @@ explicitly disabled and no request body is being replayed.
 
 - `pingora-proxy/src/proxy_h2.rs` -- `write_upstream_body_watching_stall`,
   `UPSTREAM_STALL_PROBE_INTERVAL`.
-- `docs/edgion-fork/h2-end-stream.md` -- "Request-body writes".
+- `edgion-changes/features/h2-end-stream.md` -- "Request-body writes".

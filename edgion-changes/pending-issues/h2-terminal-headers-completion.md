@@ -39,7 +39,7 @@ may validate the header block.
 
 - Edgion audit finding: `H2-004-trailer-api-permanent-latch.md`.
 - Decoder prerequisite: `H2-001-decoder-trailer-validation.md`.
-- Sibling fork record: `pending-issues/h2-trailer-validation.md`.
+- Sibling fork record: [h2-trailer-validation.md](h2-trailer-validation.md).
 
 ## Upstream references
 

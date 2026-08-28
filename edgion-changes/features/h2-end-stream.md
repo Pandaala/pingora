@@ -26,10 +26,13 @@ The client session combines four independent proofs:
 A reset before END_STREAM, an underflow, rejected trailers, flow-control loss,
 GOAWAY exclusion or a local reset invalidates the corresponding proof. A
 terminal HEADERS frame after DATA is only evidence that trailers must now be
-validated; it is not published as clean EOF by the wire watcher. Invalid
-trailers latch a body error, so a later reset cannot launder them into success.
-The wire flag alone never decides response success; it is consulted only in
-the strict reset/error path.
+validated; it is not published as clean EOF by the wire watcher. Observable
+trailer rejection or an ambiguous terminal result fails closed where the
+public `h2` API permits it. The upstream decoder can still discard forbidden
+pseudo-fields or omit oversized-trailer rejection before exposing a
+valid-looking map, so the fork cannot claim to detect every invalid trailer.
+The wire flag alone never decides response success or cache admission; see
+[`../review/upstream-limitations.md`](../review/upstream-limitations.md).
 
 ## GOAWAY eligibility
 

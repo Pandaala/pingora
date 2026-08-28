@@ -1,0 +1,57 @@
+# Fork feature inventory
+
+This file records what the fork adds to upstream Pingora. Detailed files own
+the full contracts and tests; this page is the provenance and dependency map.
+
+## Commit provenance
+
+| Layer | Original `edgion_v2` | Migrated `edgion_v3` | Purpose |
+| --- | --- | --- | --- |
+| Inbound transport | `1b33442` | `64d2690` | Parse trusted or mandatory PROXY protocol v1/v2 before TLS |
+| Request lifecycle | `879bf3e` | `faf89f5` | Capture, finalize, rewind, and replay downstream request bodies |
+| H2 response integrity | `b9ba47c` | `682506d` | Preserve qualified END_STREAM evidence across reset/error paths |
+| Proxy streaming | `81aa6ac` | `600ac49` | Add request disposition/termination and async response streaming controls |
+| Contract tests | `130a54d` | `605d306` | Cover streaming seams and H2 reset behavior |
+| Maintenance docs | `2c60acf` | `db3de91` | Record behavior, verification, and upstream synchronization |
+
+Later `edgion_v3` commits refine these features. Use `git log` and the review
+records for current history; the migration commit alone is not the current
+implementation.
+
+## Feature map
+
+| Feature | Contract | Implementation center | Detail |
+| --- | --- | --- | --- |
+| Inbound PROXY protocol | Strict v1/v2 parsing before TLS, explicit transport trust, preserved raw peer | core listeners, L4 parser, digest | [proxy-protocol.md](features/proxy-protocol.md) |
+| Replayable request body | Capture once, fail closed on partial/cancelled capture, bounded replay chunks | core body buffer and H1/H2 server sessions | [request-body-buffering.md](features/request-body-buffering.md) |
+| Request-body transport controls | Consistent events, dispositions, termination, trailers, retry gates, cleanup | proxy trait/common and pumps | [request-body-transport.md](features/request-body-transport.md) |
+| Response-body streaming controls | Async filter/sink, bounded emitted bytes, typed termination, terminal dispatch, cache/live ordering | sink, pumps, cache | [response-body-streaming.md](features/response-body-streaming.md) |
+| H2 END_STREAM evidence | Combine decoded state, EOF, content length, and qualified wire evidence; never trust wire flag alone | H2 watcher, client/connector, proxy H2 | [h2-end-stream.md](features/h2-end-stream.md) |
+
+## Cross-feature invariants
+
+1. A downstream request-body terminal event is delivered at most once as
+   `Complete` or `Abandoned`.
+2. Partial, cancelled, drained, or poisoned capture is never replayed as a
+   complete request body.
+3. A normal response gets exactly one terminal callback across Header-EOS,
+   Body-EOS, Trailer, and Done; an abort gets no synthetic clean terminal.
+4. Application termination is typed and non-retryable. A committed final
+   response cannot enter a second response or retry path.
+5. Filtered bytes preserve order across live delivery, cache admission, and
+   cache hit; framing metadata agrees with transformed body semantics.
+6. H1 reuse is rejected when unread/rewritten state makes the next exchange
+   ambiguous. H2 stream termination and connection health remain distinct.
+7. PROXY source trust is transport trust. Consumers must reject invalid trust
+   configuration rather than broaden it.
+8. Wire END_STREAM, decoded EOF, content-length satisfaction, abandonment, and
+   replay EOF are separate evidence. Cache admission never uses wire evidence
+   alone.
+
+## Ownership boundary
+
+The parser/trust wiring, request replay, watcher integration, proxy hooks, sink
+bounds, terminal/cache behavior, tests, and docs are fork-owned and must be
+fixed here when defective. Decoder behavior inside `h2` is upstream-owned; keep
+the normal dependency and the boundary in
+[`review/upstream-limitations.md`](review/upstream-limitations.md).
