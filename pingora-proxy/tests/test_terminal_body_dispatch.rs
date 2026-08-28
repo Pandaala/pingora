@@ -39,6 +39,8 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use utils::server_utils::{init_without_mock_origin, take_eos_dispatches};
 
+use pingora_proxy::RESPONSE_BODY_EMIT_CHUNK_BUDGET;
+
 const CHUNKS: [&str; 3] = ["alpha", "beta", "gamma"];
 
 fn whole_body() -> String {
@@ -187,6 +189,43 @@ async fn get_probed(port: u16, probe: &str) -> reqwest::Result<reqwest::Response
         .timeout(Duration::from_secs(10))
         .send()
         .await
+}
+
+async fn get_with_chunk_limit(port: u16, mode: &str) -> reqwest::Result<reqwest::Response> {
+    reqwest::Client::new()
+        .get("http://127.0.0.1:6147/terminal-body")
+        .header("x-h2", "true")
+        .header("x-port", port.to_string())
+        .header("x-emit-chunk-limit", mode)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+}
+
+#[tokio::test]
+async fn h2_upstream_drains_exactly_the_emitted_chunk_limit() {
+    init_without_mock_origin();
+    let port = spawn_origin(Termination::EndStreamOnLastData).await;
+    let response = get_with_chunk_limit(port, "exact").await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.bytes().await.unwrap();
+    assert_eq!(body.len(), RESPONSE_BODY_EMIT_CHUNK_BUDGET);
+    assert!(body.iter().all(|byte| *byte == b'x'));
+}
+
+#[tokio::test]
+async fn h2_upstream_rejects_the_next_chunk_after_the_limit() {
+    init_without_mock_origin();
+    let port = spawn_origin(Termination::EndStreamOnLastData).await;
+    let response = get_with_chunk_limit(port, "overflow").await;
+    let completed_ok = match response {
+        Ok(response) if response.status() == StatusCode::OK => response.bytes().await.ok(),
+        _ => None,
+    };
+    assert!(
+        completed_ok.is_none(),
+        "an H2 response that exceeds the emitted-chunk limit must fail closed"
+    );
 }
 
 /// The defect: an H2 upstream ending in trailers used to deliver no

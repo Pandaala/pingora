@@ -58,7 +58,7 @@ use pingora_error::Result;
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{
     ProcessCustomSession, ProxyHttp, ProxyServiceBuilder, RangeType, RequestBodyEvent,
-    ResponseBodySink, Session, RESPONSE_BODY_EMIT_BUDGET,
+    ResponseBodySink, Session, RESPONSE_BODY_EMIT_BUDGET, RESPONSE_BODY_EMIT_CHUNK_BUDGET,
 };
 use std::any::Any;
 use std::future::Future;
@@ -549,6 +549,7 @@ pub struct EmitCtx {
     response_cache_filter_seen: bool,
     response_filter_calls: usize,
     request_body_events: Vec<RequestBodyEvent>,
+    emitted_chunk_limit: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1129,6 +1130,8 @@ impl ProxyHttp for EmitProxy {
                 http::header::CONTENT_LENGTH,
                 (BODYLESS_CURRENT.len() + BODYLESS_EXTRA.len()).to_string(),
             )?;
+        } else if path.contains("emit_chunk_limit") {
+            upstream_response.remove_header("content-length");
         } else if path.contains("bodyless")
             && !path.ends_with("/bodyless_cl0")
             && !path.ends_with("/bodyless_empty_cl0")
@@ -1305,6 +1308,16 @@ impl ProxyHttp for EmitProxy {
                 // reject it, and that rejection must surface as a failed
                 // request, never as a silently truncated body.
                 sink.push(Bytes::from(vec![0u8; RESPONSE_BODY_EMIT_BUDGET + 1]))?;
+            }
+            path if path.contains("emit_chunk_limit") && !ctx.emitted_chunk_limit => {
+                ctx.emitted_chunk_limit = true;
+                *body = None;
+                for _ in 0..RESPONSE_BODY_EMIT_CHUNK_BUDGET {
+                    sink.push(Bytes::from_static(b"x"))?;
+                }
+                if path.contains("overflow") {
+                    sink.push(Bytes::from_static(b"y"))?;
+                }
             }
             _ => {}
         }
@@ -1817,6 +1830,17 @@ async fn completed_200_body(url: &str) -> Option<String> {
     res.text().await.ok()
 }
 
+async fn completed_body_with_status(
+    url: &str,
+    expected_status: reqwest::StatusCode,
+) -> Option<Bytes> {
+    let response = reqwest::get(url).await.ok()?;
+    if response.status() != expected_status {
+        return None;
+    }
+    response.bytes().await.ok()
+}
+
 #[tokio::test]
 async fn exceeding_the_emit_budget_fails_the_response() {
     let harness = init();
@@ -1831,6 +1855,60 @@ async fn exceeding_the_emit_budget_fails_the_response() {
         Some("hello world".to_string()),
         "the client must never receive a complete, pristine body after the emit budget was exceeded"
     );
+}
+
+#[tokio::test]
+async fn emitted_chunk_limit_reaches_h1_custom_and_cache_paths() {
+    let harness = init();
+    for (url, expected_status) in [
+        (
+            format!("{}/emit_chunk_limit", harness.base_url()),
+            reqwest::StatusCode::OK,
+        ),
+        (
+            format!("{}/emit_chunk_limit", harness.custom_base_url()),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    ] {
+        let response = reqwest::get(url).await.unwrap();
+        assert_eq!(response.status(), expected_status);
+        let body = response.bytes().await.unwrap();
+        assert_eq!(body.len(), RESPONSE_BODY_EMIT_CHUNK_BUDGET);
+        assert!(body.iter().all(|byte| *byte == b'x'));
+    }
+
+    let cache_url = format!("{}/cache/emit_chunk_limit", harness.cache_base_url());
+    for expected_cache_status in ["miss", "hit"] {
+        let response = reqwest::get(&cache_url).await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.headers()["x-cache-status"], expected_cache_status);
+        let body = response.bytes().await.unwrap();
+        assert_eq!(body.len(), RESPONSE_BODY_EMIT_CHUNK_BUDGET);
+        assert!(body.iter().all(|byte| *byte == b'x'));
+    }
+}
+
+#[tokio::test]
+async fn exceeding_the_emit_chunk_limit_fails_h1_and_custom_responses() {
+    let harness = init();
+    for (base_url, normal_status) in [
+        (harness.base_url(), reqwest::StatusCode::OK),
+        (
+            harness.custom_base_url(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    ] {
+        let observed = completed_body_with_status(
+            &format!("{base_url}/emit_chunk_limit_overflow"),
+            normal_status,
+        )
+        .await;
+        assert!(
+            observed.is_none(),
+            "a response that exceeds the emitted-chunk limit must fail closed, got {} complete bytes",
+            observed.as_ref().map_or(0, Bytes::len)
+        );
+    }
 }
 
 #[tokio::test]

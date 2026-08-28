@@ -18,8 +18,8 @@
 //! case. When it needs to emit *additional* chunks, or to end the response
 //! early, it goes through this sink.
 //!
-//! The byte budget counts only additional chunks accepted by
-//! [`ResponseBodySink::push`]. It does not account for replacing the current
+//! The byte and item budgets count only additional chunks accepted by
+//! [`ResponseBodySink::push`]. They do not account for replacing the current
 //! chunk with a larger one; filters that expand a chunk in place must enforce
 //! their own output bound.
 //!
@@ -38,10 +38,16 @@ use pingora_error::{Error, ErrorType::InternalError, Result};
 /// In-place growth of the current chunk is outside this limit.
 pub const RESPONSE_BODY_EMIT_BUDGET: usize = 1024 * 1024;
 
+/// Maximum nonempty chunks a filter may emit through the sink within one pump
+/// batch. This independently bounds per-chunk task, framing, and cache-write
+/// overhead that the byte budget cannot represent.
+pub const RESPONSE_BODY_EMIT_CHUNK_BUDGET: usize = RESPONSE_BODY_EMIT_BUDGET / 512;
+
 /// Extra chunks and the terminate signal produced by a response-body filter.
 pub struct ResponseBodySink {
     extra: Vec<Bytes>,
     remaining: usize,
+    remaining_chunks: usize,
     terminate: bool,
 }
 
@@ -56,6 +62,7 @@ impl ResponseBodySink {
         Self {
             extra: Vec::new(),
             remaining: RESPONSE_BODY_EMIT_BUDGET,
+            remaining_chunks: RESPONSE_BODY_EMIT_CHUNK_BUDGET,
             terminate: false,
         }
     }
@@ -78,6 +85,15 @@ impl ResponseBodySink {
         if chunk.is_empty() {
             return Ok(());
         }
+        if self.remaining_chunks == 0 {
+            return Error::e_explain(
+                InternalError,
+                format!(
+                    "response body emit chunk budget exhausted: maximum {} nonempty chunks per batch",
+                    RESPONSE_BODY_EMIT_CHUNK_BUDGET
+                ),
+            );
+        }
         if chunk.len() > self.remaining {
             return Error::e_explain(
                 InternalError,
@@ -89,6 +105,7 @@ impl ResponseBodySink {
             );
         }
         self.remaining -= chunk.len();
+        self.remaining_chunks -= 1;
         self.extra.push(chunk);
         Ok(())
     }
@@ -127,6 +144,10 @@ impl ResponseBodySink {
         self.remaining
     }
 
+    pub fn remaining_chunk_budget(&self) -> usize {
+        self.remaining_chunks
+    }
+
     /// Drain the queued chunks. The pump calls this to append them to the
     /// downstream task batch.
     pub fn take_extra(&mut self) -> Vec<Bytes> {
@@ -141,9 +162,10 @@ impl ResponseBodySink {
 
     /// Restore the budget for a new pump batch. Any chunk not drained by then
     /// is dropped, because the batch it belonged to has already been written.
-    pub fn reset_batch(&mut self) {
+    pub(crate) fn reset_batch(&mut self) {
         self.extra.clear();
         self.remaining = RESPONSE_BODY_EMIT_BUDGET;
+        self.remaining_chunks = RESPONSE_BODY_EMIT_CHUNK_BUDGET;
     }
 }
 
@@ -179,12 +201,35 @@ mod tests {
     }
 
     #[test]
+    fn chunk_budget_accepts_limit_and_rejects_next_without_mutation() {
+        let mut sink = ResponseBodySink::new();
+        for _ in 0..RESPONSE_BODY_EMIT_CHUNK_BUDGET {
+            sink.push(Bytes::from_static(b"x")).unwrap();
+        }
+        assert_eq!(sink.remaining_chunk_budget(), 0);
+        assert_eq!(
+            sink.remaining_budget(),
+            RESPONSE_BODY_EMIT_BUDGET - RESPONSE_BODY_EMIT_CHUNK_BUDGET
+        );
+
+        let remaining_bytes = sink.remaining_budget();
+        assert!(sink.push(Bytes::from_static(b"y")).is_err());
+        assert_eq!(sink.remaining_budget(), remaining_bytes);
+        assert_eq!(sink.remaining_chunk_budget(), 0);
+        assert_eq!(sink.take_extra().len(), RESPONSE_BODY_EMIT_CHUNK_BUDGET);
+    }
+
+    #[test]
     fn reset_batch_restores_budget_but_not_terminate() {
         let mut sink = ResponseBodySink::new();
         sink.push(Bytes::from_static(b"xyz")).unwrap();
         sink.terminate();
         sink.reset_batch();
         assert_eq!(sink.remaining_budget(), RESPONSE_BODY_EMIT_BUDGET);
+        assert_eq!(
+            sink.remaining_chunk_budget(),
+            RESPONSE_BODY_EMIT_CHUNK_BUDGET
+        );
         assert!(
             sink.take_extra().is_empty(),
             "reset_batch drops undelivered extras"
@@ -197,6 +242,10 @@ mod tests {
         let mut sink = ResponseBodySink::new();
         sink.push(Bytes::new()).unwrap();
         assert_eq!(sink.remaining_budget(), RESPONSE_BODY_EMIT_BUDGET);
+        assert_eq!(
+            sink.remaining_chunk_budget(),
+            RESPONSE_BODY_EMIT_CHUNK_BUDGET
+        );
         assert!(
             sink.take_extra().is_empty(),
             "empty chunks are dropped, not queued"
@@ -209,8 +258,10 @@ mod tests {
         sink.push(Bytes::from_static(b"extra-a")).unwrap();
         sink.push(Bytes::from_static(b"extra-b")).unwrap();
         let remaining = sink.remaining_budget();
+        let remaining_chunks = sink.remaining_chunk_budget();
         sink.prepend_current(Bytes::from_static(b"current"));
         assert_eq!(sink.remaining_budget(), remaining);
+        assert_eq!(sink.remaining_chunk_budget(), remaining_chunks);
         assert_eq!(
             sink.take_extra(),
             vec![

@@ -7,13 +7,15 @@ current body slot, the terminal flag, a `ResponseBodySink`, and request context.
 It may mutate or suppress the current chunk, emit extra chunks, request a
 delay, or terminate the response.
 
-`ResponseBodySink` has a per-pump-batch byte budget for additional chunks.
-Empty output is free; emitted bytes consume the budget and an overflow fails
-the response. Replacing the current chunk with a larger chunk is outside this
-budget and must be bounded by the filter. With the current synchronous drain
-topology, a batch contains at most the initial task plus the bounded channel's
-already queued tasks. `reset_batch` restores the budget but intentionally
-leaves termination sticky until the terminal boundary consumes it.
+`ResponseBodySink` has independent per-pump-batch byte and nonempty-chunk
+budgets for additional chunks: 1 MiB and 2048 chunks. Empty output is free;
+accepted output consumes both applicable budgets and an overflow fails the
+response without partial mutation. Replacing the current chunk with a larger
+chunk is outside these budgets and must be bounded by the filter. With the
+current synchronous drain topology, a batch contains at most the initial task
+plus the bounded channel's already queued tasks. `reset_batch` restores both
+budgets but intentionally leaves termination sticky until the terminal
+boundary consumes it.
 
 ## Ordering and terminal dispatch
 

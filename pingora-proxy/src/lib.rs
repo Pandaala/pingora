@@ -221,7 +221,9 @@ pub use proxy_purge::PurgeStatus;
 pub use proxy_trait::{
     FailToProxy, ProxyHttp, ProxyWarnLogContext, RequestBodyAction, UpstreamRequestBodyDisposition,
 };
-pub use response_body_sink::{ResponseBodySink, RESPONSE_BODY_EMIT_BUDGET};
+pub use response_body_sink::{
+    ResponseBodySink, RESPONSE_BODY_EMIT_BUDGET, RESPONSE_BODY_EMIT_CHUNK_BUDGET,
+};
 
 pub mod prelude {
     pub use crate::{

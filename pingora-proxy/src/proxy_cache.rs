@@ -1523,6 +1523,7 @@ pub(crate) fn drain_emitted_chunks_before(
 #[cfg(test)]
 mod eos_migration_tests {
     use super::*;
+    use crate::{RESPONSE_BODY_EMIT_BUDGET, RESPONSE_BODY_EMIT_CHUNK_BUDGET};
 
     fn sink_with(chunks: &[&'static [u8]]) -> ResponseBodySink {
         let mut sink = ResponseBodySink::new();
@@ -1655,6 +1656,50 @@ mod eos_migration_tests {
             }
             other => panic!("unexpected sequence: {other:?}"),
         }
+    }
+
+    #[test]
+    fn fragmented_full_budget_has_a_bounded_downstream_operation_count() {
+        let mut contiguous = ResponseBodySink::new();
+        contiguous
+            .push(Bytes::from(vec![0; RESPONSE_BODY_EMIT_BUDGET]))
+            .unwrap();
+        let mut contiguous_tasks = Vec::new();
+        drain_emitted_chunks(
+            HttpTask::Body(None, true),
+            &mut contiguous,
+            &mut contiguous_tasks,
+        );
+
+        let chunk_len = RESPONSE_BODY_EMIT_BUDGET / RESPONSE_BODY_EMIT_CHUNK_BUDGET;
+        let fragment = Bytes::from(vec![0; chunk_len]);
+        let mut fragmented = ResponseBodySink::new();
+        for _ in 0..RESPONSE_BODY_EMIT_CHUNK_BUDGET {
+            fragmented.push(fragment.clone()).unwrap();
+        }
+        let mut fragmented_tasks = Vec::new();
+        drain_emitted_chunks(
+            HttpTask::Body(None, true),
+            &mut fragmented,
+            &mut fragmented_tasks,
+        );
+
+        assert_eq!(contiguous_tasks.len(), 1);
+        assert_eq!(fragmented_tasks.len(), RESPONSE_BODY_EMIT_CHUNK_BUDGET);
+        assert!(fragmented_tasks[..fragmented_tasks.len() - 1]
+            .iter()
+            .all(|task| !task.is_end()));
+        assert!(fragmented_tasks.last().unwrap().is_end());
+        assert_eq!(
+            fragmented_tasks
+                .iter()
+                .filter_map(|task| match task {
+                    HttpTask::Body(Some(bytes), _) => Some(bytes.len()),
+                    _ => None,
+                })
+                .sum::<usize>(),
+            RESPONSE_BODY_EMIT_BUDGET
+        );
     }
 
     #[test]

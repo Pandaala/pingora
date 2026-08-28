@@ -46,7 +46,10 @@ use pingora_core::upstreams::peer::{H1UpgradePolicy, HttpPeer, HttpUpstreamReque
 use pingora_core::utils::tls::CertKey;
 use pingora_error::{Error, ErrorSource, ErrorType::*, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
-use pingora_proxy::{FailToProxy, ProxyHttp, ProxyWarnLogContext, ResponseBodySink, Session};
+use pingora_proxy::{
+    FailToProxy, ProxyHttp, ProxyWarnLogContext, ResponseBodySink, Session,
+    RESPONSE_BODY_EMIT_CHUNK_BUDGET,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -68,6 +71,7 @@ pub struct CTX {
     upstream_server_addr: Option<SocketAddr>,
     /// Response bytes withheld by the `x-retain-until-eos` processor.
     withheld_body: Vec<u8>,
+    emitted_chunk_limit: bool,
 }
 
 // Common logic for both ProxyHttp(s) types
@@ -439,6 +443,18 @@ impl ProxyHttp for ExampleProxyHttp {
     ) -> Result<Option<Duration>> {
         if end_of_stream {
             record_eos_dispatch(session);
+        }
+        if let Some(mode) = session.req_header().headers.get("x-emit-chunk-limit") {
+            *body = None;
+            if !ctx.emitted_chunk_limit {
+                ctx.emitted_chunk_limit = true;
+                for _ in 0..RESPONSE_BODY_EMIT_CHUNK_BUDGET {
+                    sink.push(Bytes::from_static(b"x"))?;
+                }
+                if mode == "overflow" {
+                    sink.push(Bytes::from_static(b"y"))?;
+                }
+            }
         }
         if session.get_header_bytes("x-bodyless-replace") == b"true"
             && end_of_stream

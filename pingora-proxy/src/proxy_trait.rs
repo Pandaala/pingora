@@ -688,10 +688,10 @@ pub trait ProxyHttp {
     ///
     /// Mutate `body` in place for the common one-in-one-out case. To emit
     /// *additional* chunks, or to end the response early, use `sink`. The
-    /// sink's byte budget is per pump batch and counts only chunks passed to
-    /// `sink.push()`; it does not limit in-place growth of `body`. A filter
-    /// that expands `body` must enforce its own output bound. See
-    /// [`crate::ResponseBodySink`].
+    /// sink's byte and nonempty-chunk budgets are per pump batch and count only
+    /// chunks accepted by `sink.push()`; they do not limit in-place growth of
+    /// `body`. A filter that expands `body` must enforce its own output bound.
+    /// See [`crate::ResponseBodySink`].
     ///
     /// This hook runs after `Session::upstream_compression`, so both in-place
     /// replacements and sink extras must already use the resulting body
