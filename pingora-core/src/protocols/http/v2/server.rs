@@ -364,8 +364,8 @@ pub struct HttpSession {
     // replay attempt must fail closed instead of silently forwarding a bodyless
     // request upstream.
     early_body_buffer_discarded: bool,
-    // Set when the session drops a fully replayed `early_body_buffer` after the
-    // response was committed downstream (no further retry is possible then).
+    // Set when the session drops a captured or fully replayed `early_body_buffer`
+    // after the response was committed downstream (no further retry is possible then).
     // A later replay attempt indicates a broken retry decision upstream of this
     // session and must fail closed instead of silently forwarding a bodyless
     // request.
@@ -1055,27 +1055,27 @@ impl HttpSession {
         self.send_response_body = Some(body_writer);
         self.ended = self.ended || end;
         // Committing the response ends any possibility of an upstream retry; a
-        // fully replayed body buffer is dead weight for the rest of the response
+        // captured or fully replayed body buffer is dead weight for the rest of the response
         // (which may be long-lived, e.g. SSE / gRPC streaming).
         self.maybe_release_early_body_buffer();
         Ok(())
     }
 
     /// Drop the registered early body buffer once it can no longer be needed:
-    /// replay reached EOF AND the response header was committed downstream. Both
-    /// conditions are required — before the response commits, a retry may still
-    /// rewind and replay the buffer; before replay EOF, the current attempt is
-    /// still reading it. Called from both places where either condition becomes
-    /// true. The `early_body_buffer_released` flag makes any later replay
-    /// attempt fail closed (see `begin_request_body_replay`). Unlike HTTP/1,
-    /// `response_written` here is only ever a non-informational header (1xx are
-    /// not sent on the h2 path), so its presence alone means committed.
+    /// capture completed without replay, or replay reached EOF, AND the response
+    /// header was committed downstream. Before the response commits, a retry may
+    /// still rewind and replay the buffer; while replay is in progress, the
+    /// current attempt is still reading it. Called from each place where a release
+    /// condition can become true. The `early_body_buffer_released` flag makes any
+    /// later replay attempt fail closed (see `begin_request_body_replay`). Unlike
+    /// HTTP/1, `response_written` here is only ever a non-informational header
+    /// (1xx are not sent on the h2 path), so its presence alone means committed.
     fn maybe_release_early_body_buffer(&mut self) {
         if self.response_written.is_some()
             && self
                 .early_body_buffer
                 .as_ref()
-                .is_some_and(RegisteredRequestBodyBuffer::is_replay_done)
+                .is_some_and(RegisteredRequestBodyBuffer::is_ready_or_replay_done)
         {
             self.early_body_buffer = None;
             self.early_body_buffer_released = true;
@@ -3227,6 +3227,54 @@ mod test {
 
     fn probe_dropped(flag: &Arc<std::sync::atomic::AtomicBool>) -> bool {
         flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn test_ready_buffer_released_when_response_commits_h2() {
+        let (client, server) = duplex(65536);
+        let mut handles = vec![];
+
+        handles.push(tokio::spawn(async move {
+            let (h2, connection) = h2::client::handshake(client).await.unwrap();
+            tokio::spawn(async move {
+                connection.await.unwrap();
+            });
+            let mut h2 = h2.ready().await.unwrap();
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("https://www.example.com/")
+                .body(())
+                .unwrap();
+            let (response, mut req_body) = h2.send_request(request, false).unwrap();
+            req_body.send_data("abc".into(), true).unwrap();
+            let (head, _body) = response.await.unwrap().into_parts();
+            assert_eq!(head.status, 200);
+        }));
+
+        let mut connection = handshake(Box::new(server), None).await.unwrap();
+        let digest = Arc::new(Digest::default());
+
+        while let Some(mut http) = HttpSession::from_h2_conn(&mut connection, digest.clone())
+            .await
+            .unwrap()
+        {
+            handles.push(tokio::spawn(async move {
+                let (probe, dropped) = DropProbeBuffer::new();
+                http.set_request_body_buffer(Box::new(probe)).unwrap();
+                while http.read_body_bytes().await.unwrap().is_some() {}
+                assert!(!probe_dropped(&dropped));
+
+                let response_header = Box::new(ResponseHeader::build(200, None).unwrap());
+                http.write_response_header(response_header, true).unwrap();
+                assert!(probe_dropped(&dropped));
+                assert!(!http.request_body_buffer_registered());
+                assert!(http.begin_request_body_replay().await.is_err());
+            }));
+        }
+
+        for handle in handles {
+            assert!(handle.await.is_ok());
+        }
     }
 
     #[tokio::test]

@@ -58,8 +58,11 @@ impl RegisteredRequestBodyBuffer {
         self.state == RequestBodyBufferState::Replaying
     }
 
-    pub(crate) fn is_replay_done(&self) -> bool {
-        self.state == RequestBodyBufferState::ReplayDone
+    pub(crate) fn is_ready_or_replay_done(&self) -> bool {
+        matches!(
+            self.state,
+            RequestBodyBufferState::Ready | RequestBodyBufferState::ReplayDone
+        )
     }
 
     pub(crate) async fn capture(&mut self, data: &Bytes) -> Result<()> {
@@ -245,14 +248,16 @@ impl FixedBuffer {
 ///   drain via `read_request_body` / `read_body_bytes`.
 /// - Request trailers (HTTP/1.1 chunked / HTTP/2) are not captured or replayed, matching
 ///   the native retry buffer.
-/// - **The buffer is dropped as soon as it can no longer be needed.** Once replay has
-///   reached EOF and a non-informational response header has been committed downstream
-///   (in either order), no further upstream retry can legitimately happen, so the session
-///   drops the buffer right then instead of holding it for the rest of the response
-///   (which may be long-lived, e.g. SSE). Implementations holding large resources (temp
-///   file, fd) should release them in `Drop`. After this release a pathological replay
-///   attempt fails the request deterministically. If the response never commits (the
-///   request errors out first), the buffer is dropped with the session.
+/// - **The buffer is dropped as soon as it can no longer be needed.** Once capture has
+///   completed and a non-informational response header has been committed downstream,
+///   no first replay can legitimately begin, so the session drops an unreplayed buffer
+///   immediately. If replay did begin, the buffer remains until replay reaches EOF and
+///   the response commits (in either order), because the active attempt still needs it.
+///   This avoids holding the buffer for the rest of a response that may be long-lived
+///   (e.g. SSE). Implementations holding large resources (temp file, fd) should release
+///   them in `Drop`. After this release a pathological replay attempt fails the request
+///   deterministically. If the response never commits (the request errors out first),
+///   the buffer is dropped with the session.
 /// - **`Expect: 100-continue` requests need an explicit 100 before capture.** Capture
 ///   moves the body read ahead of upstream forwarding, so the path that normally
 ///   unblocks such a client — the upstream's 100 relayed downstream — has not happened

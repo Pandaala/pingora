@@ -36,8 +36,9 @@ already active.
   (and commonly bounded memory with file spill) across concurrent captures.
 - Draining an unread or partially read downstream body discards the registered
   buffer and prevents a later bodyless replay.
-- The buffer is released only after replay reaches EOF and a final response
-  header commits. Before that point a retry may still need it.
+- Once capture completes, the buffer is released when a final response header
+  commits if replay never started, or after replay reaches EOF if it did. Before
+  those points a retry or the active attempt may still need it.
 - `request_headers_end_stream` remains a transport fact. Registering a buffer
   may change the effective upstream body, but never rewrites what the client
   placed on the wire.

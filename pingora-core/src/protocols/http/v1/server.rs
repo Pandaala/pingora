@@ -146,8 +146,8 @@ pub struct HttpSession {
     /// replay attempt must fail closed instead of silently forwarding a bodyless
     /// request upstream.
     early_body_buffer_discarded: bool,
-    /// Set when the session drops a fully replayed `early_body_buffer` after the
-    /// response was committed downstream (no further retry is possible then).
+    /// Set when the session drops a captured or fully replayed `early_body_buffer`
+    /// after the response was committed downstream (no further retry is possible then).
     /// A later replay attempt indicates a broken retry decision upstream of this
     /// session and must fail closed instead of silently forwarding a bodyless
     /// request.
@@ -853,7 +853,7 @@ impl HttpSession {
                 }
                 self.response_written = Some(header);
                 // Committing a non-informational response ends any possibility of
-                // an upstream retry; a fully replayed body buffer is dead weight
+                // an upstream retry; a captured or fully replayed body buffer is dead weight
                 // for the rest of the response (which may be long-lived, e.g. SSE).
                 self.maybe_release_early_body_buffer();
                 Ok(())
@@ -863,12 +863,13 @@ impl HttpSession {
     }
 
     /// Drop the registered early body buffer once it can no longer be needed:
-    /// replay reached EOF AND a non-informational response header was committed
-    /// downstream. Both conditions are required — before the response commits, a
-    /// retry may still rewind and replay the buffer; before replay EOF, the
-    /// current attempt is still reading it. Called from both places where either
-    /// condition becomes true. The `early_body_buffer_released` flag makes any
-    /// later replay attempt fail closed (see `begin_request_body_replay`).
+    /// capture completed without replay, or replay reached EOF, AND a
+    /// non-informational response header was committed downstream. Before the
+    /// response commits, a retry may still rewind and replay the buffer; while
+    /// replay is in progress, the current attempt is still reading it. Called
+    /// from each place where a release condition can become true. The
+    /// `early_body_buffer_released` flag makes any later replay attempt fail
+    /// closed (see `begin_request_body_replay`).
     fn maybe_release_early_body_buffer(&mut self) {
         let response_committed = self
             .response_written
@@ -878,7 +879,7 @@ impl HttpSession {
             && self
                 .early_body_buffer
                 .as_ref()
-                .is_some_and(RegisteredRequestBodyBuffer::is_replay_done)
+                .is_some_and(RegisteredRequestBodyBuffer::is_ready_or_replay_done)
         {
             self.early_body_buffer = None;
             self.early_body_buffer_released = true;
@@ -2030,6 +2031,7 @@ impl HttpSession {
                 {
                     ProxyTaskWriter::WritingHeader(header, end) => {
                         self.response_written = Some(header);
+                        self.maybe_release_early_body_buffer();
                         end_stream = end;
                     }
                     ProxyTaskWriter::WritingBody(end) => {
@@ -5484,6 +5486,61 @@ mod test_early_body_buffer {
 
     fn dropped(flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> bool {
         flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn ready_buffer_released_when_response_commits() {
+        init_log();
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\nabc";
+        let mock_io = Builder::new()
+            .read(&input1[..])
+            .read(&input2[..])
+            .write(b"HTTP/1.1 200 OK\r\n\r\n")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.update_resp_headers = false;
+        http_stream.read_request().await.unwrap();
+        let (probe, probe_dropped) = DropProbeBuffer::new();
+        http_stream
+            .set_request_body_buffer(Box::new(probe))
+            .unwrap();
+        let _ = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert!(!dropped(&probe_dropped));
+
+        let response = Box::new(ResponseHeader::build(200, None).unwrap());
+        http_stream.write_response_header(response).await.unwrap();
+        assert!(dropped(&probe_dropped));
+        assert!(!http_stream.request_body_buffer_registered());
+        assert!(http_stream.begin_request_body_replay().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn ready_buffer_released_when_proxy_task_response_commits() {
+        init_log();
+        let input1 = b"GET / HTTP/1.1\r\n";
+        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\nabc";
+        let mock_io = Builder::new()
+            .read(&input1[..])
+            .read(&input2[..])
+            .write(b"HTTP/1.1 200 OK\r\n\r\n")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.update_resp_headers = false;
+        http_stream.read_request().await.unwrap();
+        let (probe, probe_dropped) = DropProbeBuffer::new();
+        http_stream
+            .set_request_body_buffer(Box::new(probe))
+            .unwrap();
+        let _ = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert!(!dropped(&probe_dropped));
+
+        let response = Box::new(ResponseHeader::build(200, None).unwrap());
+        http_stream.send_proxy_task(HttpTask::Header(response, true));
+        assert!(http_stream.write_proxy_tasks().await.unwrap());
+        assert!(dropped(&probe_dropped));
+        assert!(!http_stream.request_body_buffer_registered());
+        assert!(http_stream.begin_request_body_replay().await.is_err());
     }
 
     #[tokio::test]
