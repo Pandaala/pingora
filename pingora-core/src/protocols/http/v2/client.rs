@@ -1962,6 +1962,40 @@ mod tests_h2 {
         assert_eq!(h2s.read_trailers().await.unwrap(), expected_trailers);
     }
 
+    /// Which side of the upstream fix the resolved `h2` release is on, for the
+    /// unwatched baselines below.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum DependencyBaseline {
+        /// `h2` hands the invalid terminal block back as a success, so a
+        /// following reset can pass it off as a clean end of body.
+        Laundered,
+        /// `h2` rejects the invalid terminal block itself, and the rejection
+        /// reaches the caller as an error that the fail-closed latch keeps.
+        Rejected,
+        /// `h2` rejects the block, but the same-burst NO_ERROR reset overwrites
+        /// the local PROTOCOL_ERROR and a satisfied `content-length` lets
+        /// `read_trailers()` answer "this response had no trailers".
+        ///
+        /// Deferred, not a regression: an unwatched session holds no evidence
+        /// that a terminal block was ever sent, and even the watched direct
+        /// read does not latch this yet -- see the `#[ignore]`d
+        /// `h2_watched_direct_trailer_read_latches_invalid_terminal_headers`
+        /// and H2-004.
+        RejectedThenReportedAsNoTrailers,
+    }
+
+    /// Report, without failing, which `h2` behavior the unwatched baselines saw.
+    ///
+    /// These baselines characterize the DEPENDENCY, not a Pingora contract:
+    /// `h2 = ">=0.4.16"` has an open upper bound, so an upstream fix must show
+    /// up as a reported behavior change rather than as a product regression. The
+    /// required contract -- that the adapter never launders an unvalidated
+    /// terminal block into a completed response -- is asserted by the
+    /// `h2_watched_*` siblings, and stays strict under every outcome below.
+    fn report_dependency_baseline(scenario: &str, observed: DependencyBaseline) {
+        eprintln!("h2 dependency baseline: {scenario} = {observed:?}");
+    }
+
     async fn assert_clean_empty_trailers(
         mut h2s: Http2Session,
         expected_body: Option<&'static [u8]>,
@@ -2085,18 +2119,56 @@ mod tests_h2 {
             .expect_err("the invalid trailer result must stay latched");
     }
 
-    /// The h2-only baseline demonstrates why a terminal-HEADERS observation is
-    /// still required after DATA accounting is removed: with no watcher, the
-    /// reset overwrites the codec error and the invalid zero-DATA trailers look
+    /// The h2-only baseline for why a terminal-HEADERS observation is still
+    /// required after DATA accounting is removed: with no watcher, the reset
+    /// overwrites the codec error and the invalid zero-DATA trailers can look
     /// exactly like a clean body end.
+    ///
+    /// This characterizes the dependency, so it accepts BOTH sides of the
+    /// upstream fix and reports which one it saw. Requiring the laundering
+    /// would turn the day `h2` starts rejecting these trailers into a red CI
+    /// run that reads like a Pingora regression -- and the obvious way to
+    /// silence that is to pin a known-vulnerable `h2` or delete the evidence
+    /// for the watcher. What must not move is the fail-closed contract, so the
+    /// rejecting arm still requires the trailer read to keep failing. It
+    /// asserts that outcome rather than a mechanism: with no `content-length`
+    /// and no DATA, `EndOfBodyProof::holds()` is false either way, so it does
+    /// not matter whether the `response_body_error` latch or the proof guard
+    /// in `read_trailers` is what holds the door shut.
     #[tokio::test]
-    async fn h2_unwatched_zero_data_invalid_trailers_are_laundered_baseline() {
-        let h2s = raw_reset_session(
+    async fn h2_unwatched_zero_data_invalid_trailers_dependency_baseline() {
+        let mut h2s = raw_reset_session(
             response_with_trailers(&[], RESP_200),
             EndStreamObservation::Unwatched,
         )
         .await;
-        assert_clean_response(h2s, None, None).await;
+        let observed = match h2s.read_response_body().await {
+            Ok(None) => {
+                assert!(
+                    h2s.read_response_body().await.unwrap().is_none(),
+                    "the laundered response must remain at clean EOF"
+                );
+                // Either laundered shape is the dependency's to pick: no
+                // trailers at all, or the discarded block as an empty map.
+                // Surfacing the illegal fields would be a different defect.
+                match h2s.read_trailers().await.unwrap() {
+                    None => {}
+                    Some(trailers) => assert!(
+                        trailers.is_empty(),
+                        "a laundered pseudo-header block must not surface fields: {trailers:?}"
+                    ),
+                }
+                DependencyBaseline::Laundered
+            }
+            Ok(Some(body)) => panic!("a zero-DATA response must not yield body bytes: {body:?}"),
+            Err(_) => {
+                h2s.read_trailers()
+                    .await
+                    .expect_err("a rejected terminal block must keep the trailer read failing");
+                DependencyBaseline::Rejected
+            }
+        };
+        report_dependency_baseline("unwatched zero-DATA invalid trailers", observed);
     }
 
     #[tokio::test]
@@ -2373,22 +2445,72 @@ mod tests_h2 {
     }
 
     /// A caller may consume exactly the declared body bytes and then ask for
-    /// trailers without issuing a body EOF read. That API order must not let a
-    /// same-burst reset wash an illegal terminal pseudo-header into `None`.
+    /// trailers without issuing a body EOF read, and this pins what that API
+    /// order yields for an illegal terminal pseudo-header block.
+    ///
+    /// Like the zero-DATA baseline above this characterizes the dependency, so
+    /// it accepts every outcome the dependency may produce and reports which
+    /// one it saw. All three are dependency shapes, not product verdicts:
+    /// today's `h2` launders the block into an empty map, while an `h2` that
+    /// rejects it may surface either an error or -- because the same-burst
+    /// NO_ERROR reset overwrites the local PROTOCOL_ERROR and the declared
+    /// `content-length` is satisfied -- a plain "no trailers". Closing that
+    /// last gap needs the terminal-HEADERS state consulted from the direct
+    /// read, which is H2-004's deferred work and is pinned by the `#[ignore]`d
+    /// `h2_watched_direct_trailer_read_latches_invalid_terminal_headers`.
+    /// Failing here instead would file that known gap as a fresh regression on
+    /// the day the dependency gets safer. What stays asserted is that the
+    /// fields of an illegal block never reach the caller.
     #[tokio::test]
-    async fn h2_unwatched_direct_trailer_read_launders_invalid_terminal_headers_as_empty() {
+    async fn h2_unwatched_direct_trailer_read_invalid_terminal_headers_dependency_baseline() {
         let mut frames = raw_frame(0x1, 0x4, 1, RESP_200_CONTENT_LENGTH_5);
         frames.extend_from_slice(&raw_frame(0x0, 0, 1, b"hello"));
         frames.extend_from_slice(&raw_frame(0x1, 0x4 | FLAG_END_STREAM_RAW, 1, RESP_200));
 
-        let mut h2s = raw_reset_session(frames, EndStreamObservation::Unwatched).await;
-        assert_eq!(h2s.read_response_body().await.unwrap().unwrap(), "hello");
-        assert!(
-            h2s.read_trailers()
-                .await
-                .unwrap()
-                .is_some_and(|trailers| trailers.is_empty()),
-            "the h2-only laundering baseline turns invalid trailers into an empty map"
+        let mut h2s = raw_reset_session(frames.clone(), EndStreamObservation::Unwatched).await;
+        let observed = match h2s.read_response_body().await {
+            Ok(Some(body)) => {
+                assert_eq!(body, "hello");
+                match h2s.read_trailers().await {
+                    Ok(Some(trailers)) => {
+                        assert!(
+                            trailers.is_empty(),
+                            "a laundered pseudo-header block must not surface fields: {trailers:?}"
+                        );
+                        DependencyBaseline::Laundered
+                    }
+                    Ok(None) => {
+                        // Corroborate that the DEPENDENCY is what rejected the
+                        // block, so that weakening a guard in `read_trailers`
+                        // cannot pass itself off as an upstream fix and be
+                        // absorbed by this arm. Replaying the same frames in
+                        // body-EOF order forces the rejection into the open:
+                        // `read_response_body`'s EOF branch validates the
+                        // trailers itself instead of consulting those guards.
+                        let mut replay =
+                            raw_reset_session(frames.clone(), EndStreamObservation::Unwatched)
+                                .await;
+                        assert_eq!(replay.read_response_body().await.unwrap().unwrap(), "hello");
+                        replay.read_response_body().await.expect_err(
+                            "'no trailers' here must come from h2 rejecting the block, which \
+                             the body-EOF read order surfaces as an error",
+                        );
+                        DependencyBaseline::RejectedThenReportedAsNoTrailers
+                    }
+                    Err(_) => DependencyBaseline::Rejected,
+                }
+            }
+            Ok(None) => panic!("the declared body bytes must still be delivered"),
+            Err(_) => {
+                h2s.read_trailers()
+                    .await
+                    .expect_err("a rejected terminal block must keep the trailer read failing");
+                DependencyBaseline::Rejected
+            }
+        };
+        report_dependency_baseline(
+            "unwatched direct trailer read of invalid terminal headers",
+            observed,
         );
     }
 
