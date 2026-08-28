@@ -47,6 +47,9 @@ The `status` inside each record is authoritative. This index does not rewrite
   one latch dispatches EOS and orders released bytes before terminal tasks.
 - [Custom terminal 101](http1/custom-terminal-101-normalized-before-dispatch.md):
   normalize `Header(101, true)` to `Header(101, false) -> Done` at the producer.
+- [Custom early-response request abandonment](custom/custom-upstream-early-response-abandonment.md):
+  completed responses and stopped writers terminate unfinished uploads once,
+  without manufacturing custom-upstream EOS or polling a terminal body state.
 - [Negative-test observation](testing/negative-tests-need-out-of-band-observation.md):
   failure-path negative assertions need out-of-band evidence and a positive
   control.
@@ -54,8 +57,8 @@ The `status` inside each record is authoritative. This index does not rewrite
 ## Open review findings
 
 - [2026-08-28 fork feature and malformed-input audit](fork-feature-malformed-input-audit-2026-08-28.md),
-  including the new canonical pending issue for custom-upstream early-response
-  request-body abandonment.
+  including the discovery provenance for the resolved custom-upstream
+  early-response request-body abandonment defect.
 - [003: ResponseBodySink chunk-count bound](findings/003-medium-response-body-sink-does-not-bound-chunk-count.md)
 - [004: watcher dependency evidence](findings/004-medium-end-stream-watch-is-not-pinned-to-an-audited-h2.md)
 - [007: async response filter boxing](findings/007-low-async-response-filter-adds-per-chunk-boxing.md),

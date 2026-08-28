@@ -31,7 +31,8 @@ implementation.
 ## Cross-feature invariants
 
 1. A downstream request-body terminal event is delivered at most once as
-   `Complete` or `Abandoned`.
+   `Complete` or `Abandoned`; H1, H2, and custom upstream pumps all stop an
+   unfinished upload with `Abandoned` after the response completes.
 2. Partial, cancelled, drained, or poisoned capture is never replayed as a
    complete request body.
 3. A normal response gets exactly one terminal callback across Header-EOS,

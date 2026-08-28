@@ -40,6 +40,10 @@ framing.
   batch helpers rather than duplicating inline loops.
 - When an upstream response completes and the upstream stops receiving, the
   application still receives one `Abandoned` event.
+- The custom pump dispatches that event independently from its `BodyWrite`:
+  abandonment never calls `finish()`, because a deliberately truncated upload
+  is not a clean custom-upstream request EOS. A mid-upload writer rejection
+  dispatches the same terminal event before the existing error cleanup path.
 - H1 downstream connections with unread body state are not reused. H2 keeps
   the connection and ends only the affected stream.
 - A final response already committed downstream disables retries even when an
@@ -51,3 +55,10 @@ framing.
 `pingora-proxy/tests/test_request_body_seam.rs` is the primary matrix. It
 covers H1 and H2 downstream/upstream combinations, framing, retry, GOAWAY,
 termination, bodyless contract violations and connection reuse.
+
+`pingora-proxy/tests/test_upstream_response_body_sink.rs` owns the custom
+connector harness. It covers early final responses and writer rejection with
+unfinished H1/H2 downstream uploads, exactly-once `Abandoned` delivery,
+protocol-specific cleanup, a completed-upload `Complete` control, and a
+custom-downstream case that keeps the opposite custom-message direction alive
+to prove terminal state stops further request-body polling.

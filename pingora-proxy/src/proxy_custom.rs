@@ -479,7 +479,7 @@ where
             self.send_body_to_custom(
                 session,
                 Some(buffer),
-                downstream_state.is_done(),
+                RequestBodyEvent::from(downstream_state.is_done()),
                 client_body,
                 ctx,
             )
@@ -518,13 +518,34 @@ where
             || upstream_custom
             || downstream_custom
         {
+            if response_state.is_done() && downstream_state.is_reading() {
+                // The custom upstream has completed the whole response while
+                // the downstream upload is still open. Nothing can consume
+                // more request bytes, so pay the request-body contract its
+                // single terminal event without manufacturing a clean EOS for
+                // the custom writer.
+                self.send_body_to_custom(
+                    session,
+                    None,
+                    RequestBodyEvent::Abandoned,
+                    client_body,
+                    ctx,
+                )
+                .await?;
+                downstream_state.maybe_finished(true);
+                if let Some(cancel) = cancel_downstream_reader_tx.take() {
+                    let _ = cancel.send(());
+                }
+                continue;
+            }
+
             // partial read support, this check will also be false if cache is disabled.
             let support_cache_partial_read =
                 session.cache.support_streaming_partial_write() == Some(true);
             let upgraded = session.was_upgraded();
 
             tokio::select! {
-                body = session.downstream_session.read_body_or_idle(downstream_state.is_done()), if downstream_state.can_poll() => {
+                body = session.downstream_session.read_body_or_idle(false), if downstream_state.is_reading() => {
                     let body = match body {
                         Ok(b) => b,
                         Err(e) => {
@@ -552,8 +573,9 @@ where
                         }
                     };
                     let is_body_done = session.is_body_done();
+                    let event = RequestBodyEvent::from(is_body_done);
 
-                    match self.send_body_to_custom(session, body, is_body_done, client_body, ctx).await {
+                    match self.send_body_to_custom(session, body, event, client_body, ctx).await {
                         Ok(request_done) =>  {
                             downstream_state.maybe_finished(request_done);
                         },
@@ -1163,7 +1185,7 @@ where
         &self,
         session: &mut Session,
         mut data: Option<Bytes>,
-        end_of_body: bool,
+        mut event: RequestBodyEvent,
         client_body: &mut Box<dyn BodyWrite>,
         ctx: &mut SV::CTX,
     ) -> Result<bool>
@@ -1183,27 +1205,20 @@ where
         // their documented contract -- never deliver the single `(None, true)`
         // event, and return `Ok(false)` forever, so the duplex loop would spin
         // on an already-finished read side at 100% CPU.
-        let end_of_body = end_of_body || data.is_none();
-        let event = RequestBodyEvent::from(end_of_body);
+        if data.is_none() && event == RequestBodyEvent::Data {
+            event = RequestBodyEvent::Complete;
+        }
+        let end_of_body = event.is_terminal();
 
-        session
-            .downstream_modules_ctx
-            .request_body_filter(&mut data, event)
+        self.filter_custom_request_body(session, &mut data, event, ctx)
             .await?;
 
-        if self
-            .inner
-            .request_body_filter_action(session, &mut data, event, ctx)
-            .await?
-            == RequestBodyAction::Terminate
-        {
-            // The custom pump has its own join structure and implements no
-            // terminate propagation; fail closed instead of diverging
-            // silently.
-            return Error::e_explain(
-                InternalError,
-                "request-body terminate is not supported on custom connector sessions",
-            );
+        // Abandonment is terminal for application/module state, but it is not
+        // a clean request EOS at the custom transport. In particular, calling
+        // BodyWrite::finish() here would misrepresent a deliberately truncated
+        // upload as complete.
+        if event == RequestBodyEvent::Abandoned {
+            return Ok(true);
         }
 
         if session.was_upgraded() {
@@ -1218,10 +1233,19 @@ where
         }
 
         if let Some(mut data) = data {
-            client_body
-                .write_all_buf(&mut data)
-                .await
-                .map_err(|e| e.into_up())?;
+            if let Err(e) = client_body.write_all_buf(&mut data).await {
+                if event == RequestBodyEvent::Data {
+                    let mut abandoned_body = None;
+                    self.filter_custom_request_body(
+                        session,
+                        &mut abandoned_body,
+                        RequestBodyEvent::Abandoned,
+                        ctx,
+                    )
+                    .await?;
+                }
+                return Err(e.into_up());
+            }
             if end_of_body {
                 client_body.finish().await.map_err(|e| e.into_up())?;
             }
@@ -1237,6 +1261,40 @@ where
         }
 
         Ok(end_of_body)
+    }
+
+    async fn filter_custom_request_body(
+        &self,
+        session: &mut Session,
+        data: &mut Option<Bytes>,
+        event: RequestBodyEvent,
+        ctx: &mut SV::CTX,
+    ) -> Result<()>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        session
+            .downstream_modules_ctx
+            .request_body_filter(data, event)
+            .await?;
+
+        if self
+            .inner
+            .request_body_filter_action(session, data, event, ctx)
+            .await?
+            == RequestBodyAction::Terminate
+        {
+            // The custom pump has its own join structure and implements no
+            // terminate propagation; fail closed instead of diverging
+            // silently.
+            return Error::e_explain(
+                InternalError,
+                "request-body terminate is not supported on custom connector sessions",
+            );
+        }
+
+        Ok(())
     }
 }
 

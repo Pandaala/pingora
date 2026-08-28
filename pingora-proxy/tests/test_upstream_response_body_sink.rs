@@ -37,9 +37,16 @@ use pingora_core::server::Server;
 use pingora_core::services::ServiceWithDependents;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{
+    apps::HttpServerApp,
     connectors::http::custom::{Connection as CustomConnection, Connector as CustomConnector},
     protocols::{
-        http::custom::{client::Session as CustomSession, BodyWrite, CustomMessageWrite},
+        http::{
+            custom::{
+                client::Session as CustomSession, server::Session as CustomServerSession,
+                BodyWrite, CustomMessageWrite,
+            },
+            HttpTask, ServerSession,
+        },
         l4::socket::SocketAddr,
         tls::{CustomALPN, ALPN},
         Digest, Stream, UniqueIDType,
@@ -50,12 +57,15 @@ use pingora_core::{
 use pingora_error::Result;
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{
-    ProcessCustomSession, ProxyHttp, ProxyServiceBuilder, RangeType, ResponseBodySink, Session,
-    RESPONSE_BODY_EMIT_BUDGET,
+    ProcessCustomSession, ProxyHttp, ProxyServiceBuilder, RangeType, RequestBodyEvent,
+    ResponseBodySink, Session, RESPONSE_BODY_EMIT_BUDGET,
 };
 use std::any::Any;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::thread;
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -126,6 +136,12 @@ const BODYLESS_NO_CONTENT_HEADER: (&str, &str) = ("x-bodyless-no-content", "1");
 const BODYLESS_NOT_MODIFIED_HEADER: (&str, &str) = ("x-bodyless-not-modified", "1");
 const MANY_CHUNK_HEADER: (&str, &str) = ("x-many-chunks", "1");
 const CUSTOM_POST_TERMINAL_FAILURE_HEADER: (&str, &str) = ("x-custom-post-terminal-failure", "1");
+const CUSTOM_REQUEST_BODY_SCRIPT_HEADER: &str = "x-custom-request-body-script";
+const CUSTOM_EARLY_RESPONSE_SCRIPT: &str = "early-response";
+const CUSTOM_REJECT_FIRST_WRITE_SCRIPT: &str = "reject-first-write";
+const CUSTOM_REJECT_LATER_WRITE_SCRIPT: &str = "reject-later-write";
+const CUSTOM_COMPLETE_UPLOAD_SCRIPT: &str = "complete-upload";
+const CUSTOM_DOWNSTREAM_EARLY_RESPONSE_SCRIPT: &str = "custom-downstream-early-response";
 const SUPPRESS_DOWNSTREAM_BODY_HEADER: (&str, &str) = ("x-suppress-downstream-body", "1");
 const RESPONSE_FILTER_CALLS_HEADER: &str = "x-test-response-filter-calls";
 const SUPPRESSED_BODY_EXTRA: &[u8] = b"+";
@@ -404,6 +420,22 @@ static TERMINAL_UPGRADE_EOS_CALLS: Lazy<Mutex<std::collections::HashMap<String, 
 /// never sets this flag for any of the three terminal-upgrade paths, so every
 /// one of them asserts on it and the assertion message stays path-agnostic.
 static TERMINAL_UPGRADE_SESSION_READ_AFTER_EOS: AtomicBool = AtomicBool::new(false);
+#[derive(Clone, Debug, Default)]
+struct CustomRequestBodyRecord {
+    events: Vec<RequestBodyEvent>,
+    logging_calls: usize,
+    had_error: bool,
+}
+
+static CUSTOM_REQUEST_BODY_RECORDS: Lazy<
+    Mutex<std::collections::HashMap<String, CustomRequestBodyRecord>>,
+> = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+static CUSTOM_DOWNSTREAM_BODY_READS: AtomicUsize = AtomicUsize::new(0);
+static CUSTOM_DOWNSTREAM_RESPONSE_DONE: AtomicBool = AtomicBool::new(false);
+static CUSTOM_DOWNSTREAM_RESPONSE_CHANGED: Lazy<tokio::sync::Notify> =
+    Lazy::new(tokio::sync::Notify::new);
+static CUSTOM_DOWNSTREAM_WRITER_FINISHES: AtomicUsize = AtomicUsize::new(0);
+static CUSTOM_DOWNSTREAM_WRITER_CLEANUPS: AtomicUsize = AtomicUsize::new(0);
 
 fn assert_no_terminal_upgrade_read_after_eos() {
     assert!(
@@ -510,6 +542,7 @@ pub struct EmitCtx {
     response_filter_seen: bool,
     response_cache_filter_seen: bool,
     response_filter_calls: usize,
+    request_body_events: Vec<RequestBodyEvent>,
 }
 
 #[derive(Clone, Copy)]
@@ -531,22 +564,93 @@ struct HeaderOnlyCustomSession {
     /// connection reach clean EOF, so the whole response is complete at the
     /// header and the session must never be read again.
     terminal_upgrade: bool,
+    request_body_script: Option<String>,
+    request_body_progress: Arc<CustomRequestBodyProgress>,
 }
 
-struct NoopBodyWriter;
+#[derive(Default)]
+struct CustomRequestBodyProgress {
+    write_attempts: AtomicUsize,
+    finished: AtomicBool,
+    changed: tokio::sync::Notify,
+}
+
+struct ResponseGatedEndStream {
+    delay: Pin<Box<tokio::time::Sleep>>,
+    response_seen: bool,
+}
+
+impl ResponseGatedEndStream {
+    fn new() -> Self {
+        Self {
+            delay: Box::pin(tokio::time::sleep(Duration::from_millis(1))),
+            response_seen: false,
+        }
+    }
+}
+
+impl FuturesStream for ResponseGatedEndStream {
+    type Item = Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if !self.response_seen {
+            if CUSTOM_DOWNSTREAM_RESPONSE_DONE.load(Ordering::SeqCst) {
+                self.response_seen = true;
+                self.delay
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + Duration::from_millis(100));
+            } else {
+                if self.delay.as_mut().poll(cx).is_ready() {
+                    self.delay
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + Duration::from_millis(1));
+                    cx.waker().wake_by_ref();
+                }
+                return Poll::Pending;
+            }
+        }
+        self.delay.as_mut().poll(cx).map(|()| None)
+    }
+}
+
+struct NoopBodyWriter {
+    script: Option<String>,
+    progress: Arc<CustomRequestBodyProgress>,
+}
 
 #[async_trait]
 impl BodyWrite for NoopBodyWriter {
     async fn write_all_buf(&mut self, data: &mut Bytes) -> Result<()> {
+        let attempt = self.progress.write_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        self.progress.changed.notify_one();
+        let reject = matches!(
+            (self.script.as_deref(), attempt),
+            (Some(CUSTOM_REJECT_FIRST_WRITE_SCRIPT), 1)
+                | (Some(CUSTOM_REJECT_LATER_WRITE_SCRIPT), 2)
+        );
+        if reject {
+            return pingora_error::Error::e_explain(
+                pingora_error::ErrorType::WriteError,
+                "scripted custom request-body writer rejection",
+            );
+        }
         data.clear();
         Ok(())
     }
 
     async fn finish(&mut self) -> Result<()> {
+        if self.script.as_deref() == Some(CUSTOM_DOWNSTREAM_EARLY_RESPONSE_SCRIPT) {
+            CUSTOM_DOWNSTREAM_WRITER_FINISHES.fetch_add(1, Ordering::SeqCst);
+        }
+        self.progress.finished.store(true, Ordering::SeqCst);
+        self.progress.changed.notify_one();
         Ok(())
     }
 
     async fn cleanup(&mut self) -> Result<()> {
+        if self.script.as_deref() == Some(CUSTOM_DOWNSTREAM_EARLY_RESPONSE_SCRIPT) {
+            CUSTOM_DOWNSTREAM_WRITER_CLEANUPS.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(())
     }
 
@@ -564,6 +668,32 @@ impl HeaderOnlyCustomSession {
             upgraded: false,
             body_eof_observed: false,
             terminal_upgrade: false,
+            request_body_script: None,
+            request_body_progress: Arc::new(CustomRequestBodyProgress::default()),
+        }
+    }
+
+    async fn wait_for_scripted_request_body_state(&self) {
+        let ready = || match self.request_body_script.as_deref() {
+            Some(CUSTOM_EARLY_RESPONSE_SCRIPT | CUSTOM_REJECT_FIRST_WRITE_SCRIPT) => {
+                self.request_body_progress
+                    .write_attempts
+                    .load(Ordering::SeqCst)
+                    >= 1
+            }
+            Some(CUSTOM_REJECT_LATER_WRITE_SCRIPT) => {
+                self.request_body_progress
+                    .write_attempts
+                    .load(Ordering::SeqCst)
+                    >= 2
+            }
+            Some(CUSTOM_COMPLETE_UPLOAD_SCRIPT) => {
+                self.request_body_progress.finished.load(Ordering::SeqCst)
+            }
+            _ => true,
+        };
+        while !ready() {
+            self.request_body_progress.changed.notified().await;
         }
     }
 }
@@ -608,6 +738,16 @@ impl CustomConnector for HeaderOnlyCustomConnector {
 impl CustomSession for HeaderOnlyCustomSession {
     async fn write_request_header(&mut self, req: Box<RequestHeader>, _end: bool) -> Result<()> {
         self.request_header_written = true;
+        self.request_body_script = req
+            .headers
+            .get(CUSTOM_REQUEST_BODY_SCRIPT_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        if self.request_body_script.is_some() {
+            self.response = ResponseHeader::build(200, None)?;
+            self.response
+                .insert_header(http::header::CONTENT_LENGTH, "0")?;
+        }
         self.fail_after_terminal = req
             .headers
             .get(CUSTOM_POST_TERMINAL_FAILURE_HEADER.0)
@@ -655,6 +795,7 @@ impl CustomSession for HeaderOnlyCustomSession {
     fn set_write_timeout(&mut self, _timeout: Option<Duration>) {}
 
     async fn read_response_header(&mut self) -> Result<()> {
+        self.wait_for_scripted_request_body_state().await;
         Ok(())
     }
 
@@ -735,7 +876,10 @@ impl CustomSession for HeaderOnlyCustomSession {
     }
 
     fn take_request_body_writer(&mut self) -> Option<Box<dyn BodyWrite>> {
-        Some(Box::new(NoopBodyWriter))
+        Some(Box::new(NoopBodyWriter {
+            script: self.request_body_script.clone(),
+            progress: self.request_body_progress.clone(),
+        }))
     }
 
     async fn finish_custom(&mut self) -> Result<()> {
@@ -745,6 +889,9 @@ impl CustomSession for HeaderOnlyCustomSession {
     fn take_custom_message_reader(
         &mut self,
     ) -> Option<Box<dyn FuturesStream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>> {
+        if self.request_body_script.as_deref() == Some(CUSTOM_DOWNSTREAM_EARLY_RESPONSE_SCRIPT) {
+            return Some(Box::new(ResponseGatedEndStream::new()));
+        }
         Some(Box::new(futures::stream::empty()))
     }
 
@@ -763,6 +910,17 @@ impl ProxyHttp for EmitProxy {
 
     fn new_ctx(&self) -> Self::CTX {
         EmitCtx::default()
+    }
+
+    async fn request_body_filter(
+        &self,
+        _session: &mut Session,
+        _body: &mut Option<Bytes>,
+        event: RequestBodyEvent,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        ctx.request_body_events.push(event);
+        Ok(())
     }
 
     fn request_cache_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<()> {
@@ -1202,12 +1360,261 @@ impl ProxyHttp for EmitProxy {
         }
         Ok(None)
     }
+
+    async fn logging(
+        &self,
+        session: &mut Session,
+        error: Option<&pingora_error::Error>,
+        ctx: &mut Self::CTX,
+    ) {
+        if session
+            .req_header()
+            .headers
+            .get(CUSTOM_REQUEST_BODY_SCRIPT_HEADER)
+            .is_none()
+        {
+            return;
+        }
+        let path = session.req_header().uri.path().to_string();
+        let mut records = CUSTOM_REQUEST_BODY_RECORDS.lock().unwrap();
+        let record = records.entry(path).or_default();
+        record.events = ctx.request_body_events.clone();
+        record.logging_calls += 1;
+        record.had_error = error.is_some();
+    }
+}
+
+struct ScriptedCustomDownstream {
+    request: RequestHeader,
+    response: Option<ResponseHeader>,
+    body_reads: usize,
+    read_timeout: Option<Duration>,
+    write_timeout: Option<Duration>,
+    drain_timeout: Option<Duration>,
+}
+
+impl ScriptedCustomDownstream {
+    fn early_response() -> Self {
+        let mut request =
+            RequestHeader::build("POST", b"/custom_early_response_custom", None).unwrap();
+        request
+            .insert_header(http::header::HOST, "localhost")
+            .unwrap();
+        request
+            .insert_header(http::header::CONTENT_LENGTH, "8")
+            .unwrap();
+        request
+            .insert_header(
+                CUSTOM_REQUEST_BODY_SCRIPT_HEADER,
+                CUSTOM_DOWNSTREAM_EARLY_RESPONSE_SCRIPT,
+            )
+            .unwrap();
+        Self {
+            request,
+            response: None,
+            body_reads: 0,
+            read_timeout: None,
+            write_timeout: None,
+            drain_timeout: None,
+        }
+    }
+}
+
+#[async_trait]
+impl CustomServerSession for ScriptedCustomDownstream {
+    fn req_header(&self) -> &RequestHeader {
+        &self.request
+    }
+
+    fn req_header_mut(&mut self) -> &mut RequestHeader {
+        &mut self.request
+    }
+
+    async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
+        self.read_body_or_idle(false).await
+    }
+
+    async fn drain_request_body(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn write_response_header(
+        &mut self,
+        response: Box<ResponseHeader>,
+        end: bool,
+    ) -> Result<()> {
+        self.response = Some(*response);
+        if end {
+            CUSTOM_DOWNSTREAM_RESPONSE_DONE.store(true, Ordering::SeqCst);
+            CUSTOM_DOWNSTREAM_RESPONSE_CHANGED.notify_waiters();
+        }
+        Ok(())
+    }
+
+    async fn write_response_header_ref(
+        &mut self,
+        response: &ResponseHeader,
+        _end: bool,
+    ) -> Result<()> {
+        self.response = Some(response.clone());
+        Ok(())
+    }
+
+    async fn write_body(&mut self, _data: Bytes, _end: bool) -> Result<()> {
+        Ok(())
+    }
+
+    async fn write_trailers(&mut self, _trailers: HeaderMap) -> Result<()> {
+        Ok(())
+    }
+
+    async fn response_duplex_vec(&mut self, tasks: Vec<HttpTask>) -> Result<bool> {
+        let finished = tasks.iter().any(HttpTask::is_end);
+        for task in tasks {
+            if let HttpTask::Header(response, _) = task {
+                self.response = Some(*response);
+            }
+        }
+        if finished {
+            CUSTOM_DOWNSTREAM_RESPONSE_DONE.store(true, Ordering::SeqCst);
+            CUSTOM_DOWNSTREAM_RESPONSE_CHANGED.notify_waiters();
+        }
+        Ok(finished)
+    }
+
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.read_timeout = timeout;
+    }
+
+    fn get_read_timeout(&self) -> Option<Duration> {
+        self.read_timeout
+    }
+
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) {
+        self.write_timeout = timeout;
+    }
+
+    fn get_write_timeout(&self) -> Option<Duration> {
+        self.write_timeout
+    }
+
+    fn set_total_drain_timeout(&mut self, timeout: Option<Duration>) {
+        self.drain_timeout = timeout;
+    }
+
+    fn get_total_drain_timeout(&self) -> Option<Duration> {
+        self.drain_timeout
+    }
+
+    fn request_summary(&self) -> String {
+        self.request.uri.to_string()
+    }
+
+    fn response_written(&self) -> Option<&ResponseHeader> {
+        self.response.as_ref()
+    }
+
+    async fn shutdown(&mut self, _code: u32, _ctx: &str) {}
+
+    fn is_body_done(&mut self) -> bool {
+        false
+    }
+
+    async fn finish(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn is_body_empty(&mut self) -> bool {
+        false
+    }
+
+    async fn read_body_or_idle(&mut self, _no_body_expected: bool) -> Result<Option<Bytes>> {
+        if self.body_reads == 0 {
+            self.body_reads = 1;
+            CUSTOM_DOWNSTREAM_BODY_READS.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(Bytes::from_static(b"data")))
+        } else {
+            while !CUSTOM_DOWNSTREAM_RESPONSE_DONE.load(Ordering::SeqCst) {
+                CUSTOM_DOWNSTREAM_RESPONSE_CHANGED.notified().await;
+            }
+            self.body_reads += 1;
+            CUSTOM_DOWNSTREAM_BODY_READS.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+    }
+
+    fn body_bytes_sent(&self) -> usize {
+        0
+    }
+
+    fn body_bytes_read(&self) -> usize {
+        usize::from(self.body_reads > 0) * 4
+    }
+
+    fn digest(&self) -> Option<&Digest> {
+        None
+    }
+
+    fn digest_mut(&mut self) -> Option<&mut Digest> {
+        None
+    }
+
+    fn client_addr(&self) -> Option<&SocketAddr> {
+        None
+    }
+
+    fn server_addr(&self) -> Option<&SocketAddr> {
+        None
+    }
+
+    fn pseudo_raw_h1_request_header(&self) -> Bytes {
+        Bytes::new()
+    }
+
+    fn enable_retry_buffering(&mut self) {}
+
+    fn retry_buffer_truncated(&self) -> bool {
+        false
+    }
+
+    fn get_retry_buffer(&self) -> Option<Bytes> {
+        None
+    }
+
+    async fn finish_custom(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn take_custom_message_reader(
+        &mut self,
+    ) -> Option<Box<dyn FuturesStream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>> {
+        Some(Box::new(futures::stream::empty()))
+    }
+
+    fn restore_custom_message_reader(
+        &mut self,
+        _reader: Box<dyn FuturesStream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn take_custom_message_writer(&mut self) -> Option<Box<dyn CustomMessageWrite>> {
+        Some(Box::new(()))
+    }
+
+    fn restore_custom_message_writer(
+        &mut self,
+        _writer: Box<dyn CustomMessageWrite>,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 struct Harness {
     proxy_port: u16,
     cache_proxy_port: u16,
     custom_proxy_port: u16,
+    custom_downstream_proxy_port: u16,
 }
 
 impl Harness {
@@ -1232,12 +1639,15 @@ fn start_harness() -> Harness {
     let proxy_port = reserve_port();
     let cache_proxy_port = reserve_port();
     let custom_proxy_port = reserve_port();
+    let custom_downstream_proxy_port = reserve_port();
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
     let cache_proxy_addr = format!("127.0.0.1:{cache_proxy_port}");
     let custom_proxy_addr = format!("127.0.0.1:{custom_proxy_port}");
+    let custom_downstream_proxy_addr = format!("127.0.0.1:{custom_downstream_proxy_port}");
     let listen_addr = proxy_addr.clone();
     let cache_listen_addr = cache_proxy_addr.clone();
     let custom_listen_addr = custom_proxy_addr.clone();
+    let custom_downstream_listen_addr = custom_downstream_proxy_addr.clone();
 
     thread::spawn(move || {
         let mut server = Server::new(None).unwrap();
@@ -1267,6 +1677,8 @@ fn start_harness() -> Harness {
 
         let custom_handler: ProcessCustomSession<EmitProxy, HeaderOnlyCustomConnector> =
             Arc::new(|_proxy, _stream: Stream, _shutdown: &ShutdownWatch| Box::pin(async { None }));
+        let mut custom_server_options = pingora_core::apps::HttpServerOptions::default();
+        custom_server_options.h2c = true;
         let mut custom_proxy_service = ProxyServiceBuilder::new(
             &server.configuration,
             EmitProxy {
@@ -1277,13 +1689,46 @@ fn start_harness() -> Harness {
             },
         )
         .custom(HeaderOnlyCustomConnector, custom_handler)
+        .server_options(custom_server_options)
         .build();
         custom_proxy_service.add_tcp(&custom_listen_addr);
+
+        let custom_downstream_handler: ProcessCustomSession<EmitProxy, HeaderOnlyCustomConnector> =
+            Arc::new(|proxy, _stream: Stream, shutdown: &ShutdownWatch| {
+                let shutdown = shutdown.clone();
+                Box::pin(async move {
+                    proxy
+                        .process_new_http(
+                            ServerSession::new_custom(Box::new(
+                                ScriptedCustomDownstream::early_response(),
+                            )),
+                            &shutdown,
+                        )
+                        .await;
+                    None
+                })
+            });
+        let mut custom_downstream_options = pingora_core::apps::HttpServerOptions::default();
+        custom_downstream_options.force_custom = true;
+        let mut custom_downstream_proxy_service = ProxyServiceBuilder::new(
+            &server.configuration,
+            EmitProxy {
+                origin_port,
+                custom: true,
+                cache: false,
+                terminate_once_fired: AtomicBool::new(false),
+            },
+        )
+        .custom(HeaderOnlyCustomConnector, custom_downstream_handler)
+        .server_options(custom_downstream_options)
+        .build();
+        custom_downstream_proxy_service.add_tcp(&custom_downstream_listen_addr);
 
         let services: Vec<Box<dyn ServiceWithDependents>> = vec![
             Box::new(proxy_service),
             Box::new(cache_proxy_service),
             Box::new(custom_proxy_service),
+            Box::new(custom_downstream_proxy_service),
         ];
         server.add_services(services);
         server.run_forever();
@@ -1291,7 +1736,12 @@ fn start_harness() -> Harness {
 
     // Poll for readiness instead of sleeping, matching `tests/seam/harness.rs`.
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    for addr in [&proxy_addr, &cache_proxy_addr, &custom_proxy_addr] {
+    for addr in [
+        &proxy_addr,
+        &cache_proxy_addr,
+        &custom_proxy_addr,
+        &custom_downstream_proxy_addr,
+    ] {
         loop {
             if std::net::TcpStream::connect(addr).is_ok() {
                 break;
@@ -1308,6 +1758,7 @@ fn start_harness() -> Harness {
         proxy_port,
         cache_proxy_port,
         custom_proxy_port,
+        custom_downstream_proxy_port,
     }
 }
 
@@ -2162,6 +2613,256 @@ async fn terminal_cached_if_none_match_is_304_on_miss_and_hit() {
         0,
         "cached 304 follow-up body tasks reached the downstream body filter"
     );
+}
+
+async fn read_h1_response_header(io: &mut TcpStream) -> Vec<u8> {
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let mut byte = [0u8; 1];
+        while !response.ends_with(b"\r\n\r\n") {
+            let read = io.read(&mut byte).await.unwrap();
+            assert_ne!(
+                read, 0,
+                "connection closed before the response header completed"
+            );
+            response.push(byte[0]);
+        }
+    })
+    .await
+    .expect("custom response header did not complete within one second");
+    response
+}
+
+async fn wait_for_custom_request_body_record(path: &str) -> CustomRequestBodyRecord {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        if let Some(record) = CUSTOM_REQUEST_BODY_RECORDS
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+        {
+            if record.logging_calls > 0 {
+                return record;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "custom request {path} did not reach logging within one second"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn run_h1_custom_upload_script(
+    path: &str,
+    script: &str,
+    chunks: &[&[u8]],
+    complete: bool,
+) -> (TcpStream, CustomRequestBodyRecord) {
+    CUSTOM_REQUEST_BODY_RECORDS.lock().unwrap().remove(path);
+    let harness = init();
+    let mut io = TcpStream::connect(("127.0.0.1", harness.custom_proxy_port))
+        .await
+        .unwrap();
+    io.write_all(
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\
+             Connection: keep-alive\r\n{CUSTOM_REQUEST_BODY_SCRIPT_HEADER}: {script}\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    for chunk in chunks {
+        io.write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+            .await
+            .unwrap();
+        io.write_all(chunk).await.unwrap();
+        io.write_all(b"\r\n").await.unwrap();
+        io.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if complete {
+        io.write_all(b"0\r\n\r\n").await.unwrap();
+        io.flush().await.unwrap();
+    }
+
+    let response = read_h1_response_header(&mut io).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 200"),
+        "unexpected custom response: {}",
+        String::from_utf8_lossy(&response)
+    );
+    let record = wait_for_custom_request_body_record(path).await;
+    (io, record)
+}
+
+#[tokio::test]
+async fn custom_early_response_abandons_h1_upload_and_closes_connection() {
+    let path = "/custom_early_response_h1";
+    let (mut io, record) =
+        run_h1_custom_upload_script(path, CUSTOM_EARLY_RESPONSE_SCRIPT, &[b"data"], false).await;
+    assert_eq!(
+        record.events,
+        vec![RequestBodyEvent::Data, RequestBodyEvent::Abandoned]
+    );
+    assert_eq!(record.logging_calls, 1);
+    assert!(!record.had_error);
+
+    let mut byte = [0u8; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(1), io.read(&mut byte))
+        .await
+        .expect("H1 connection with an unread request body stayed reusable");
+    assert!(matches!(closed, Ok(0) | Err(_)));
+}
+
+#[tokio::test]
+async fn custom_early_response_abandons_only_the_h2_stream() {
+    let path = "/custom_early_response_h2";
+    CUSTOM_REQUEST_BODY_RECORDS.lock().unwrap().remove(path);
+    let harness = init();
+    let tcp = TcpStream::connect(("127.0.0.1", harness.custom_proxy_port))
+        .await
+        .unwrap();
+    let (h2, connection) = h2::client::handshake(tcp).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let mut h2 = h2.ready().await.unwrap();
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("http://localhost{path}"))
+        .header(http::header::CONTENT_LENGTH, "8")
+        .header(
+            CUSTOM_REQUEST_BODY_SCRIPT_HEADER,
+            CUSTOM_EARLY_RESPONSE_SCRIPT,
+        )
+        .body(())
+        .unwrap();
+    let (response, mut request_body) = h2.send_request(request, false).unwrap();
+    request_body
+        .send_data(Bytes::from_static(b"data"), false)
+        .unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(1), response)
+        .await
+        .expect("custom H2 response did not complete within one second")
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let record = wait_for_custom_request_body_record(path).await;
+    assert_eq!(
+        record.events,
+        vec![RequestBodyEvent::Data, RequestBodyEvent::Abandoned]
+    );
+    assert_eq!(record.logging_calls, 1);
+    assert!(!record.had_error);
+
+    h2 = h2.ready().await.unwrap();
+    let next = http::Request::builder()
+        .uri("http://localhost/bodyless")
+        .body(())
+        .unwrap();
+    let (next_response, _) = h2.send_request(next, true).unwrap();
+    let next_response = tokio::time::timeout(Duration::from_secs(1), next_response)
+        .await
+        .expect("abandoning one H2 upload made the connection unusable")
+        .unwrap();
+    assert_eq!(
+        next_response.status(),
+        http::StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
+#[tokio::test]
+async fn custom_early_response_stops_polling_a_custom_downstream() {
+    let path = "/custom_early_response_custom";
+    let harness = init();
+
+    // The readiness probe also enters the force-custom handler. Let it finish
+    // before resetting the out-of-band observations for this request.
+    let _ = wait_for_custom_request_body_record(path).await;
+    CUSTOM_REQUEST_BODY_RECORDS.lock().unwrap().remove(path);
+    CUSTOM_DOWNSTREAM_BODY_READS.store(0, Ordering::SeqCst);
+    CUSTOM_DOWNSTREAM_RESPONSE_DONE.store(false, Ordering::SeqCst);
+    CUSTOM_DOWNSTREAM_WRITER_FINISHES.store(0, Ordering::SeqCst);
+    CUSTOM_DOWNSTREAM_WRITER_CLEANUPS.store(0, Ordering::SeqCst);
+
+    let _io = TcpStream::connect(("127.0.0.1", harness.custom_downstream_proxy_port))
+        .await
+        .unwrap();
+    let record = wait_for_custom_request_body_record(path).await;
+
+    assert_eq!(
+        record.events,
+        vec![RequestBodyEvent::Data, RequestBodyEvent::Abandoned]
+    );
+    assert_eq!(record.logging_calls, 1);
+    assert!(!record.had_error);
+    assert_eq!(
+        CUSTOM_DOWNSTREAM_BODY_READS.load(Ordering::SeqCst),
+        1,
+        "the custom downstream was polled again after Abandoned"
+    );
+    assert_eq!(
+        CUSTOM_DOWNSTREAM_WRITER_FINISHES.load(Ordering::SeqCst),
+        0,
+        "abandonment manufactured a clean custom-upstream EOS"
+    );
+    assert_eq!(
+        CUSTOM_DOWNSTREAM_WRITER_CLEANUPS.load(Ordering::SeqCst),
+        1,
+        "the custom body writer did not follow its normal cleanup path"
+    );
+}
+
+#[tokio::test]
+async fn custom_writer_rejection_dispatches_abandoned_exactly_once() {
+    for (path, script, chunks, expected) in [
+        (
+            "/custom_reject_first_write",
+            CUSTOM_REJECT_FIRST_WRITE_SCRIPT,
+            &[[b'a'; 4]][..],
+            vec![RequestBodyEvent::Data, RequestBodyEvent::Abandoned],
+        ),
+        (
+            "/custom_reject_later_write",
+            CUSTOM_REJECT_LATER_WRITE_SCRIPT,
+            &[[b'a'; 4], [b'b'; 4]][..],
+            vec![
+                RequestBodyEvent::Data,
+                RequestBodyEvent::Data,
+                RequestBodyEvent::Abandoned,
+            ],
+        ),
+    ] {
+        let chunk_refs: Vec<&[u8]> = chunks.iter().map(|chunk| chunk.as_slice()).collect();
+        let (_io, record) = run_h1_custom_upload_script(path, script, &chunk_refs, false).await;
+        assert_eq!(record.events, expected, "unexpected events for {script}");
+        assert_eq!(record.logging_calls, 1);
+        assert!(
+            record.had_error,
+            "writer rejection must remain an upstream error"
+        );
+    }
+}
+
+#[tokio::test]
+async fn custom_completed_upload_dispatches_complete_without_abandoned() {
+    let path = "/custom_complete_upload";
+    let (mut io, record) =
+        run_h1_custom_upload_script(path, CUSTOM_COMPLETE_UPLOAD_SCRIPT, &[b"data"], true).await;
+    assert_eq!(
+        record.events,
+        vec![RequestBodyEvent::Data, RequestBodyEvent::Complete]
+    );
+    assert_eq!(record.logging_calls, 1);
+    assert!(!record.had_error);
+
+    io.write_all(b"GET /bodyless HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let next = read_h1_response_header(&mut io).await;
+    assert!(next.starts_with(b"HTTP/1.1 503"));
 }
 
 #[tokio::test]
