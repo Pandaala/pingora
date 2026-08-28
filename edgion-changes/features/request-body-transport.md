@@ -43,7 +43,11 @@ framing.
 - The custom pump dispatches that event independently from its `BodyWrite`:
   abandonment never calls `finish()`, because a deliberately truncated upload
   is not a clean custom-upstream request EOS. A mid-upload writer rejection
-  dispatches the same terminal event before the existing error cleanup path.
+  dispatches the same terminal event before the existing error return path.
+- Natural request-body completion retains the downstream idle/disconnect
+  watcher while a custom upstream response is pending. Only application
+  abandonment disables that watcher; an unexpected successful custom idle
+  return never manufactures a second terminal event.
 - H1 downstream connections with unread body state are not reused. H2 keeps
   the connection and ends only the affected stream.
 - A final response already committed downstream disables retries even when an
@@ -61,4 +65,6 @@ connector harness. It covers early final responses and writer rejection with
 unfinished H1/H2 downstream uploads, exactly-once `Abandoned` delivery,
 protocol-specific cleanup, a completed-upload `Complete` control, and a
 custom-downstream case that keeps the opposite custom-message direction alive
-to prove terminal state stops further request-body polling.
+to prove abandonment stops further request-body polling. Completed-upload H1
+FIN and H2 reset controls prove natural completion still watches downstream
+disconnects while the custom upstream response is stalled.

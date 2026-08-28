@@ -142,6 +142,8 @@ const CUSTOM_REJECT_FIRST_WRITE_SCRIPT: &str = "reject-first-write";
 const CUSTOM_REJECT_LATER_WRITE_SCRIPT: &str = "reject-later-write";
 const CUSTOM_COMPLETE_UPLOAD_SCRIPT: &str = "complete-upload";
 const CUSTOM_DOWNSTREAM_EARLY_RESPONSE_SCRIPT: &str = "custom-downstream-early-response";
+const CUSTOM_WAIT_FOR_H1_CLOSE_SCRIPT: &str = "wait-for-h1-close";
+const CUSTOM_WAIT_FOR_H2_CLOSE_SCRIPT: &str = "wait-for-h2-close";
 const SUPPRESS_DOWNSTREAM_BODY_HEADER: (&str, &str) = ("x-suppress-downstream-body", "1");
 const RESPONSE_FILTER_CALLS_HEADER: &str = "x-test-response-filter-calls";
 const SUPPRESSED_BODY_EXTRA: &[u8] = b"+";
@@ -430,7 +432,11 @@ struct CustomRequestBodyRecord {
 static CUSTOM_REQUEST_BODY_RECORDS: Lazy<
     Mutex<std::collections::HashMap<String, CustomRequestBodyRecord>>,
 > = Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
-static CUSTOM_DOWNSTREAM_BODY_READS: AtomicUsize = AtomicUsize::new(0);
+static CUSTOM_STALLED_UPLOAD_FINISHED: Lazy<Mutex<std::collections::HashSet<String>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
+static CUSTOM_REJECTED_WRITER_ATTEMPTS: Lazy<Mutex<std::collections::HashMap<String, usize>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+static CUSTOM_DOWNSTREAM_POST_RESPONSE_BODY_POLLS: AtomicUsize = AtomicUsize::new(0);
 static CUSTOM_DOWNSTREAM_RESPONSE_DONE: AtomicBool = AtomicBool::new(false);
 static CUSTOM_DOWNSTREAM_RESPONSE_CHANGED: Lazy<tokio::sync::Notify> =
     Lazy::new(tokio::sync::Notify::new);
@@ -629,6 +635,10 @@ impl BodyWrite for NoopBodyWriter {
                 | (Some(CUSTOM_REJECT_LATER_WRITE_SCRIPT), 2)
         );
         if reject {
+            CUSTOM_REJECTED_WRITER_ATTEMPTS
+                .lock()
+                .unwrap()
+                .insert(self.script.clone().unwrap(), attempt);
             return pingora_error::Error::e_explain(
                 pingora_error::ErrorType::WriteError,
                 "scripted custom request-body writer rejection",
@@ -644,6 +654,15 @@ impl BodyWrite for NoopBodyWriter {
         }
         self.progress.finished.store(true, Ordering::SeqCst);
         self.progress.changed.notify_one();
+        if matches!(
+            self.script.as_deref(),
+            Some(CUSTOM_WAIT_FOR_H1_CLOSE_SCRIPT | CUSTOM_WAIT_FOR_H2_CLOSE_SCRIPT)
+        ) {
+            CUSTOM_STALLED_UPLOAD_FINISHED
+                .lock()
+                .unwrap()
+                .insert(self.script.clone().unwrap());
+        }
         Ok(())
     }
 
@@ -687,9 +706,11 @@ impl HeaderOnlyCustomSession {
                     .load(Ordering::SeqCst)
                     >= 2
             }
-            Some(CUSTOM_COMPLETE_UPLOAD_SCRIPT) => {
-                self.request_body_progress.finished.load(Ordering::SeqCst)
-            }
+            Some(
+                CUSTOM_COMPLETE_UPLOAD_SCRIPT
+                | CUSTOM_WAIT_FOR_H1_CLOSE_SCRIPT
+                | CUSTOM_WAIT_FOR_H2_CLOSE_SCRIPT,
+            ) => self.request_body_progress.finished.load(Ordering::SeqCst),
             _ => true,
         };
         while !ready() {
@@ -796,6 +817,12 @@ impl CustomSession for HeaderOnlyCustomSession {
 
     async fn read_response_header(&mut self) -> Result<()> {
         self.wait_for_scripted_request_body_state().await;
+        if matches!(
+            self.request_body_script.as_deref(),
+            Some(CUSTOM_WAIT_FOR_H1_CLOSE_SCRIPT | CUSTOM_WAIT_FOR_H2_CLOSE_SCRIPT)
+        ) {
+            return std::future::pending().await;
+        }
         Ok(())
     }
 
@@ -1528,18 +1555,16 @@ impl CustomServerSession for ScriptedCustomDownstream {
         false
     }
 
-    async fn read_body_or_idle(&mut self, _no_body_expected: bool) -> Result<Option<Bytes>> {
+    async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
+        if CUSTOM_DOWNSTREAM_RESPONSE_DONE.load(Ordering::SeqCst) {
+            CUSTOM_DOWNSTREAM_POST_RESPONSE_BODY_POLLS.fetch_add(1, Ordering::SeqCst);
+        }
         if self.body_reads == 0 {
             self.body_reads = 1;
-            CUSTOM_DOWNSTREAM_BODY_READS.fetch_add(1, Ordering::SeqCst);
             Ok(Some(Bytes::from_static(b"data")))
         } else {
-            while !CUSTOM_DOWNSTREAM_RESPONSE_DONE.load(Ordering::SeqCst) {
-                CUSTOM_DOWNSTREAM_RESPONSE_CHANGED.notified().await;
-            }
-            self.body_reads += 1;
-            CUSTOM_DOWNSTREAM_BODY_READS.fetch_add(1, Ordering::SeqCst);
-            Ok(None)
+            let _ = no_body_expected;
+            std::future::pending().await
         }
     }
 
@@ -2654,6 +2679,77 @@ async fn wait_for_custom_request_body_record(path: &str) -> CustomRequestBodyRec
     }
 }
 
+async fn wait_for_custom_stalled_upload(script: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        if CUSTOM_STALLED_UPLOAD_FINISHED
+            .lock()
+            .unwrap()
+            .contains(script)
+        {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let observed = CUSTOM_STALLED_UPLOAD_FINISHED.lock().unwrap().clone();
+            panic!(
+                "custom request body for {script} did not finish upstream; observed {observed:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DataEventCount {
+    Any,
+    AtLeastOne,
+    Exactly(usize),
+}
+
+fn assert_request_body_terminal_events(
+    events: &[RequestBodyEvent],
+    terminal: RequestBodyEvent,
+    expected_data_events: DataEventCount,
+    scenario: &str,
+) {
+    let Some((last, data_events)) = events.split_last() else {
+        panic!("{scenario} dispatched no request-body events");
+    };
+    assert_eq!(
+        *last, terminal,
+        "{scenario} dispatched the wrong terminal event: {events:?}"
+    );
+    assert!(
+        data_events
+            .iter()
+            .all(|event| *event == RequestBodyEvent::Data),
+        "{scenario} dispatched a non-Data event before its terminal event: {events:?}"
+    );
+    match expected_data_events {
+        DataEventCount::Any => {}
+        DataEventCount::AtLeastOne => assert!(
+            !data_events.is_empty(),
+            "{scenario} dispatched no standalone Data event: {events:?}"
+        ),
+        DataEventCount::Exactly(expected) => assert_eq!(
+            data_events.len(),
+            expected,
+            "{scenario} dispatched the wrong number of standalone Data events: {events:?}"
+        ),
+    }
+}
+
+fn assert_completed_body_before_disconnect(record: &CustomRequestBodyRecord) {
+    assert_request_body_terminal_events(
+        &record.events,
+        RequestBodyEvent::Complete,
+        DataEventCount::Any,
+        "completed upload before downstream disconnect",
+    );
+    assert_eq!(record.logging_calls, 1);
+    assert!(record.had_error);
+}
+
 async fn run_h1_custom_upload_script(
     path: &str,
     script: &str,
@@ -2703,9 +2799,11 @@ async fn custom_early_response_abandons_h1_upload_and_closes_connection() {
     let path = "/custom_early_response_h1";
     let (mut io, record) =
         run_h1_custom_upload_script(path, CUSTOM_EARLY_RESPONSE_SCRIPT, &[b"data"], false).await;
-    assert_eq!(
-        record.events,
-        vec![RequestBodyEvent::Data, RequestBodyEvent::Abandoned]
+    assert_request_body_terminal_events(
+        &record.events,
+        RequestBodyEvent::Abandoned,
+        DataEventCount::AtLeastOne,
+        "H1 early response",
     );
     assert_eq!(record.logging_calls, 1);
     assert!(!record.had_error);
@@ -2750,9 +2848,11 @@ async fn custom_early_response_abandons_only_the_h2_stream() {
         .unwrap();
     assert_eq!(response.status(), http::StatusCode::OK);
     let record = wait_for_custom_request_body_record(path).await;
-    assert_eq!(
-        record.events,
-        vec![RequestBodyEvent::Data, RequestBodyEvent::Abandoned]
+    assert_request_body_terminal_events(
+        &record.events,
+        RequestBodyEvent::Abandoned,
+        DataEventCount::Exactly(1),
+        "H2 early response",
     );
     assert_eq!(record.logging_calls, 1);
     assert!(!record.had_error);
@@ -2782,7 +2882,7 @@ async fn custom_early_response_stops_polling_a_custom_downstream() {
     // before resetting the out-of-band observations for this request.
     let _ = wait_for_custom_request_body_record(path).await;
     CUSTOM_REQUEST_BODY_RECORDS.lock().unwrap().remove(path);
-    CUSTOM_DOWNSTREAM_BODY_READS.store(0, Ordering::SeqCst);
+    CUSTOM_DOWNSTREAM_POST_RESPONSE_BODY_POLLS.store(0, Ordering::SeqCst);
     CUSTOM_DOWNSTREAM_RESPONSE_DONE.store(false, Ordering::SeqCst);
     CUSTOM_DOWNSTREAM_WRITER_FINISHES.store(0, Ordering::SeqCst);
     CUSTOM_DOWNSTREAM_WRITER_CLEANUPS.store(0, Ordering::SeqCst);
@@ -2792,15 +2892,17 @@ async fn custom_early_response_stops_polling_a_custom_downstream() {
         .unwrap();
     let record = wait_for_custom_request_body_record(path).await;
 
-    assert_eq!(
-        record.events,
-        vec![RequestBodyEvent::Data, RequestBodyEvent::Abandoned]
+    assert_request_body_terminal_events(
+        &record.events,
+        RequestBodyEvent::Abandoned,
+        DataEventCount::Exactly(1),
+        "custom-downstream early response",
     );
     assert_eq!(record.logging_calls, 1);
     assert!(!record.had_error);
     assert_eq!(
-        CUSTOM_DOWNSTREAM_BODY_READS.load(Ordering::SeqCst),
-        1,
+        CUSTOM_DOWNSTREAM_POST_RESPONSE_BODY_POLLS.load(Ordering::SeqCst),
+        0,
         "the custom downstream was polled again after Abandoned"
     );
     assert_eq!(
@@ -2817,27 +2919,41 @@ async fn custom_early_response_stops_polling_a_custom_downstream() {
 
 #[tokio::test]
 async fn custom_writer_rejection_dispatches_abandoned_exactly_once() {
-    for (path, script, chunks, expected) in [
+    for (path, script, chunks, expected_writer_attempt) in [
         (
             "/custom_reject_first_write",
             CUSTOM_REJECT_FIRST_WRITE_SCRIPT,
             &[[b'a'; 4]][..],
-            vec![RequestBodyEvent::Data, RequestBodyEvent::Abandoned],
+            1,
         ),
         (
             "/custom_reject_later_write",
             CUSTOM_REJECT_LATER_WRITE_SCRIPT,
             &[[b'a'; 4], [b'b'; 4]][..],
-            vec![
-                RequestBodyEvent::Data,
-                RequestBodyEvent::Data,
-                RequestBodyEvent::Abandoned,
-            ],
+            2,
         ),
     ] {
+        CUSTOM_REJECTED_WRITER_ATTEMPTS
+            .lock()
+            .unwrap()
+            .remove(script);
         let chunk_refs: Vec<&[u8]> = chunks.iter().map(|chunk| chunk.as_slice()).collect();
         let (_io, record) = run_h1_custom_upload_script(path, script, &chunk_refs, false).await;
-        assert_eq!(record.events, expected, "unexpected events for {script}");
+        assert_request_body_terminal_events(
+            &record.events,
+            RequestBodyEvent::Abandoned,
+            DataEventCount::AtLeastOne,
+            script,
+        );
+        assert_eq!(
+            CUSTOM_REJECTED_WRITER_ATTEMPTS
+                .lock()
+                .unwrap()
+                .get(script)
+                .copied(),
+            Some(expected_writer_attempt),
+            "{script} rejected the wrong real writer attempt"
+        );
         assert_eq!(record.logging_calls, 1);
         assert!(
             record.had_error,
@@ -2851,9 +2967,11 @@ async fn custom_completed_upload_dispatches_complete_without_abandoned() {
     let path = "/custom_complete_upload";
     let (mut io, record) =
         run_h1_custom_upload_script(path, CUSTOM_COMPLETE_UPLOAD_SCRIPT, &[b"data"], true).await;
-    assert_eq!(
-        record.events,
-        vec![RequestBodyEvent::Data, RequestBodyEvent::Complete]
+    assert_request_body_terminal_events(
+        &record.events,
+        RequestBodyEvent::Complete,
+        DataEventCount::AtLeastOne,
+        "completed H1 upload",
     );
     assert_eq!(record.logging_calls, 1);
     assert!(!record.had_error);
@@ -2863,6 +2981,90 @@ async fn custom_completed_upload_dispatches_complete_without_abandoned() {
         .unwrap();
     let next = read_h1_response_header(&mut io).await;
     assert!(next.starts_with(b"HTTP/1.1 503"));
+}
+
+#[tokio::test]
+async fn custom_upstream_watches_h1_disconnect_after_completed_upload() {
+    let path = "/custom_completed_upload_then_h1_disconnect";
+    CUSTOM_REQUEST_BODY_RECORDS.lock().unwrap().remove(path);
+    CUSTOM_STALLED_UPLOAD_FINISHED
+        .lock()
+        .unwrap()
+        .remove(CUSTOM_WAIT_FOR_H1_CLOSE_SCRIPT);
+    let harness = init();
+    let mut io = TcpStream::connect(("127.0.0.1", harness.custom_proxy_port))
+        .await
+        .unwrap();
+    io.write_all(
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\
+             {CUSTOM_REQUEST_BODY_SCRIPT_HEADER}: {CUSTOM_WAIT_FOR_H1_CLOSE_SCRIPT}\r\n\r\ndata"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    io.flush().await.unwrap();
+
+    wait_for_custom_stalled_upload(CUSTOM_WAIT_FOR_H1_CLOSE_SCRIPT).await;
+    io.shutdown().await.unwrap();
+
+    let record = wait_for_custom_request_body_record(path).await;
+    assert_completed_body_before_disconnect(&record);
+}
+
+#[tokio::test]
+async fn custom_upstream_watches_h2_reset_after_completed_upload() {
+    let path = "/custom_completed_upload_then_h2_reset";
+    CUSTOM_REQUEST_BODY_RECORDS.lock().unwrap().remove(path);
+    CUSTOM_STALLED_UPLOAD_FINISHED
+        .lock()
+        .unwrap()
+        .remove(CUSTOM_WAIT_FOR_H2_CLOSE_SCRIPT);
+    let harness = init();
+    let tcp = TcpStream::connect(("127.0.0.1", harness.custom_proxy_port))
+        .await
+        .unwrap();
+    let (h2, connection) = h2::client::handshake(tcp).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let mut h2 = h2.ready().await.unwrap();
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("http://localhost{path}"))
+        .header(http::header::CONTENT_LENGTH, "4")
+        .header(
+            CUSTOM_REQUEST_BODY_SCRIPT_HEADER,
+            CUSTOM_WAIT_FOR_H2_CLOSE_SCRIPT,
+        )
+        .body(())
+        .unwrap();
+    let (_response, mut request_body) = h2.send_request(request, false).unwrap();
+    request_body
+        .send_data(Bytes::from_static(b"data"), true)
+        .unwrap();
+
+    wait_for_custom_stalled_upload(CUSTOM_WAIT_FOR_H2_CLOSE_SCRIPT).await;
+    request_body.send_reset(h2::Reason::CANCEL);
+
+    let record = wait_for_custom_request_body_record(path).await;
+    assert_completed_body_before_disconnect(&record);
+
+    h2 = h2.ready().await.unwrap();
+    let next = http::Request::builder()
+        .uri("http://localhost/bodyless")
+        .body(())
+        .unwrap();
+    let (next_response, _) = h2.send_request(next, true).unwrap();
+    let next_response = tokio::time::timeout(Duration::from_secs(1), next_response)
+        .await
+        .expect("resetting one completed upload made the H2 connection unusable")
+        .unwrap();
+    assert_eq!(
+        next_response.status(),
+        http::StatusCode::SERVICE_UNAVAILABLE
+    );
 }
 
 #[tokio::test]

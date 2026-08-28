@@ -35,7 +35,7 @@ Expected feature coverage:
 | `pingora-core --lib --features boringssl test_listen_tls_proxy_protocol` | explicit PROXY-before-TLS rejection stages, successful handshake and address preservation |
 | `pingora-proxy --lib` | disposition truth tables, terminal latch, sink budget, EOS migration, retry guards |
 | `test_request_body_seam` | 54 H1/H2 request-pump, framing, retry and termination scenarios |
-| `test_upstream_response_body_sink` | 48 response streaming/cache/custom scenarios |
+| `test_upstream_response_body_sink` | 50 response streaming/cache/custom scenarios |
 | `test_terminal_body_dispatch` | 9 self-contained terminal/trailer scenarios |
 | `test_h2_upstream_no_error_reset` | 8 self-contained H2 reset/completion scenarios |
 | `test_h2_upstream_stalled_after_response` | 3 H2 request-body stall, configured-deadline and no-write-timeout scenarios |
@@ -44,7 +44,7 @@ Expected feature coverage:
 ## Validation snapshot
 
 Validated on 2026-08-28 against the `edgion_v3` working tree based on
-`849adea`:
+`ff5f045`:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo check -p pingora-core -p pingora-proxy`: passed.
@@ -57,7 +57,7 @@ Validated on 2026-08-28 against the `edgion_v3` working tree based on
   2 passed.
 - `cargo test -p pingora-proxy --lib`: 114 passed.
 - `test_request_body_seam`: 54 passed.
-- `test_upstream_response_body_sink`: 48 passed.
+- `test_upstream_response_body_sink`: 50 passed.
 - `test_terminal_body_dispatch`: 9 passed.
 - `test_h2_upstream_no_error_reset`: 8 passed.
 - `test_h2_upstream_stalled_after_response`: 3 passed.
@@ -78,6 +78,9 @@ rather than a regression in this feature stack.
 - No Cargo.toml, crate version or dependency change belongs to this feature
   stack unless a future feature explicitly needs one.
 - New integration tests remain standalone test targets.
+- Substantial new harnesses follow the root `AGENTS.md` test-organization rule:
+  behavior-grouped external files by default, without widening production APIs
+  merely to move private-detail tests.
 - The original `edgion` and `edgion_v2` refs still resolve to their recorded
   SHAs.
 - A rebase/merge-tree preview against the target main is reviewed before the

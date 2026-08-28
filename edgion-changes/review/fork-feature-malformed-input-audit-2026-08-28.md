@@ -19,12 +19,13 @@ issues. Each pending issue or durable review record remains canonical.
 Malformed, truncated, oversized, slow, reset, premature-response, and
 contradictory framing/termination shapes were treated as defensive test input.
 
-## Finding resolved after this audit
+## Finding correction resolved after this audit
 
 - [Custom upstream early response misses request-body abandonment](custom/custom-upstream-early-response-abandonment.md)
   was medium for the public fork and currently unreachable in Edgion. The
-  correction prevents a custom downstream from being polled after `Abandoned`
-  and passed fresh independent review and the project verification matrix.
+  correction prevents body polling after `Abandoned` while retaining the
+  natural-completion downstream idle watcher. Fresh independent review returned
+  LGTM and the project verification matrix passed.
 
 ## Confirmed existing open findings
 

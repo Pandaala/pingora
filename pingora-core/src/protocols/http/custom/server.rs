@@ -116,6 +116,13 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     fn is_body_empty(&mut self) -> bool;
 
+    /// Read the next request-body chunk, or watch the downstream session after
+    /// its body is complete.
+    ///
+    /// Once `no_body_expected` is true or this session has returned body EOF,
+    /// the future must remain pending until the downstream terminates, then
+    /// return an error describing that termination. It must not return a
+    /// successful `None` or body chunk while acting as the idle watcher.
     async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>>;
 
     fn body_bytes_sent(&self) -> usize;

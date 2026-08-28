@@ -93,6 +93,20 @@ cache fill, retry, early response, terminal trailer/Done, reset, and connection
 reuse paths. Wire END_STREAM, decoded EOF, content-length satisfaction,
 application abandonment, and replay EOF are distinct facts.
 
+## Test organization
+
+- Prefer substantial test suites and tests that require large fixtures or
+  harnesses in dedicated, behavior-grouped files instead of growing large
+  inline `#[cfg(test)]` modules. Use crate-level `tests/` integration targets
+  for public behavior, or an external `#[cfg(test)]` submodule when private
+  implementation access is necessary.
+- Keep small, focused tests inline when they directly exercise private details.
+  Do not widen production APIs, raise item visibility, or add test-only
+  production interfaces merely to move tests out of the source file.
+- Reuse shared harness code from a test subdirectory or `common/mod.rs`. Avoid
+  one-test-per-file fragmentation and unnecessary extra targets that duplicate
+  service startup or create fixed-port conflicts.
+
 ## Knowledge maintenance
 
 - Update [`features.md`](edgion-changes/features.md) and the matching detailed

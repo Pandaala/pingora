@@ -473,6 +473,10 @@ where
         // derived from in `proxy_to_custom_upstream`; see
         // `no_downstream_body_to_read`.
         let mut downstream_state = DownstreamStateMachine::new(no_downstream_body_to_read(session));
+        // `ReadingFinished` still owns an idle/disconnect watcher. Stop that
+        // watcher only when the application abandons the upload, or when a
+        // custom downstream violates the idle contract by returning success.
+        let mut poll_downstream_body_or_idle = true;
 
         // retry, send buffer if it exists
         if let Some(buffer) = session.as_mut().get_retry_buffer() {
@@ -533,6 +537,7 @@ where
                 )
                 .await?;
                 downstream_state.maybe_finished(true);
+                poll_downstream_body_or_idle = false;
                 if let Some(cancel) = cancel_downstream_reader_tx.take() {
                     let _ = cancel.send(());
                 }
@@ -545,7 +550,9 @@ where
             let upgraded = session.was_upgraded();
 
             tokio::select! {
-                body = session.downstream_session.read_body_or_idle(false), if downstream_state.is_reading() => {
+                body = session.downstream_session.read_body_or_idle(downstream_state.is_done()),
+                    if downstream_state.can_poll() && poll_downstream_body_or_idle => {
+                    let reading_body = downstream_state.is_reading();
                     let body = match body {
                         Ok(b) => b,
                         Err(e) => {
@@ -569,9 +576,17 @@ where
                                 continue;
                            } else {
                                 return Err(e.into_down());
-                           }
+                            }
                         }
                     };
+                    if !reading_body {
+                        // Built-in downstreams resolve an idle watch only with
+                        // an error. A custom implementation may instead return
+                        // success; do not manufacture another request-body
+                        // terminal event or spin by polling it again.
+                        poll_downstream_body_or_idle = false;
+                        continue;
+                    }
                     let is_body_done = session.is_body_done();
                     let event = RequestBodyEvent::from(is_body_done);
 
