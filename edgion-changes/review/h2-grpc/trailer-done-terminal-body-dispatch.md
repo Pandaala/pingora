@@ -16,6 +16,13 @@ with trailers and one that ends with a bare `HttpTask::Done`. A per-response
 latch (`proxy_common::TerminalBodyDispatch`) decides which task delivers it, and
 released bytes are emitted ahead of the terminating task.
 
+The H1 trailer re-evaluation trigger fired on 2026-08-28. The response-wide
+latch is now shared by H1, H2, and custom pumps and returns a typed event:
+`TerminalBeforeTrailers` for a real trailer map and
+`TerminalWithoutTrailers` for an empty trailer or bare Done. H1 parsing and
+writing use the same ordering and exactly-once contract; this remains a fixed
+fork-owned finding rather than a new issue.
+
 Fix suggestions of the form "just call `terminal_upstream_body_filter` from
 `upstream_filter`", "add a `Trailer` arm to the `upstream_filter` dispatch
 table", or "let both `Trailer` and `Done` fire the callback" are **not
@@ -88,8 +95,6 @@ that ordering is load-bearing for a bare `Done`, which runs
 
 Re-open only if:
 
-- H1 trailer parsing lands (`pingora-core/.../http/v1/client.rs`,
-  `// TODO: support h1 trailer`) and the H1 pump needs the latch wired in.
 - A response pump gains a termination shape outside the six enumerated ones
   (`Header`-EOS, `Body`-EOS, trailers, bare `Done`, `Failed`, H1 framings).
 - `cache_http_task` stops treating `HttpTask::Trailer(_)` as a no-op, which

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use http::{HeaderMap, HeaderName, HeaderValue};
 use log::{debug, trace, warn};
 use pingora_error::{
     Error,
@@ -25,6 +26,7 @@ use std::pin::{pin, Pin};
 use std::task::{ready, Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use super::common::MAX_HEADERS;
 use crate::utils::BufRef;
 
 // TODO: make this dynamically adjusted
@@ -32,9 +34,7 @@ const BODY_BUFFER_SIZE: usize = 1024 * 64;
 // limit how much incomplete chunk-size and chunk-ext to buffer
 const PARTIAL_CHUNK_HEAD_LIMIT: usize = 1024 * 8;
 // Trailers: https://datatracker.ietf.org/doc/html/rfc9112#section-7.1.2
-// TODO: proper trailer handling and parsing
-// generally trailers are an uncommonly used HTTP/1.1 feature, this is a somewhat
-// arbitrary cap on trailer size after the 0 chunk size (like header buf)
+// This cap applies to the complete trailer section after the zero-size chunk.
 const TRAILER_SIZE_LIMIT: usize = 1024 * 64;
 
 const LAST_CHUNK: &[u8; 5] = &[b'0', CR, LF, CR, LF];
@@ -152,6 +152,8 @@ pub struct BodyReader {
     upstream: bool,
     body_buf_overread: Option<BytesMut>,
     trailers_present: bool,
+    trailers: Option<HeaderMap>,
+    trailer_buf: BytesMut,
 }
 
 impl BodyReader {
@@ -164,6 +166,8 @@ impl BodyReader {
             upstream,
             body_buf_overread: None,
             trailers_present: false,
+            trailers: None,
+            trailer_buf: BytesMut::new(),
         }
     }
 
@@ -174,6 +178,8 @@ impl BodyReader {
     pub fn reinit(&mut self) {
         self.body_state = PS::ToStart;
         self.trailers_present = false;
+        self.trailers = None;
+        self.trailer_buf.clear();
     }
 
     fn prepare_buf(&mut self, buf_to_rewind: &[u8]) {
@@ -370,6 +376,42 @@ impl BodyReader {
 
     pub fn trailers_present(&self) -> bool {
         self.trailers_present
+    }
+
+    /// Take the parsed HTTP/1.1 chunked response trailers, if any.
+    pub fn take_trailers(&mut self) -> Option<HeaderMap> {
+        self.trailers.take()
+    }
+
+    fn parse_trailers(raw: &[u8]) -> Result<HeaderMap> {
+        if raw.len() > TRAILER_SIZE_LIMIT {
+            return Error::e_explain(INVALID_TRAILER_END, "Trailer size over limit");
+        }
+        let mut parsed = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        let httparse::Status::Complete((consumed, fields)) =
+            httparse::parse_headers(raw, &mut parsed).map_err(|e| {
+                Error::explain(INVALID_TRAILER_END, format!("Invalid trailer fields: {e}"))
+            })?
+        else {
+            return Error::e_explain(INVALID_TRAILER_END, "Incomplete trailer fields");
+        };
+        if consumed != raw.len() {
+            return Error::e_explain(INVALID_TRAILER_END, "Unexpected bytes after trailer fields");
+        }
+        let mut trailers = HeaderMap::with_capacity(fields.len());
+        for field in fields {
+            let name = HeaderName::from_bytes(field.name.as_bytes()).map_err(|e| {
+                Error::explain(INVALID_TRAILER_END, format!("Invalid trailer name: {e}"))
+            })?;
+            if forbidden_trailer_name(&name) {
+                return Error::e_explain(INVALID_TRAILER_END, "Forbidden HTTP trailer field");
+            }
+            let value = HeaderValue::from_bytes(field.value).map_err(|e| {
+                Error::explain(INVALID_TRAILER_END, format!("Invalid trailer value: {e}"))
+            })?;
+            trailers.append(name, value);
+        }
+        Ok(trailers)
     }
 
     fn finish_body_buf(&mut self, end_of_body: usize, total_read: usize) {
@@ -815,8 +857,7 @@ impl BodyReader {
     {
         // parse section after last-chunk: https://datatracker.ietf.org/doc/html/rfc9112#section-7.1
         // This is the section after the final chunk we're trying to read, which can include
-        // HTTP1 trailers (currently we just discard them).
-        // Really we are just waiting for a consecutive CRLF + CRLF to end the body.
+        // HTTP/1 trailers, which are retained after bounded validation.
         match self.body_state {
             PS::ChunkedFinal(read, trailers_read, existing_buf_end, end_read) => {
                 let n = if existing_buf_end != 0 {
@@ -848,6 +889,13 @@ impl BodyReader {
                         ),
                     );
                 }
+
+                self.trailer_buf.extend_from_slice(
+                    &self
+                        .body_buf
+                        .as_deref()
+                        .expect("body buf is initialized before reading trailers")[..n],
+                );
 
                 // Re-borrow just the buffer field so `self.body_state` stays assignable below.
                 let buf = &self
@@ -916,6 +964,15 @@ impl BodyReader {
                             );
 
                             self.trailers_present = trailers_present;
+                            let consumed = start + end_idx;
+                            self.trailer_buf.truncate(
+                                self.trailer_buf
+                                    .len()
+                                    .saturating_sub(n.saturating_sub(consumed)),
+                            );
+                            if trailers_present {
+                                self.trailers = Some(Self::parse_trailers(&self.trailer_buf)?);
+                            }
                             self.finish_body_buf(start + end_idx, n);
                             return Ok(None);
                         }
@@ -1078,6 +1135,22 @@ impl BodyReader {
             }
         }
     }
+}
+
+fn forbidden_trailer_name(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "content-length"
+            | "transfer-encoding"
+            | "trailer"
+            | "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "upgrade"
+            | "host"
+    )
 }
 
 pub enum TrailersEndParseState {
@@ -1286,6 +1359,11 @@ impl Default for BodyWriter {
 }
 
 impl BodyWriter {
+    /// Whether the selected response framing can carry HTTP trailers.
+    pub fn trailers_supported(&self) -> bool {
+        matches!(self.body_mode, BM::ChunkedEncoding(_))
+    }
+
     pub fn new() -> Self {
         BodyWriter {
             body_mode: BM::ToSelect,
@@ -1443,6 +1521,74 @@ impl BodyWriter {
             BM::UntilClose(_) => self.do_finish_until_close_body(stream),
             BM::ToSelect => Ok(None),
         }
+    }
+
+    /// Finish a chunked HTTP/1.1 body with a validated trailer section.
+    /// Validation and bounded serialization complete before any bytes are
+    /// written, so malformed trailers cannot partially commit downstream.
+    pub async fn write_trailers<S>(
+        &mut self,
+        stream: &mut S,
+        trailers: &HeaderMap,
+    ) -> Result<Option<usize>>
+    where
+        S: AsyncWrite + Unpin + Send,
+    {
+        let (wire, written) = self.prepare_trailers(trailers)?;
+
+        stream
+            .write_all(&wire)
+            .await
+            .or_err(WriteError, "while writing HTTP trailers")?;
+        stream
+            .flush()
+            .await
+            .or_err(WriteError, "flushing HTTP trailers")?;
+        self.mark_trailers_written(written);
+        Ok(Some(written))
+    }
+
+    /// Validate and serialize a trailer block without changing writer state.
+    /// The proxy task writer uses this to retain cancel-safe write progress.
+    pub(super) fn prepare_trailers(&self, trailers: &HeaderMap) -> Result<(Bytes, usize)> {
+        let BM::ChunkedEncoding(written) = self.body_mode else {
+            return Error::e_explain(WriteError, "HTTP trailers require chunked encoding");
+        };
+        if trailers.len() > MAX_HEADERS {
+            return Error::e_explain(WriteError, "Too many HTTP trailer fields");
+        }
+
+        let mut wire = BytesMut::with_capacity(256);
+        wire.put_slice(b"0\r\n");
+        for (name, value) in trailers {
+            if forbidden_trailer_name(name) {
+                return Error::e_explain(WriteError, "Forbidden HTTP trailer field");
+            }
+            let next_len = wire
+                .len()
+                .checked_add(name.as_str().len())
+                .and_then(|len| len.checked_add(2))
+                .and_then(|len| len.checked_add(value.as_bytes().len()))
+                .and_then(|len| len.checked_add(2))
+                .ok_or_else(|| Error::explain(WriteError, "HTTP trailer size overflow"))?;
+            if next_len
+                .checked_add(2)
+                .is_none_or(|final_len| final_len > TRAILER_SIZE_LIMIT)
+            {
+                return Error::e_explain(WriteError, "Trailer size over limit");
+            }
+            wire.put_slice(name.as_str().as_bytes());
+            wire.put_slice(b": ");
+            wire.put_slice(value.as_bytes());
+            wire.put_slice(CRLF);
+        }
+        wire.put_slice(CRLF);
+        Ok((wire.freeze(), written))
+    }
+
+    pub(super) fn mark_trailers_written(&mut self, written: usize) {
+        debug_assert!(matches!(self.body_mode, BM::ChunkedEncoding(n) if n == written));
+        self.body_mode = BM::Complete(written);
     }
 
     fn do_finish_body<S>(&mut self, _stream: S) -> Result<Option<usize>> {
@@ -4155,6 +4301,7 @@ mod test_poll_body_writer {
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::AsyncWrite;
+    use tokio_test::io::Builder;
 
     /// Programmable in-memory [`AsyncWrite`]. Each scripted entry dictates
     /// the outcome of one `poll_write` / `poll_write_vectored` call.
@@ -4447,5 +4594,120 @@ mod test_poll_body_writer {
         assert!(matches!(res, Ok(Some(5))));
         assert_eq!(mock.written, data);
         assert!(mock.next.is_empty());
+    }
+
+    #[tokio::test]
+    async fn chunked_trailers_are_parsed_with_duplicates_and_overread_preserved() {
+        let mut io = Builder::new()
+            .read(b"3\r\nabc\r\n0\r\nx-a: 1\r\n")
+            .read(b"x-a: 2\r\nx-b: final\r\n\r\nNEXT")
+            .build();
+        let mut reader = BodyReader::new(true);
+        reader.init_chunked(b"");
+        while !reader.body_done() {
+            let _ = reader.read_body(&mut io).await.unwrap();
+        }
+
+        let trailers = reader
+            .take_trailers()
+            .expect("real trailers must be retained");
+        assert_eq!(
+            trailers
+                .get_all("x-a")
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["1", "2"]
+        );
+        assert_eq!(trailers["x-b"], "final");
+        assert_eq!(reader.get_body_overread(), Some(&b"NEXT"[..]));
+    }
+
+    #[test]
+    fn trailer_parser_rejects_malformed_forbidden_count_and_size_boundaries() {
+        for invalid in [
+            &b"missing-colon\r\n\r\n"[..],
+            &b"content-length: 1\r\n\r\n"[..],
+            &b"connection: close\r\n\r\n"[..],
+            &b"host: example.com\r\n\r\n"[..],
+        ] {
+            assert!(BodyReader::parse_trailers(invalid).is_err());
+        }
+
+        let mut fields = Vec::new();
+        for _ in 0..MAX_HEADERS {
+            fields.extend_from_slice(b"x-duplicate: ok\r\n");
+        }
+        fields.extend_from_slice(b"\r\n");
+        assert_eq!(
+            BodyReader::parse_trailers(&fields).unwrap().len(),
+            MAX_HEADERS
+        );
+        fields.splice(
+            fields.len() - 2..fields.len() - 2,
+            b"x-over: no\r\n".iter().copied(),
+        );
+        assert!(BodyReader::parse_trailers(&fields).is_err());
+
+        let oversized = vec![b'a'; TRAILER_SIZE_LIMIT + 1];
+        assert!(BodyReader::parse_trailers(&oversized).is_err());
+    }
+
+    #[tokio::test]
+    async fn chunked_trailer_writer_preserves_duplicates_and_rejects_non_chunked() {
+        let expected = b"0\r\nx-a: 1\r\nx-a: 2\r\n\r\n";
+        let mut io = Builder::new().write(expected).build();
+        let mut writer = BodyWriter::new();
+        writer.init_chunked();
+        let mut trailers = HeaderMap::new();
+        trailers.append("x-a", HeaderValue::from_static("1"));
+        trailers.append("x-a", HeaderValue::from_static("2"));
+        assert_eq!(
+            writer.write_trailers(&mut io, &trailers).await.unwrap(),
+            Some(0)
+        );
+        assert_eq!(writer.body_mode, BodyMode::Complete(0));
+
+        let mut no_write = Builder::new().build();
+        let mut content_length = BodyWriter::new();
+        content_length.init_content_length(0);
+        assert!(content_length
+            .write_trailers(&mut no_write, &trailers)
+            .await
+            .is_err());
+
+        let mut too_many = HeaderMap::new();
+        for _ in 0..=MAX_HEADERS {
+            too_many.append("x-duplicate", HeaderValue::from_static("ok"));
+        }
+        let mut no_write = Builder::new().build();
+        let mut writer = BodyWriter::new();
+        writer.init_chunked();
+        assert!(writer
+            .write_trailers(&mut no_write, &too_many)
+            .await
+            .is_err());
+
+        let mut too_large = HeaderMap::new();
+        too_large.insert(
+            "x-large",
+            HeaderValue::from_bytes(&vec![b'a'; TRAILER_SIZE_LIMIT]).unwrap(),
+        );
+        let mut no_write = Builder::new().build();
+        let mut writer = BodyWriter::new();
+        writer.init_chunked();
+        assert!(writer
+            .write_trailers(&mut no_write, &too_large)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn trailerless_chunked_finish_writes_the_standard_empty_terminator() {
+        let mut io = Builder::new().write(b"0\r\n\r\n").build();
+        let mut writer = BodyWriter::new();
+        writer.init_chunked();
+        assert_eq!(writer.finish(&mut io).await.unwrap(), Some(0));
+        assert_eq!(writer.body_mode, BodyMode::Complete(0));
     }
 }

@@ -19,7 +19,7 @@ use bytes::Bytes;
 use bytes::{BufMut, BytesMut};
 use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::HeaderValue;
-use http::{header, header::AsHeaderName, Method, Version};
+use http::{header, header::AsHeaderName, Method, StatusCode, Version};
 use log::{debug, trace, warn};
 use once_cell::sync::Lazy;
 use percent_encoding::{percent_encode, AsciiSet, CONTROLS};
@@ -54,6 +54,9 @@ enum ProxyTaskWriter {
     /// Currently writing a body task (`Body` or `UpgradedBody`).
     /// Stores: (end_stream flag)
     WritingBody(bool),
+    /// Writing a validated trailer block. Stores application body bytes
+    /// written before the trailer block.
+    WritingTrailers(usize),
     /// Currently finishing the body (writing last chunk + flush).
     FinishingBody,
 }
@@ -128,6 +131,10 @@ pub struct HttpSession {
     total_drain_timeout: Option<Duration>,
     /// A copy of the response that is already written to the client
     response_written: Option<Box<ResponseHeader>>,
+    /// Trailer capability derived from the fully filtered response header
+    /// before it is committed. This covers a header and trailers that arrive
+    /// in the same proxy batch, while the body writer is still `ToSelect`.
+    planned_response_trailers_supported: Option<bool>,
     /// The parsed request header
     request_header: Option<Box<RequestHeader>>,
     /// An internal buffer that holds a copy of the request body up to a certain size
@@ -227,6 +234,7 @@ impl HttpSession {
             keepalive_timeout: KeepaliveStatus::Off,
             update_resp_headers: true,
             response_written: None,
+            planned_response_trailers_supported: None,
             request_header: None,
             read_timeout: Some(Duration::from_secs(60)),
             read_deadline: None,
@@ -470,6 +478,7 @@ impl HttpSession {
                         // own transport facts.
                         self.request_headers_end_stream = None;
                         self.response_written = None;
+                        self.planned_response_trailers_supported = None;
                         // Reset the per-request early-body-buffer state too, so a reused
                         // ServerSession struct can use the capture feature again on the
                         // next request instead of inheriting request 1's sticky flags.
@@ -837,7 +846,7 @@ impl HttpSession {
     /// This function can be called more than once to send 1xx informational headers excluding 101.
     pub async fn write_response_header(&mut self, mut header: Box<ResponseHeader>) -> Result<()> {
         // Prepare header (handle upgrades, set headers, initialize body writer, serialize to bytes)
-        let Some((write_buf, flush)) = self.prepare_response_header(&mut header)? else {
+        let Some((write_buf, flush)) = self.prepare_response_header_for_write(&mut header)? else {
             // Header already sent or should be ignored
             return Ok(());
         };
@@ -1030,13 +1039,92 @@ impl HttpSession {
         }
     }
 
+    /// Finalize HTTP/1 response framing facts before response-trailer hooks.
+    /// Calling this again at header commit is intentional and idempotent.
+    pub fn prepare_response_header(&mut self, header: &mut ResponseHeader) -> Result<()> {
+        // Planning must preserve the writer's ignored-informational no-op.
+        // In particular, an ignored 1xx must not disable HTTP/1.0 keepalive
+        // before the final response is known.
+        if header.status.is_informational() && self.ignore_info_resp(header.status.into()) {
+            return Ok(());
+        }
+
+        let downstream_http10 = self
+            .request_header
+            .as_ref()
+            .is_some_and(|request| request.version == Version::HTTP_10);
+        if downstream_http10 {
+            header.set_version(Version::HTTP_10);
+            if header.headers.contains_key(header::TRANSFER_ENCODING) {
+                if !is_only_chunked_transfer_encoding(&header.headers) {
+                    return Error::e_explain(
+                        InvalidHTTPHeader,
+                        "HTTP/1.0 cannot represent non-chunked transfer codings",
+                    );
+                }
+                header.remove_header(&header::TRANSFER_ENCODING);
+            }
+            let response_body_forbidden = (header.status.is_informational()
+                && header.status != StatusCode::SWITCHING_PROTOCOLS)
+                || matches!(
+                    header.status,
+                    StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+                )
+                || self.get_method() == Some(&Method::HEAD);
+            if !response_body_forbidden && header.headers.get(header::CONTENT_LENGTH).is_none() {
+                self.set_keepalive(None);
+                header.insert_header(header::CONNECTION, "close")?;
+            }
+        }
+
+        if !header.status.is_informational() || header.status == StatusCode::SWITCHING_PROTOCOLS {
+            self.planned_response_trailers_supported = Some(
+                !downstream_http10
+                    && !matches!(
+                        header.status,
+                        StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+                    )
+                    && self.get_method() != Some(&Method::HEAD)
+                    && self.is_upgrade(header) != Some(true)
+                    && is_chunked_encoding_from_headers(&header.headers),
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether this downstream can represent response trailers with the
+    /// framing selected for the committed response.
+    pub fn response_trailers_supported(&self) -> bool {
+        let final_response_committed = self.response_written.as_ref().is_some_and(|response| {
+            !response.status.is_informational()
+                || response.status == StatusCode::SWITCHING_PROTOCOLS
+        });
+        if final_response_committed {
+            let actual = self
+                .request_header
+                .as_ref()
+                .is_some_and(|request| request.version == Version::HTTP_11)
+                && self.body_writer.trailers_supported();
+            debug_assert!(
+                self.planned_response_trailers_supported
+                    .is_none_or(|planned| planned == actual),
+                "planned and committed response trailer capability diverged"
+            );
+            actual
+        } else {
+            self.planned_response_trailers_supported.unwrap_or(false)
+        }
+    }
+
     /// Prepare response header for writing: handle upgrades, set headers, initialize body writer.
     /// This contains all the synchronous logic that should happen before writing the header.
     /// Returns Ok(Some((bytes, should_flush))) if the header should be written, Ok(None) if should skip.
-    fn prepare_response_header(
+    fn prepare_response_header_for_write(
         &mut self,
         header: &mut ResponseHeader,
     ) -> Result<Option<(Bytes, bool)>> {
+        self.prepare_response_header(header)?;
+
         // Check if we should ignore informational responses
         if header.status.is_informational() && self.ignore_info_resp(header.status.into()) {
             debug!("ignoring informational headers");
@@ -1309,6 +1397,22 @@ impl HttpSession {
             "finish body (response body writer), upgraded: {}",
             self.upgraded
         );
+        self.maybe_force_close_body_reader();
+        Ok(res)
+    }
+
+    /// Finish a chunked HTTP/1.1 response with trailers.
+    pub async fn write_trailers(&mut self, trailers: &http::HeaderMap) -> Result<Option<usize>> {
+        if trailers.is_empty() || !self.response_trailers_supported() {
+            return self.finish_body().await;
+        }
+        if !self.body_write_buf.is_empty() {
+            self.write_body_buf().await?;
+        }
+        let res = self
+            .body_writer
+            .write_trailers(&mut self.underlying_stream, trailers)
+            .await?;
         self.maybe_force_close_body_reader();
         Ok(res)
     }
@@ -1894,7 +1998,13 @@ impl HttpSession {
                 self.write_non_empty_body(data, true).await?;
                 end_stream
             }
-            HttpTask::Trailer(_) => true, // h1 trailer is not supported yet
+            HttpTask::Trailer(Some(trailers)) => {
+                self.write_trailers(&trailers)
+                    .await
+                    .map_err(|e| e.into_down())?;
+                true
+            }
+            HttpTask::Trailer(None) => true,
             HttpTask::Done => true,
             HttpTask::Failed(e) => return Err(e),
         };
@@ -1947,7 +2057,14 @@ impl HttpSession {
                     self.buffer_body_data(data, true);
                     end_stream
                 }
-                HttpTask::Trailer(_) => true, // h1 trailer is not supported yet
+                HttpTask::Trailer(Some(trailers)) => {
+                    self.write_body_buf().await.map_err(|e| e.into_down())?;
+                    self.write_trailers(&trailers)
+                        .await
+                        .map_err(|e| e.into_down())?;
+                    true
+                }
+                HttpTask::Trailer(None) => true,
                 HttpTask::Done => true,
                 HttpTask::Failed(e) => {
                     // flush the data we have and quit
@@ -1997,7 +2114,7 @@ impl HttpSession {
             // - Resume any in-progress write
             if let Some(ref writer_state) = self.proxy_task_state.current_writer {
                 match writer_state {
-                    ProxyTaskWriter::WritingHeader(_, _) => {
+                    ProxyTaskWriter::WritingHeader(_, _) | ProxyTaskWriter::WritingTrailers(_) => {
                         let _bytes_written = self
                             .proxy_task_state
                             .header_writer()
@@ -2037,6 +2154,11 @@ impl HttpSession {
                     ProxyTaskWriter::WritingBody(end) => {
                         end_stream = end;
                     }
+                    ProxyTaskWriter::WritingTrailers(written) => {
+                        self.body_writer.mark_trailers_written(written);
+                        end_stream = true;
+                        self.maybe_force_close_body_reader();
+                    }
                     ProxyTaskWriter::FinishingBody => {
                         end_stream = true;
                         self.maybe_force_close_body_reader();
@@ -2060,7 +2182,7 @@ impl HttpSession {
             match task {
                 HttpTask::Header(mut header, end) => {
                     let Some((write_buf, should_flush)) =
-                        self.prepare_response_header(&mut header)?
+                        self.prepare_response_header_for_write(&mut header)?
                     else {
                         end_stream = end;
                         continue;
@@ -2102,6 +2224,16 @@ impl HttpSession {
                         }
                     }
                     end_stream = end;
+                }
+                HttpTask::Trailer(Some(trailers))
+                    if !trailers.is_empty() && self.response_trailers_supported() =>
+                {
+                    let (write_buf, written) = self.body_writer.prepare_trailers(&trailers)?;
+                    self.proxy_task_state
+                        .header_writer()
+                        .send_header_task(write_buf, true, None);
+                    self.proxy_task_state.current_writer =
+                        Some(ProxyTaskWriter::WritingTrailers(written));
                 }
                 HttpTask::Trailer(_) | HttpTask::Done => {
                     end_stream = true;
@@ -2232,7 +2364,7 @@ fn http_resp_header_to_buf(
 mod tests_stream {
     use super::*;
     use crate::protocols::http::v1::body::{BodyMode, ParseState};
-    use http::StatusCode;
+    use http::{HeaderMap, StatusCode};
     use pingora_error::ErrorType;
     use rstest::rstest;
     use std::str;
@@ -3419,6 +3551,116 @@ mod tests_stream {
             .unwrap();
         let written = http_stream.write_body_buf().await.unwrap();
         assert!(written.is_none());
+    }
+
+    #[tokio::test]
+    async fn response_trailer_capability_tracks_planned_and_actual_framing() {
+        let request = b"GET / HTTP/1.1\r\n\r\n";
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let trailers = b"0\r\nx-test: yes\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(request)
+            .write(response)
+            .write(trailers)
+            .build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.read_request().await.unwrap();
+        session.update_resp_headers = false;
+        let mut header = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        header
+            .insert_header(http::header::TRANSFER_ENCODING, "chunked")
+            .unwrap();
+        session.prepare_response_header(&mut header).unwrap();
+        assert!(session.response_trailers_supported());
+        session
+            .write_response_header(Box::new(header))
+            .await
+            .unwrap();
+        assert!(session.response_trailers_supported());
+        let mut map = HeaderMap::new();
+        map.insert("x-test", "yes".parse().unwrap());
+        session.write_trailers(&map).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http10_chunked_downgrade_closes_and_rejects_composite_codings() {
+        let request = b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n";
+        let mock_io = Builder::new().read(request).build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.read_request().await.unwrap();
+
+        let mut chunked = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        chunked
+            .insert_header(http::header::TRANSFER_ENCODING, "chunked")
+            .unwrap();
+        session.prepare_response_header(&mut chunked).unwrap();
+        assert_eq!(chunked.version, Version::HTTP_10);
+        assert!(!chunked
+            .headers
+            .contains_key(http::header::TRANSFER_ENCODING));
+        assert_eq!(chunked.headers[http::header::CONNECTION], "close");
+        assert!(!session.will_keepalive());
+        assert!(!session.response_trailers_supported());
+
+        let mut encoded = ResponseHeader::build(StatusCode::OK, None).unwrap();
+        encoded
+            .insert_header(http::header::TRANSFER_ENCODING, "gzip, chunked")
+            .unwrap();
+        assert!(session.prepare_response_header(&mut encoded).is_err());
+        assert_eq!(
+            encoded.headers[http::header::TRANSFER_ENCODING],
+            "gzip, chunked"
+        );
+    }
+
+    #[tokio::test]
+    async fn ignored_http10_informational_does_not_change_connection_state() {
+        let request = b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n";
+        let mock_io = Builder::new().read(request).build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+        session.read_request().await.unwrap();
+        session.ignore_info_resp = true;
+        assert!(session.will_keepalive());
+
+        let mut early_hints = ResponseHeader::build(StatusCode::EARLY_HINTS, None).unwrap();
+        let original_version = early_hints.version;
+        session.prepare_response_header(&mut early_hints).unwrap();
+
+        assert_eq!(early_hints.version, original_version);
+        assert!(!early_hints.headers.contains_key(header::CONNECTION));
+        assert!(session.will_keepalive());
+        assert!(session
+            .prepare_response_header_for_write(&mut early_hints)
+            .unwrap()
+            .is_none());
+        assert!(session.will_keepalive());
+    }
+
+    #[tokio::test]
+    async fn bodyless_http10_responses_do_not_require_close_delimiting() {
+        for (method, status) in [
+            ("HEAD", StatusCode::OK),
+            ("GET", StatusCode::NO_CONTENT),
+            ("GET", StatusCode::NOT_MODIFIED),
+            ("GET", StatusCode::CONTINUE),
+        ] {
+            let request = format!("{method} / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n");
+            let mock_io = Builder::new().read(request.as_bytes()).build();
+            let mut session = HttpSession::new(Box::new(mock_io));
+            session.read_request().await.unwrap();
+            assert!(session.will_keepalive());
+
+            let mut response = ResponseHeader::build(status, None).unwrap();
+            session.prepare_response_header(&mut response).unwrap();
+
+            assert_eq!(response.version, Version::HTTP_10, "{method} {status}");
+            assert!(
+                !response.headers.contains_key(header::CONNECTION),
+                "{method} {status}"
+            );
+            assert!(session.will_keepalive(), "{method} {status}");
+            assert!(!session.response_trailers_supported(), "{method} {status}");
+        }
     }
 
     #[tokio::test]

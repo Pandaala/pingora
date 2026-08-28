@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Session, UpstreamRequestBodyDisposition};
+use crate::{Session, UpstreamRequestBodyDisposition, UpstreamResponseBodyEvent};
 use bytes::Bytes;
 use http::{
     header::{self, HeaderName},
-    Method,
+    HeaderMap, Method,
 };
 use log::{debug, warn};
 use pingora_cache::NoCacheReason;
@@ -382,9 +382,8 @@ impl PipeState {
     }
 }
 
-/// Tracks whether the single terminal `upstream_response_body_filter` callback
-/// (the one carrying `end_of_stream = true`) has already been delivered for
-/// this response.
+/// Tracks whether the single terminal response-body lifecycle event has
+/// already been delivered for this response.
 ///
 /// `HttpProxy::upstream_filter` reaches the body filter only from a
 /// `Body`/`UpgradedBody` task, so a response that terminates with a `Trailer`
@@ -406,9 +405,7 @@ impl PipeState {
 /// Claiming (rather than ignoring) is what stops a `Done` following the error
 /// from doing exactly that.
 ///
-/// Protocol-neutral on purpose: the H2 and custom pumps share it today, and H1
-/// inherits it unchanged once H1 trailer parsing lands (`v1/client.rs`,
-/// `// TODO: support h1 trailer`).
+/// Protocol-neutral on purpose: the H1, H2, and custom pumps share it.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct TerminalBodyDispatch {
     claimed: bool,
@@ -438,11 +435,10 @@ impl TerminalBodyDispatch {
     }
 
     /// Record `task` as this response's terminal observation if nothing has
-    /// claimed that role yet, and report whether `task` must dispatch the
-    /// terminal body-filter callback.
+    /// claimed that role yet, and return its typed terminal body event.
     ///
-    /// Returns true at most once per response, and only for `Trailer`/`Done`.
-    pub fn claim_for(&mut self, task: &HttpTask) -> bool {
+    /// Returns an event at most once per response.
+    pub fn claim_for(&mut self, task: &HttpTask) -> Option<UpstreamResponseBodyEvent> {
         self.upgraded |= matches!(task, HttpTask::UpgradedBody(..));
         match task {
             // Already delivers end-of-stream through the ordinary path: the
@@ -455,19 +451,38 @@ impl TerminalBodyDispatch {
             // Aborted: must never be given a synthetic end-of-stream.
             | HttpTask::Failed(_) => {
                 self.claimed = true;
-                false
+                None
             }
-            HttpTask::Trailer(_) | HttpTask::Done => {
+            HttpTask::Trailer(trailers) => {
                 if self.claimed {
-                    false
+                    None
                 } else {
                     self.claimed = true;
-                    true
+                    Some(if trailers.is_some() {
+                        UpstreamResponseBodyEvent::TerminalBeforeTrailers
+                    } else {
+                        UpstreamResponseBodyEvent::TerminalWithoutTrailers
+                    })
                 }
             }
-            _ => false,
+            HttpTask::Done => {
+                if self.claimed {
+                    None
+                } else {
+                    self.claimed = true;
+                    Some(UpstreamResponseBodyEvent::TerminalWithoutTrailers)
+                }
+            }
+            _ => None,
         }
     }
+}
+
+/// Canonicalize an emptied trailer map to the transport's trailer-free
+/// terminal event. This lets an async application hook remove every field
+/// without causing an empty trailer block to be forwarded.
+pub(crate) fn normalize_trailers(trailers: Option<Box<HeaderMap>>) -> Option<Box<HeaderMap>> {
+    trailers.filter(|trailers| !trailers.is_empty())
 }
 
 /// The request shapes on which a non-`Ordinary` disposition must not be
@@ -1476,7 +1491,7 @@ mod terminal_body_dispatch_tests {
 
     /// Feed a whole response through one latch and collect, for each task,
     /// whether it dispatched the terminal callback.
-    fn dispatches(tasks: &[HttpTask]) -> Vec<bool> {
+    fn dispatches(tasks: &[HttpTask]) -> Vec<Option<UpstreamResponseBodyEvent>> {
         let mut latch = TerminalBodyDispatch::default();
         tasks.iter().map(|t| latch.claim_for(t)).collect()
     }
@@ -1494,7 +1509,13 @@ mod terminal_body_dispatch_tests {
                 trailer(),
                 HttpTask::Done
             ]),
-            [false, false, false, true, false]
+            [
+                None,
+                None,
+                None,
+                Some(UpstreamResponseBodyEvent::TerminalBeforeTrailers),
+                None
+            ]
         );
     }
 
@@ -1674,7 +1695,11 @@ mod terminal_body_dispatch_tests {
     fn bare_done_dispatches_when_nothing_claimed_the_termination() {
         assert_eq!(
             dispatches(&[header(false), body(false), HttpTask::Done]),
-            [false, false, true]
+            [
+                None,
+                None,
+                Some(UpstreamResponseBodyEvent::TerminalWithoutTrailers)
+            ]
         );
     }
 
@@ -1682,7 +1707,7 @@ mod terminal_body_dispatch_tests {
     /// already runs `terminal_upstream_body_filter` for it.
     #[test]
     fn terminal_header_claims_without_dispatching() {
-        assert_eq!(dispatches(&[header(true), HttpTask::Done]), [false, false]);
+        assert_eq!(dispatches(&[header(true), HttpTask::Done]), [None, None]);
     }
 
     /// `Body(_, true)` carries `eos = true` into the body filter itself.
@@ -1690,7 +1715,7 @@ mod terminal_body_dispatch_tests {
     fn terminal_body_claims_without_dispatching() {
         assert_eq!(
             dispatches(&[header(false), body(false), body(true), HttpTask::Done]),
-            [false, false, false, false]
+            [None, None, None, None]
         );
     }
 
@@ -1700,7 +1725,7 @@ mod terminal_body_dispatch_tests {
     fn trailer_after_terminal_body_does_not_dispatch() {
         assert_eq!(
             dispatches(&[body(true), trailer(), HttpTask::Done]),
-            [false, false, false]
+            [None, None, None]
         );
     }
 
@@ -1710,7 +1735,7 @@ mod terminal_body_dispatch_tests {
     fn failed_never_dispatches_and_suppresses_a_following_done() {
         assert_eq!(
             dispatches(&[header(false), body(false), failed(), HttpTask::Done]),
-            [false, false, false, false]
+            [None, None, None, None]
         );
     }
 
@@ -1721,7 +1746,11 @@ mod terminal_body_dispatch_tests {
     fn empty_trailer_claims_the_termination() {
         assert_eq!(
             dispatches(&[body(false), HttpTask::Trailer(None), HttpTask::Done]),
-            [false, true, false]
+            [
+                None,
+                Some(UpstreamResponseBodyEvent::TerminalWithoutTrailers),
+                None
+            ]
         );
     }
 
@@ -1737,7 +1766,10 @@ mod terminal_body_dispatch_tests {
             false,
         ));
         assert!(latch.is_upgraded());
-        assert!(latch.claim_for(&HttpTask::Done));
+        assert_eq!(
+            latch.claim_for(&HttpTask::Done),
+            Some(UpstreamResponseBodyEvent::TerminalWithoutTrailers)
+        );
         assert!(latch.is_upgraded());
     }
 
@@ -1750,7 +1782,10 @@ mod terminal_body_dispatch_tests {
         let mut latch = TerminalBodyDispatch::default();
         latch.mark_upgraded();
         assert!(latch.is_upgraded());
-        assert!(latch.claim_for(&HttpTask::Done));
+        assert_eq!(
+            latch.claim_for(&HttpTask::Done),
+            Some(UpstreamResponseBodyEvent::TerminalWithoutTrailers)
+        );
     }
 
     #[test]
@@ -1765,8 +1800,19 @@ mod terminal_body_dispatch_tests {
     #[test]
     fn a_new_latch_dispatches_for_the_next_response() {
         let mut latch = TerminalBodyDispatch::default();
-        assert!(latch.claim_for(&HttpTask::Done));
-        assert!(!latch.claim_for(&HttpTask::Done));
-        assert!(TerminalBodyDispatch::default().claim_for(&HttpTask::Done));
+        assert!(latch.claim_for(&HttpTask::Done).is_some());
+        assert!(latch.claim_for(&HttpTask::Done).is_none());
+        assert!(TerminalBodyDispatch::default()
+            .claim_for(&HttpTask::Done)
+            .is_some());
+    }
+
+    #[test]
+    fn emptied_trailer_map_normalizes_to_no_trailer() {
+        assert!(normalize_trailers(Some(Box::default())).is_none());
+
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-test", "present".parse().unwrap());
+        assert!(normalize_trailers(Some(Box::new(trailers))).is_some());
     }
 }

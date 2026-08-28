@@ -58,7 +58,8 @@ use pingora_error::Result;
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{
     ProcessCustomSession, ProxyHttp, ProxyServiceBuilder, RangeType, RequestBodyEvent,
-    ResponseBodySink, Session, RESPONSE_BODY_EMIT_BUDGET, RESPONSE_BODY_EMIT_CHUNK_BUDGET,
+    ResponseBodySink, Session, UpstreamResponseBodyEvent, RESPONSE_BODY_EMIT_BUDGET,
+    RESPONSE_BODY_EMIT_CHUNK_BUDGET,
 };
 use std::any::Any;
 use std::future::Future;
@@ -548,6 +549,7 @@ pub struct EmitCtx {
     response_filter_seen: bool,
     response_cache_filter_seen: bool,
     response_filter_calls: usize,
+    terminal_before_trailers_seen: bool,
     request_body_events: Vec<RequestBodyEvent>,
     emitted_chunk_limit: bool,
 }
@@ -1333,6 +1335,45 @@ impl ProxyHttp for EmitProxy {
         }
         Ok((session.req_header().uri.path() == "/bodyless_delay")
             .then_some(Duration::from_millis(50)))
+    }
+
+    async fn upstream_response_body_filter_event(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        event: UpstreamResponseBodyEvent,
+        sink: &mut ResponseBodySink,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        if event == UpstreamResponseBodyEvent::TerminalBeforeTrailers {
+            ctx.terminal_before_trailers_seen = true;
+        }
+        let end_of_stream = !matches!(
+            event,
+            UpstreamResponseBodyEvent::Data {
+                end_of_stream: false
+            }
+        );
+        self.upstream_response_body_filter(session, body, end_of_stream, sink, ctx)
+            .await
+    }
+
+    async fn upstream_response_trailer_filter(
+        &self,
+        session: &mut Session,
+        trailers: &mut HeaderMap,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        if session.req_header().uri.path() == CUSTOM_TRAILERED_PATH {
+            if !ctx.terminal_before_trailers_seen {
+                return pingora_error::Error::e_explain(
+                    pingora_error::ErrorType::InternalError,
+                    "custom trailer hook ran before typed terminal event",
+                );
+            }
+            trailers.insert("x-custom-filtered", "yes".parse().unwrap());
+        }
+        Ok(())
     }
 
     fn response_body_filter(
@@ -3197,6 +3238,31 @@ async fn custom_trailered_response_dispatches_the_terminal_callback_once() {
         .await
         .unwrap();
     assert_eq!(body.matches("|eos").count(), 1, "body was {body:?}");
+}
+
+#[tokio::test]
+async fn custom_trailer_hook_mutates_after_terminal_and_before_h1_write() {
+    let harness = init();
+    let mut io = TcpStream::connect(("127.0.0.1", harness.custom_proxy_port))
+        .await
+        .unwrap();
+    let request = format!(
+        "GET {CUSTOM_TRAILERED_PATH} HTTP/1.1\r\nHost: localhost\r\n{}: {}\r\nConnection: close\r\n\r\n",
+        CUSTOM_TRAILERED_HEADER.0, CUSTOM_TRAILERED_HEADER.1
+    );
+    io.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    io.read_to_end(&mut response).await.unwrap();
+    let wire = String::from_utf8(response).unwrap();
+
+    let released = wire.find("|eos").expect("typed terminal output missing");
+    let trailer = wire
+        .find("x-custom-filtered: yes")
+        .expect("custom trailer mutation missing from H1 wire");
+    assert!(
+        released < trailer,
+        "custom terminal output followed trailers: {wire:?}"
+    );
 }
 
 /// A cleanly closed upgrade may yield no `UpgradedBody` task at all. Bytes

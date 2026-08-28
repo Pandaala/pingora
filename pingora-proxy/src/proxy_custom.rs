@@ -28,8 +28,9 @@ use proxy_cache::{
     ServeFromCache,
 };
 use proxy_common::{
-    no_downstream_body_to_read, release_cache_on_terminate, DownstreamRequestOutcome,
-    DownstreamStateMachine, PipeState, ResponseStateMachine, TerminalBodyDispatch,
+    no_downstream_body_to_read, normalize_trailers, release_cache_on_terminate,
+    DownstreamRequestOutcome, DownstreamStateMachine, PipeState, ResponseStateMachine,
+    TerminalBodyDispatch,
 };
 use tokio::sync::oneshot;
 
@@ -911,7 +912,7 @@ where
         // Whether this task must deliver the response's single terminal
         // `upstream_response_body_filter` callback. Only `Trailer`/`Done` ever
         // set it, and only once per response -- see `TerminalBodyDispatch`.
-        let mut terminal_dispatch = false;
+        let mut terminal_event = None;
 
         if !from_cache {
             if let HttpTask::Header(header, _) = &task {
@@ -928,15 +929,20 @@ where
             // `Body`/`UpgradedBody` task, so a response terminating with a
             // trailer or a bare `Done` would never deliver end-of-stream to a
             // filter that withholds bytes until it.
-            terminal_dispatch = terminal_body.claim_for(&task);
-            if terminal_dispatch {
+            terminal_event = terminal_body.claim_for(&task);
+            if let Some(event) = terminal_event {
                 if let Some(duration) = self
-                    .terminal_upstream_body_filter(session, sink, ctx)
+                    .terminal_upstream_body_filter(session, event, sink, ctx)
                     .await?
                 {
                     trace!("delaying terminal upstream response for {duration:?}");
                     time::sleep(duration).await;
                 }
+            }
+            if let HttpTask::Trailer(Some(trailers)) = &mut task {
+                self.inner
+                    .upstream_response_trailer_filter(session, trailers, ctx)
+                    .await?;
             }
 
             if terminal_header {
@@ -952,7 +958,7 @@ where
             // transformation. Requests that bypassed cache still need to run
             // filters to see if the response has become cacheable.
             if !terminal_header {
-                if terminal_dispatch {
+                if terminal_event.is_some() {
                     // Released body bytes precede the terminating task on the
                     // wire, so the cached entity has to be admitted in that
                     // same order to stay byte-identical.
@@ -1055,7 +1061,12 @@ where
                 }
                 if terminal_header {
                     if let Some(duration) = self
-                        .terminal_upstream_body_filter(session, sink, ctx)
+                        .terminal_upstream_body_filter(
+                            session,
+                            UpstreamResponseBodyEvent::TerminalWithoutTrailers,
+                            sink,
+                            ctx,
+                        )
                         .await?
                     {
                         trace!("delaying terminal upstream response for {duration:?}");
@@ -1145,7 +1156,7 @@ where
                     // https://http2.github.io/http2-spec/#malformed
                     Ok(HttpTask::Body(Some(buffer), true))
                 } else {
-                    Ok(HttpTask::Trailer(trailers))
+                    Ok(HttpTask::Trailer(normalize_trailers(trailers)))
                 }
             }
             HttpTask::Done if from_cache => Ok(HttpTask::Body(None, true)),
@@ -1164,7 +1175,7 @@ where
             // task -- see the `sink.take_extra()` discard on the early-return
             // path above for where that would otherwise leak from.
             out_tasks.push(task);
-        } else if terminal_dispatch {
+        } else if terminal_event.is_some() {
             // The terminal callback releases body bytes the filter had been
             // withholding. They are body, so they must precede the trailer
             // that ends the response -- the opposite of the ordinary drain
@@ -1189,10 +1200,13 @@ where
             reconcile_terminal_response_tasks(out_tasks, start, downstream_body_forbidden)?;
             // A `Trailer` task is not a `Body` task, so released bytes would
             // otherwise skip the downstream body filter entirely.
-        } else if filter_downstream_body || terminal_dispatch {
+        } else if filter_downstream_body || terminal_event.is_some() {
             self.downstream_response_body_filter_tasks(session, &mut out_tasks[start..], ctx)
                 .await?;
         }
+        session
+            .prepare_response_headers(&mut out_tasks[start..])
+            .await?;
         Ok(())
     }
 

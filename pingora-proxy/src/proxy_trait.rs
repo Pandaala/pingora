@@ -22,6 +22,18 @@ use proxy_cache::range_filter::{self};
 use std::any::Any;
 use std::time::Duration;
 
+/// Typed lifecycle events for the upstream response body.
+///
+/// Terminal events carry no fabricated body data. In particular,
+/// `TerminalBeforeTrailers` lets a filter flush bounded state without being
+/// told that the response has no trailers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpstreamResponseBodyEvent {
+    Data { end_of_stream: bool },
+    TerminalBeforeTrailers,
+    TerminalWithoutTrailers,
+}
+
 /// Context for proxy warning logs that can be suppressed by
 /// [`ProxyHttp::suppress_proxy_warn_log`].
 ///
@@ -589,6 +601,24 @@ pub trait ProxyHttp {
         Ok(())
     }
 
+    /// Typed variant of [`Self::upstream_response_filter`] that also exposes
+    /// the transport's final-header end-of-stream evidence.
+    ///
+    /// The default preserves the legacy hook exactly.
+    async fn upstream_response_header_filter_event(
+        &self,
+        session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        _end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        self.upstream_response_filter(session, upstream_response, ctx)
+            .await
+    }
+
     /// Modify the response header before it is send to the downstream
     ///
     /// The modification is after caching. This filter is called for all responses including
@@ -657,19 +687,20 @@ pub trait ProxyHttp {
     ///
     /// # Terminal call
     ///
-    /// Every response representation received from upstream and forwarded by
-    /// the pump that terminates NORMALLY delivers `end_of_stream = true`
-    /// exactly once, whatever task shape the protocol used to end it. Responses
-    /// served from cache do not run this upstream hook. When the termination
-    /// carries no body chunk of its own, the hook is called with `body = None`
-    /// and `end_of_stream = true`; a filter may release withheld bytes by
-    /// writing them into `body`.
+    /// Every normally terminated response delivers `end_of_stream = true`
+    /// exactly once, including responses that carry trailers. Responses served
+    /// from cache do not run this upstream hook. When the termination carries
+    /// no body chunk of its own, the hook is called with `body = None`; a
+    /// filter may release withheld bytes by writing them into `body`.
+    /// Applications that need to distinguish a pre-trailer terminal boundary
+    /// must implement
+    /// [`Self::upstream_response_body_filter_event`].
     ///
     /// | Upstream termination | Terminal call arrives on |
     /// |---|---|
     /// | end-of-stream on the response header (204/304/HEAD/`CL: 0`) | a synthetic call, `body = None` |
     /// | end-of-stream on the last body chunk | that body task itself |
-    /// | trailers (H2 puts `END_STREAM` on the trailers HEADERS frame) | a synthetic call before the trailer |
+    /// | trailers | a synthetic legacy call before the trailer; the typed hook can distinguish `TerminalBeforeTrailers` |
     /// | a bare `Done` with no earlier end-of-stream | a synthetic call |
     ///
     /// Bytes released by a synthetic call are written downstream and admitted
@@ -719,13 +750,47 @@ pub trait ProxyHttp {
         Ok(None)
     }
 
+    /// Typed response-body lifecycle hook.
+    ///
+    /// `Data` preserves the event's legacy EOS flag. Both terminal variants
+    /// delegate with `end_of_stream = true`, preserving the pre-typed contract
+    /// that legacy filters receive exactly one terminal callback even when
+    /// trailers follow. Trailer-aware implementations should override this
+    /// method to distinguish the two terminal variants.
+    async fn upstream_response_body_filter_event(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        event: UpstreamResponseBodyEvent,
+        sink: &mut ResponseBodySink,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        match event {
+            UpstreamResponseBodyEvent::Data { end_of_stream } => {
+                self.upstream_response_body_filter(session, body, end_of_stream, sink, ctx)
+                    .await
+            }
+            UpstreamResponseBodyEvent::TerminalBeforeTrailers
+            | UpstreamResponseBodyEvent::TerminalWithoutTrailers => {
+                self.upstream_response_body_filter(session, body, true, sink, ctx)
+                    .await
+            }
+        }
+    }
+
     /// Similar to [Self::upstream_response_filter()] but for response trailers
-    fn upstream_response_trailer_filter(
+    async fn upstream_response_trailer_filter(
         &self,
         _session: &mut Session,
         _upstream_trailers: &mut header::HeaderMap,
         _ctx: &mut Self::CTX,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
         Ok(())
     }
 
@@ -1088,6 +1153,18 @@ mod tests {
             *ctx = true;
             Ok(())
         }
+
+        async fn upstream_response_body_filter(
+            &self,
+            _session: &mut Session,
+            _body: &mut Option<Bytes>,
+            end_of_stream: bool,
+            _sink: &mut ResponseBodySink,
+            ctx: &mut Self::CTX,
+        ) -> Result<Option<Duration>> {
+            *ctx = end_of_stream;
+            Ok(None)
+        }
     }
 
     #[tokio::test]
@@ -1111,5 +1188,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(trailer_action, RequestBodyAction::Continue);
+    }
+
+    #[tokio::test]
+    async fn typed_pre_trailer_terminal_defaults_to_legacy_eos() {
+        let io = tokio_test::io::Builder::new().build();
+        let mut session = Session::new_h1(Box::new(io));
+        let mut body = None;
+        let mut sink = ResponseBodySink::new();
+        let mut ctx = false;
+
+        LegacyBodyFilter
+            .upstream_response_body_filter_event(
+                &mut session,
+                &mut body,
+                UpstreamResponseBodyEvent::TerminalBeforeTrailers,
+                &mut sink,
+                &mut ctx,
+            )
+            .await
+            .unwrap();
+
+        assert!(ctx, "legacy filters must retain their terminal callback");
     }
 }

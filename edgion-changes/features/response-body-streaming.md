@@ -2,10 +2,16 @@
 
 ## API contract
 
-`ProxyHttp::upstream_response_body_filter` is asynchronous. It receives the
-current body slot, the terminal flag, a `ResponseBodySink`, and request context.
-It may mutate or suppress the current chunk, emit extra chunks, request a
-delay, or terminate the response.
+`ProxyHttp::upstream_response_body_filter` is asynchronous. Its additive typed
+variant, `upstream_response_body_filter_event`, distinguishes ordinary data,
+the terminal boundary before real trailers, and a trailer-free terminal. The
+legacy hook remains the default for data and both terminal variants. A
+pre-trailer terminal delegates with `end_of_stream = true` to preserve the
+fork's established exactly-once legacy contract; trailer-aware implementations
+override the typed hook to retain the distinction.
+Both hooks receive the current body slot, a `ResponseBodySink`, and request
+context. They may mutate or suppress the current chunk, emit extra chunks,
+request a delay, or terminate the response.
 
 `ResponseBodySink` has independent per-pump-batch byte and nonempty-chunk
 budgets for additional chunks: 1 MiB and 2048 chunks. Empty output is free;
@@ -21,7 +27,8 @@ boundary consumes it.
 
 - Mutated current bytes precede chunks pushed by the filter.
 - A terminal Header, terminal Body, Trailer or bare Done claims one terminal
-  callback for the response.
+  event for the response. A real trailer dispatches `TerminalBeforeTrailers`
+  before the awaited trailer hook; the following Done is inert.
 - Pump-batch completion is derived only from tasks actually processed. Tasks
   queued behind an early `ResponseBodySink::terminate()` are discarded rather
   than treated as completion evidence; a discarded failure still aborts cache

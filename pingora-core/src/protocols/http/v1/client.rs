@@ -839,7 +839,13 @@ impl HttpSession {
             Ok(HttpTask::Done)
         } else {
             /* need to read body */
-            let body = self.read_body_bytes().await?;
+            let body = loop {
+                let body = self.read_body_bytes().await?;
+                if body.as_ref().is_some_and(Bytes::is_empty) && !self.is_body_done() {
+                    continue;
+                }
+                break body;
+            };
             let end_of_body = self.is_body_done();
             debug!(
                 "Response body: {} bytes, end: {end_of_body}",
@@ -848,11 +854,16 @@ impl HttpSession {
             trace!("Response body: {body:?}, upgraded: {}", self.upgraded);
             if self.upgraded {
                 Ok(HttpTask::UpgradedBody(body, end_of_body))
+            } else if body.is_none() && end_of_body {
+                if let Some(trailers) = self.body_reader.take_trailers() {
+                    Ok(HttpTask::Trailer(Some(Box::new(trailers))))
+                } else {
+                    Ok(HttpTask::Done)
+                }
             } else {
                 Ok(HttpTask::Body(body, end_of_body))
             }
         }
-        // TODO: support h1 trailer
     }
 
     /// Return the [Digest] of the connection
@@ -2838,6 +2849,52 @@ hello";
         }
 
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
+    }
+
+    #[tokio::test]
+    async fn chunked_response_emits_payload_then_one_trailer_task_then_done() {
+        let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                     3\r\nabc\r\n0\r\nx-a: 1\r\nx-a: 2\r\n\r\n";
+        let mock_io = Builder::new().read(&wire[..]).build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+
+        assert!(matches!(
+            session.read_response_task().await.unwrap(),
+            HttpTask::Header(_, false)
+        ));
+        assert!(matches!(
+            session.read_response_task().await.unwrap(),
+            HttpTask::Body(Some(data), false) if data.as_ref() == b"abc"
+        ));
+        let HttpTask::Trailer(Some(trailers)) = session.read_response_task().await.unwrap() else {
+            panic!("expected retained H1 trailers");
+        };
+        assert_eq!(trailers.get_all("x-a").iter().count(), 2);
+        assert!(matches!(
+            session.read_response_task().await.unwrap(),
+            HttpTask::Done
+        ));
+    }
+
+    #[tokio::test]
+    async fn chunked_response_without_trailers_uses_done_terminal() {
+        let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                     3\r\nabc\r\n0\r\n\r\n";
+        let mock_io = Builder::new().read(&wire[..]).build();
+        let mut session = HttpSession::new(Box::new(mock_io));
+
+        assert!(matches!(
+            session.read_response_task().await.unwrap(),
+            HttpTask::Header(_, false)
+        ));
+        assert!(matches!(
+            session.read_response_task().await.unwrap(),
+            HttpTask::Body(Some(data), false) if data.as_ref() == b"abc"
+        ));
+        assert!(matches!(
+            session.read_response_task().await.unwrap(),
+            HttpTask::Done
+        ));
     }
 }
 

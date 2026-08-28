@@ -26,6 +26,7 @@ implementation.
 | Replayable request body | Capture once, fail closed on partial/cancelled capture, bounded replay chunks | core body buffer and H1/H2 server sessions | [request-body-buffering.md](features/request-body-buffering.md) |
 | Request-body transport controls | Consistent events, dispositions, termination, trailers, retry gates, cleanup | proxy trait/common and pumps | [request-body-transport.md](features/request-body-transport.md) |
 | Response-body streaming controls | Async filter/sink, bounded emitted bytes and chunk count, typed termination, terminal dispatch, cache/live ordering | sink, pumps, cache | [response-body-streaming.md](features/response-body-streaming.md) |
+| Response trailer lifecycle | Typed pre-trailer boundary, awaited application hook, H1 parsing/writing, planned framing capability, HTTP/1.0 downgrade | core H1, proxy trait and pumps | [response-trailers.md](features/response-trailers.md) |
 | H2 END_STREAM evidence | Combine decoded state, EOF, content length, and qualified wire evidence; never trust wire flag alone | H2 watcher, client/connector, proxy H2 | [h2-end-stream.md](features/h2-end-stream.md) |
 
 ## Cross-feature invariants
@@ -35,8 +36,9 @@ implementation.
    unfinished upload with `Abandoned` after the response completes.
 2. Partial, cancelled, drained, or poisoned capture is never replayed as a
    complete request body.
-3. A normal response gets exactly one terminal callback across Header-EOS,
-   Body-EOS, Trailer, and Done; an abort gets no synthetic clean terminal.
+3. A normal response gets exactly one typed terminal event across Header-EOS,
+   Body-EOS, Trailer, and Done; a real trailer receives
+   `TerminalBeforeTrailers`, while an abort gets no synthetic clean terminal.
 4. Application termination is typed and non-retryable. A committed final
    response cannot enter a second response or retry path.
 5. Filtered bytes preserve order across live delivery, cache admission, and

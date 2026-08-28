@@ -223,6 +223,15 @@ impl Session {
         }
     }
 
+    /// Finalize downstream response framing facts before same-batch trailer
+    /// hooks run. Native trailer-capable transports need no planning latch.
+    pub fn prepare_response_header(&mut self, resp: &mut ResponseHeader) -> Result<()> {
+        match self {
+            Self::H1(s) => s.prepare_response_header(resp),
+            Self::H2(_) | Self::Subrequest(_) | Self::Custom(_) => Ok(()),
+        }
+    }
+
     /// Write the response body to client
     pub async fn write_response_body(&mut self, data: Bytes, end: bool) -> Result<()> {
         if data.is_empty() && !end {
@@ -253,10 +262,22 @@ impl Session {
     /// Write the response trailers to client
     pub async fn write_response_trailers(&mut self, trailers: HeaderMap) -> Result<()> {
         match self {
-            Self::H1(_) => Ok(()), // TODO: support trailers for h1
+            Self::H1(s) => {
+                s.write_trailers(&trailers).await?;
+                Ok(())
+            }
             Self::H2(s) => s.write_trailers(trailers),
             Self::Subrequest(s) => s.write_trailers(Some(Box::new(trailers))).await,
             Self::Custom(s) => s.write_trailers(trailers).await,
+        }
+    }
+
+    /// Whether the committed or planned downstream response can represent
+    /// trailers.
+    pub fn response_trailers_supported(&self) -> bool {
+        match self {
+            Self::H1(s) => s.response_trailers_supported(),
+            Self::H2(_) | Self::Subrequest(_) | Self::Custom(_) => true,
         }
     }
 

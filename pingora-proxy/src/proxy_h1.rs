@@ -16,7 +16,10 @@ use futures::future::OptionFuture;
 use futures::StreamExt;
 
 use super::*;
-use crate::proxy_cache::{drain_emitted_chunks, range_filter::RangeBodyFilter, ServeFromCache};
+use crate::proxy_cache::{
+    drain_emitted_chunks, drain_emitted_chunks_before, range_filter::RangeBodyFilter,
+    ServeFromCache,
+};
 use crate::proxy_common::*;
 use pingora_core::protocols::http::{
     custom::CUSTOM_MESSAGE_QUEUE_SIZE, v1::common::is_upgrade_req as is_h1_upgrade_req,
@@ -460,6 +463,7 @@ where
         filtered_terminal_header: &mut Option<Box<ResponseHeader>>,
         upstream_reusable: &mut bool,
         sink: &mut ResponseBodySink,
+        terminal_body: &mut TerminalBodyDispatch,
     ) -> Result<Option<(bool, bool)>>
     where
         SV: ProxyHttp + Send + Sync,
@@ -517,6 +521,7 @@ where
                 filtered_terminal_header,
                 upstream_reusable,
                 sink,
+                terminal_body,
                 &mut filtered_tasks,
             )
             .await?;
@@ -645,6 +650,7 @@ where
         // `ResponseBodySink::reset_batch`), but a `terminate()` signal stays
         // sticky for the rest of this response.
         let mut sink = ResponseBodySink::new();
+        let mut terminal_body = TerminalBodyDispatch::default();
         let mut suppress_downstream_body = false;
         let mut filtered_terminal_header = None;
         let mut upstream_reusable = true;
@@ -851,6 +857,7 @@ where
                             &mut filtered_terminal_header,
                             &mut upstream_reusable,
                             &mut sink,
+                            &mut terminal_body,
                         ).await? else {
                             // nothing sent downstream e.g. serve_from_cache
                             continue;
@@ -888,6 +895,7 @@ where
                             &mut filtered_terminal_header,
                             &mut upstream_reusable,
                             &mut sink,
+                            &mut terminal_body,
                         ).await? else {
                             // nothing sent downstream e.g. serve_from_cache
                             continue;
@@ -932,7 +940,7 @@ where
                         &mut suppress_downstream_body,
                         &mut filtered_terminal_header,
                         &mut upstream_reusable,
-                        &mut sink, &mut cached_tasks).await?;
+                        &mut sink, &mut terminal_body, &mut cached_tasks).await?;
                     debug!("serve_from_cache task {cached_tasks:?}");
 
                     if session.downstream_session.supports_proxy_task_api() {
@@ -1125,6 +1133,7 @@ where
         filtered_terminal_header: &mut Option<Box<ResponseHeader>>,
         upstream_reusable: &mut bool,
         sink: &mut ResponseBodySink,
+        terminal_body: &mut TerminalBodyDispatch,
         out_tasks: &mut Vec<HttpTask>,
     ) -> Result<()>
     where
@@ -1141,6 +1150,7 @@ where
             || (from_cache && matches!(&task, HttpTask::Done));
 
         let mut terminal_cacheability = None;
+        let mut terminal_event = None;
 
         // skip caching if already served from cache
         if !from_cache {
@@ -1151,6 +1161,21 @@ where
             if let HttpTask::Header(header, _) = &task {
                 reject_mismatched_h1_upgrade_101(session, header, "h1_upstream_filter")
                     .map_err(|e| e.into_up())?;
+            }
+            terminal_event = terminal_body.claim_for(&task);
+            if let Some(event) = terminal_event {
+                if let Some(duration) = self
+                    .terminal_upstream_body_filter(session, event, sink, ctx)
+                    .await?
+                {
+                    trace!("delaying terminal upstream response for {duration:?}");
+                    time::sleep(duration).await;
+                }
+            }
+            if let HttpTask::Trailer(Some(trailers)) = &mut task {
+                self.inner
+                    .upstream_response_trailer_filter(session, trailers, ctx)
+                    .await?;
             }
             if terminal_header {
                 let HttpTask::Header(header, _) = &task else {
@@ -1165,8 +1190,20 @@ where
             // transformation. Requests that bypassed cache still need to run
             // filters to see if the response has become cacheable.
             if !terminal_header {
-                self.cache_task_and_emitted_chunks(session, &task, sink, ctx, serve_from_cache)
+                if terminal_event.is_some() {
+                    self.cache_task_and_emitted_chunks_before(
+                        session,
+                        &task,
+                        sink,
+                        terminal_body.is_upgraded(),
+                        ctx,
+                        serve_from_cache,
+                    )
                     .await?;
+                } else {
+                    self.cache_task_and_emitted_chunks(session, &task, sink, ctx, serve_from_cache)
+                        .await?;
+                }
                 self.track_predicted_uncacheable_response(session, &task, sink);
             }
 
@@ -1257,7 +1294,12 @@ where
 
                 if terminal_header {
                     if let Some(duration) = self
-                        .terminal_upstream_body_filter(session, sink, ctx)
+                        .terminal_upstream_body_filter(
+                            session,
+                            UpstreamResponseBodyEvent::TerminalWithoutTrailers,
+                            sink,
+                            ctx,
+                        )
                         .await?
                     {
                         trace!("delaying terminal upstream response for {duration:?}");
@@ -1323,7 +1365,21 @@ where
                 Ok(HttpTask::Body(data, end))
             }
             HttpTask::UpgradedBody(data, end) => Ok(HttpTask::UpgradedBody(data, end)),
-            HttpTask::Trailer(h) => Ok(HttpTask::Trailer(h)), // TODO: support trailers for h1
+            HttpTask::Trailer(mut trailers) => {
+                let trailer_buffer = match trailers.as_mut() {
+                    Some(trailers) => {
+                        self.inner
+                            .response_trailer_filter(session, trailers, ctx)
+                            .await?
+                    }
+                    None => None,
+                };
+                if let Some(buffer) = trailer_buffer {
+                    Ok(HttpTask::Body(Some(buffer), true))
+                } else {
+                    Ok(HttpTask::Trailer(normalize_trailers(trailers)))
+                }
+            }
             HttpTask::Done if from_cache => Ok(HttpTask::Body(None, true)),
             HttpTask::Done => Ok(task),
             HttpTask::Failed(_) => Ok(task), // Do nothing just pass the error down
@@ -1340,6 +1396,8 @@ where
             // task -- see the `sink.take_extra()` discard on the early-return
             // path above for where that would otherwise leak from.
             out_tasks.push(task);
+        } else if terminal_event.is_some() {
+            drain_emitted_chunks_before(task, sink, terminal_body.is_upgraded(), out_tasks);
         } else {
             // Extra chunks emitted by the upstream body filter follow the
             // chunk they were emitted from, preserving order; `task`'s own
@@ -1357,10 +1415,13 @@ where
                     .await?;
             }
             reconcile_terminal_response_tasks(out_tasks, start, downstream_body_forbidden)?;
-        } else if filter_downstream_body {
+        } else if filter_downstream_body || terminal_event.is_some() {
             self.downstream_response_body_filter_tasks(session, &mut out_tasks[start..], ctx)
                 .await?;
         }
+        session
+            .prepare_response_headers(&mut out_tasks[start..])
+            .await?;
         Ok(())
     }
 
@@ -1793,6 +1854,7 @@ mod tests {
         let mut filtered_terminal_header = None;
         let mut upstream_reusable = true;
         let mut sink = ResponseBodySink::new();
+        let mut terminal_body = TerminalBodyDispatch::default();
         let (source_done, terminated) = proxy
             .process_upstream_tasks(
                 &mut session,
@@ -1806,6 +1868,7 @@ mod tests {
                 &mut filtered_terminal_header,
                 &mut upstream_reusable,
                 &mut sink,
+                &mut terminal_body,
             )
             .await
             .unwrap()
@@ -1965,6 +2028,7 @@ mod tests {
         let mut filtered_terminal_header = None;
         let mut upstream_reusable = true;
         let mut sink = ResponseBodySink::new();
+        let mut terminal_body = TerminalBodyDispatch::default();
         let mut out_tasks = Vec::new();
         let task = HttpTask::Header(Box::new(ResponseHeader::build(200, Some(0)).unwrap()), true);
 
@@ -1980,6 +2044,7 @@ mod tests {
                 &mut filtered_terminal_header,
                 &mut upstream_reusable,
                 &mut sink,
+                &mut terminal_body,
                 &mut out_tasks,
             )
             .await
@@ -2004,6 +2069,7 @@ mod tests {
         let mut filtered_terminal_header = None;
         let mut upstream_reusable = true;
         let mut sink = ResponseBodySink::new();
+        let mut terminal_body = TerminalBodyDispatch::default();
         let mut out_tasks = Vec::new();
         let mut response =
             ResponseHeader::build(http::StatusCode::SWITCHING_PROTOCOLS, Some(0)).unwrap();
@@ -2022,6 +2088,7 @@ mod tests {
                 &mut filtered_terminal_header,
                 &mut upstream_reusable,
                 &mut sink,
+                &mut terminal_body,
                 &mut out_tasks,
             )
             .await

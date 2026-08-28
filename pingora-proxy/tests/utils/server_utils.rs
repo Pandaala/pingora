@@ -48,7 +48,7 @@ use pingora_error::{Error, ErrorSource, ErrorType::*, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{
     FailToProxy, ProxyHttp, ProxyWarnLogContext, ResponseBodySink, Session,
-    RESPONSE_BODY_EMIT_CHUNK_BUDGET,
+    UpstreamResponseBodyEvent, RESPONSE_BODY_EMIT_CHUNK_BUDGET,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{
@@ -71,6 +71,7 @@ pub struct CTX {
     upstream_server_addr: Option<SocketAddr>,
     /// Response bytes withheld by the `x-retain-until-eos` processor.
     withheld_body: Vec<u8>,
+    terminal_before_trailers_seen: bool,
     emitted_chunk_limit: bool,
 }
 
@@ -482,6 +483,97 @@ impl ProxyHttp for ExampleProxyHttp {
             }
         }
         Ok(None)
+    }
+
+    async fn upstream_response_body_filter_event(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        event: UpstreamResponseBodyEvent,
+        sink: &mut ResponseBodySink,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        if event == UpstreamResponseBodyEvent::TerminalBeforeTrailers {
+            ctx.terminal_before_trailers_seen = true;
+        }
+        let end_of_stream = !matches!(
+            event,
+            UpstreamResponseBodyEvent::Data {
+                end_of_stream: false
+            }
+        );
+        self.upstream_response_body_filter(session, body, end_of_stream, sink, ctx)
+            .await
+    }
+
+    async fn upstream_response_trailer_filter(
+        &self,
+        session: &mut Session,
+        trailers: &mut http::HeaderMap,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        if session.get_header_bytes("x-assert-trailer-order") == b"true"
+            && !ctx.terminal_before_trailers_seen
+        {
+            return Error::e_explain(
+                InternalError,
+                "trailer hook ran before typed terminal event",
+            );
+        }
+        if let Ok(delay_ms) = std::str::from_utf8(session.get_header_bytes("x-trailer-delay-ms"))
+            .unwrap_or_default()
+            .parse::<u64>()
+        {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+        if session.get_header_bytes("x-trailer-error") == b"true" {
+            return Error::e_explain(InternalError, "scripted upstream trailer rejection");
+        }
+        match session.get_header_bytes("x-assert-trailer-capability") {
+            b"true" if !session.downstream_session.response_trailers_supported() => {
+                return Error::e_explain(
+                    InternalError,
+                    "expected downstream response trailers to be supported",
+                );
+            }
+            b"false" if session.downstream_session.response_trailers_supported() => {
+                return Error::e_explain(
+                    InternalError,
+                    "expected downstream response trailers to be unsupported",
+                );
+            }
+            _ => {}
+        }
+        if session.get_header_bytes("x-assert-response-uncommitted") == b"true"
+            && session.response_written().is_some()
+        {
+            return Error::e_explain(
+                InternalError,
+                "expected same-batch trailer hook before response commit",
+            );
+        }
+        if session.get_header_bytes("x-trailer-mutate") == b"true" {
+            trailers.insert("x-filtered-trailer", HeaderValue::from_static("yes"));
+        }
+        if session.get_header_bytes("x-trailer-clear") == b"true" {
+            trailers.clear();
+        }
+        Ok(())
+    }
+
+    async fn upstream_response_header_filter_event(
+        &self,
+        session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        upstream_response.insert_header(
+            "x-upstream-header-eos",
+            if end_of_stream { "true" } else { "false" },
+        )?;
+        self.upstream_response_filter(session, upstream_response, ctx)
+            .await
     }
 
     async fn upstream_peer(
@@ -1011,6 +1103,24 @@ impl ProxyHttp for ExampleProxyCache {
             }
         }
         Ok(None)
+    }
+
+    async fn upstream_response_body_filter_event(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        event: UpstreamResponseBodyEvent,
+        sink: &mut ResponseBodySink,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        let end_of_stream = !matches!(
+            event,
+            UpstreamResponseBodyEvent::Data {
+                end_of_stream: false
+            }
+        );
+        self.upstream_response_body_filter(session, body, end_of_stream, sink, ctx)
+            .await
     }
 
     async fn upstream_response_filter(

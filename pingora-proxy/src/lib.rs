@@ -220,6 +220,7 @@ pub use proxy_cache::range_filter::{range_header_filter, MultiRangeInfo, RangeTy
 pub use proxy_purge::PurgeStatus;
 pub use proxy_trait::{
     FailToProxy, ProxyHttp, ProxyWarnLogContext, RequestBodyAction, UpstreamRequestBodyDisposition,
+    UpstreamResponseBodyEvent,
 };
 pub use response_body_sink::{
     ResponseBodySink, RESPONSE_BODY_EMIT_BUDGET, RESPONSE_BODY_EMIT_CHUNK_BUDGET,
@@ -228,7 +229,7 @@ pub use response_body_sink::{
 pub mod prelude {
     pub use crate::{
         http_proxy, http_proxy_service, ProxyHttp, ProxyWarnLogContext, RequestBodyAction, Session,
-        UpstreamRequestBodyDisposition,
+        UpstreamRequestBodyDisposition, UpstreamResponseBodyEvent,
     };
 }
 
@@ -547,21 +548,24 @@ where
         SV::CTX: Send + Sync,
     {
         let duration = match task {
-            HttpTask::Header(header, _eos) => {
+            HttpTask::Header(header, eos) => {
                 self.inner
-                    .upstream_response_filter(session, header, ctx)
+                    .upstream_response_header_filter_event(session, header, *eos, ctx)
                     .await?;
                 None
             }
             HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => {
                 self.inner
-                    .upstream_response_body_filter(session, data, *eos, sink, ctx)
+                    .upstream_response_body_filter_event(
+                        session,
+                        data,
+                        UpstreamResponseBodyEvent::Data {
+                            end_of_stream: *eos,
+                        },
+                        sink,
+                        ctx,
+                    )
                     .await?
-            }
-            HttpTask::Trailer(Some(trailers)) => {
-                self.inner
-                    .upstream_response_trailer_filter(session, trailers, ctx)?;
-                None
             }
             _ => {
                 // task does not support a filter
@@ -581,6 +585,7 @@ where
     async fn terminal_upstream_body_filter(
         &self,
         session: &mut Session,
+        event: UpstreamResponseBodyEvent,
         sink: &mut ResponseBodySink,
         ctx: &mut SV::CTX,
     ) -> Result<Option<Duration>>
@@ -591,7 +596,7 @@ where
         let mut body = None;
         let duration = self
             .inner
-            .upstream_response_body_filter(session, &mut body, true, sink, ctx)
+            .upstream_response_body_filter_event(session, &mut body, event, sink, ctx)
             .await?;
         if let Some(body) = body {
             sink.prepend_current(body);
@@ -713,6 +718,9 @@ pub struct Session {
     /// also has `data == None` while the trailer fact stays true) would
     /// re-fire the hook.
     pub(crate) request_trailer_filter_fired: bool,
+    /// Number of response header tasks whose downstream module filtering was
+    /// completed early so a same-batch trailer hook can query planned framing.
+    prepared_response_headers: usize,
     /// Flag that is set when the shutdown process has begun.
     shutdown_flag: Arc<AtomicBool>,
 }
@@ -741,6 +749,7 @@ impl Session {
             downstream_task_seen_upgraded: false,
             upstream_write_pending_time: Duration::ZERO,
             request_trailer_filter_fired: false,
+            prepared_response_headers: 0,
             shutdown_flag,
         }
     }
@@ -841,7 +850,23 @@ impl Session {
         self.downstream_modules_ctx
             .response_header_filter(&mut resp, end_of_stream)
             .await?;
+        self.downstream_session.prepare_response_header(&mut resp)?;
         self.downstream_session.write_response_header(resp).await
+    }
+
+    /// Run final downstream response-header filters before a same-batch
+    /// trailer hook, then latch the resulting H1 framing capability.
+    pub(crate) async fn prepare_response_headers(&mut self, tasks: &mut [HttpTask]) -> Result<()> {
+        for task in tasks {
+            if let HttpTask::Header(resp, end) = task {
+                self.downstream_modules_ctx
+                    .response_header_filter(resp, *end)
+                    .await?;
+                self.downstream_session.prepare_response_header(resp)?;
+                self.prepared_response_headers += 1;
+            }
+        }
+        Ok(())
     }
 
     /// Similar to `write_response_header()`, this fn will clone the `resp` internally
@@ -889,9 +914,14 @@ impl Session {
                 if *seen_upgraded {
                     return reject_unexpected_task_after_h1_upgrade(self, "header", *seen_upgraded);
                 }
-                self.downstream_modules_ctx
-                    .response_header_filter(resp, *end)
-                    .await?;
+                if self.prepared_response_headers > 0 {
+                    self.prepared_response_headers -= 1;
+                } else {
+                    self.downstream_modules_ctx
+                        .response_header_filter(resp, *end)
+                        .await?;
+                    self.downstream_session.prepare_response_header(resp)?;
+                }
                 reject_mismatched_h1_upgrade_101(self, resp, "downstream_module_header_filter")
                     .map_err(|e| e.into_in())?;
                 if resp.status == http::StatusCode::SWITCHING_PROTOCOLS

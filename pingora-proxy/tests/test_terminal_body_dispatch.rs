@@ -36,7 +36,7 @@ use http::{HeaderMap, Response, StatusCode};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpListener;
+use tokio::{io::AsyncReadExt, io::AsyncWriteExt, net::TcpListener, net::TcpStream};
 use utils::server_utils::{init_without_mock_origin, take_eos_dispatches};
 
 use pingora_proxy::RESPONSE_BODY_EMIT_CHUNK_BUDGET;
@@ -102,6 +102,107 @@ async fn spawn_origin(how: Termination) -> u16 {
         while conn.accept().await.is_some() {}
     });
     port
+}
+
+/// Emit HEADERS, one DATA frame, and trailers without yielding so the proxy
+/// can pull all three tasks into one channel batch.
+async fn spawn_single_chunk_trailered_origin() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (io, _) = listener.accept().await.unwrap();
+        let mut conn = h2::server::handshake(io).await.unwrap();
+        let (_req, mut send_resp) = conn.accept().await.unwrap().unwrap();
+        let response = Response::builder().status(StatusCode::OK).body(()).unwrap();
+        let mut body = send_resp.send_response(response, false).unwrap();
+        body.send_data(Bytes::from_static(b"alpha"), false).unwrap();
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", "0".parse().unwrap());
+        body.send_trailers(trailers).unwrap();
+        while conn.accept().await.is_some() {}
+    });
+    port
+}
+
+async fn spawn_content_length_trailered_origin() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (io, _) = listener.accept().await.unwrap();
+        let mut conn = h2::server::handshake(io).await.unwrap();
+        let (_req, mut send_resp) = conn.accept().await.unwrap().unwrap();
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_LENGTH, whole_body().len())
+            .body(())
+            .unwrap();
+        let mut body = send_resp.send_response(response, false).unwrap();
+        for chunk in CHUNKS {
+            body.send_data(Bytes::from_static(chunk.as_bytes()), false)
+                .unwrap();
+        }
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", "0".parse().unwrap());
+        body.send_trailers(trailers).unwrap();
+        while conn.accept().await.is_some() {}
+    });
+    port
+}
+
+async fn spawn_h1_chunked_origin(with_trailers: bool) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut io, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = io.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&chunk[..read]);
+        }
+        let terminal = if with_trailers {
+            "0\r\ngrpc-status: 0\r\nx-origin: h1\r\n\r\n"
+        } else {
+            "0\r\n\r\n"
+        };
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+             5\r\nalpha\r\n4\r\nbeta\r\n{terminal}"
+        );
+        io.write_all(response.as_bytes()).await.unwrap();
+        io.shutdown().await.unwrap();
+    });
+    port
+}
+
+async fn raw_h1_get(
+    origin_port: u16,
+    use_h2: bool,
+    version: &str,
+    extra_headers: &[(&str, &str)],
+) -> (Duration, String) {
+    let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+    let mut request = format!(
+        "GET /terminal-body {version}\r\nHost: 127.0.0.1\r\nx-port: {origin_port}\r\nConnection: close\r\n"
+    );
+    if use_h2 {
+        request.push_str("x-h2: true\r\n");
+    }
+    for (name, value) in extra_headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    let started = tokio::time::Instant::now();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    (started.elapsed(), String::from_utf8(response).unwrap())
 }
 
 /// Spawn a cacheable trailered origin. Answers ONE request: the cache hit that
@@ -241,6 +342,192 @@ async fn trailered_response_releases_the_withheld_body() {
         response.text().await.unwrap(),
         format!("{}|eos", whole_body())
     );
+}
+
+#[tokio::test]
+async fn header_event_exposes_real_end_of_stream_evidence() {
+    init_without_mock_origin();
+    let terminal = spawn_origin(Termination::EndStreamOnHeaders).await;
+    let response = get(terminal, false).await.unwrap();
+    assert_eq!(response.headers()["x-upstream-header-eos"], "true");
+
+    let trailered = spawn_origin(Termination::Trailers).await;
+    let response = get(trailered, false).await.unwrap();
+    assert_eq!(response.headers()["x-upstream-header-eos"], "false");
+}
+
+#[tokio::test]
+async fn async_trailer_hook_is_awaited_mutates_after_terminal_and_before_h1_write() {
+    init_without_mock_origin();
+    let port = spawn_origin(Termination::Trailers).await;
+    let (elapsed, wire) = raw_h1_get(
+        port,
+        true,
+        "HTTP/1.1",
+        &[
+            ("x-retain-until-eos", "true"),
+            ("x-trailer-delay-ms", "100"),
+            ("x-trailer-mutate", "true"),
+            ("x-assert-trailer-order", "true"),
+            ("x-assert-trailer-capability", "true"),
+        ],
+    )
+    .await;
+
+    assert!(
+        elapsed >= Duration::from_millis(100),
+        "hook was not awaited: {elapsed:?}"
+    );
+    let released = wire.find("|eos").expect("typed terminal output missing");
+    let trailer = wire
+        .find("x-filtered-trailer: yes")
+        .expect("mutated trailer missing from H1 wire");
+    assert!(
+        released < trailer,
+        "terminal output followed trailers: {wire:?}"
+    );
+    assert!(wire.contains("grpc-status: 0"));
+}
+
+#[tokio::test]
+async fn same_batch_header_data_and_trailer_use_planned_h1_capability() {
+    init_without_mock_origin();
+    let port = spawn_single_chunk_trailered_origin().await;
+    let (_, wire) = raw_h1_get(
+        port,
+        true,
+        "HTTP/1.1",
+        &[
+            ("x-assert-trailer-capability", "true"),
+            ("x-assert-response-uncommitted", "true"),
+        ],
+    )
+    .await;
+
+    assert!(wire.contains("5\r\nalpha\r\n"), "wire was {wire:?}");
+    assert!(wire.contains("grpc-status: 0"), "wire was {wire:?}");
+}
+
+#[tokio::test]
+async fn h1_http10_drops_real_trailers_and_uses_close_delimited_framing() {
+    init_without_mock_origin();
+    let port = spawn_origin(Termination::Trailers).await;
+    let (_, wire) = raw_h1_get(
+        port,
+        true,
+        "HTTP/1.0",
+        &[("x-assert-trailer-capability", "false")],
+    )
+    .await;
+
+    let lower = wire.to_ascii_lowercase();
+    assert!(wire.starts_with("HTTP/1.0 200"), "wire was {wire:?}");
+    assert!(!lower.contains("transfer-encoding"), "wire was {wire:?}");
+    assert!(lower.contains("connection: close"), "wire was {wire:?}");
+    assert!(!lower.contains("grpc-status"), "wire was {wire:?}");
+    assert!(wire.ends_with(&whole_body()), "wire was {wire:?}");
+}
+
+#[tokio::test]
+async fn cleared_trailer_map_uses_standard_chunked_terminator() {
+    init_without_mock_origin();
+    let port = spawn_origin(Termination::Trailers).await;
+    let (_, wire) = raw_h1_get(
+        port,
+        true,
+        "HTTP/1.1",
+        &[
+            ("x-assert-trailer-capability", "true"),
+            ("x-trailer-clear", "true"),
+        ],
+    )
+    .await;
+
+    assert!(!wire.contains("grpc-status"), "wire was {wire:?}");
+    assert!(wire.ends_with("0\r\n\r\n"), "wire was {wire:?}");
+}
+
+#[tokio::test]
+async fn content_length_response_drops_real_trailers_without_late_error() {
+    init_without_mock_origin();
+    let port = spawn_content_length_trailered_origin().await;
+    let (_, wire) = raw_h1_get(
+        port,
+        true,
+        "HTTP/1.1",
+        &[("x-assert-trailer-capability", "false")],
+    )
+    .await;
+
+    let lower = wire.to_ascii_lowercase();
+    assert!(wire.starts_with("HTTP/1.1 200"), "wire was {wire:?}");
+    assert!(
+        lower.contains(&format!("content-length: {}", whole_body().len())),
+        "wire was {wire:?}"
+    );
+    assert!(!lower.contains("grpc-status"), "wire was {wire:?}");
+    assert!(wire.ends_with(&whole_body()), "wire was {wire:?}");
+}
+
+#[tokio::test]
+async fn async_trailer_hook_error_prevents_trailer_forwarding() {
+    init_without_mock_origin();
+    let port = spawn_origin(Termination::Trailers).await;
+    let (_, wire) = raw_h1_get(port, true, "HTTP/1.1", &[("x-trailer-error", "true")]).await;
+
+    assert!(wire.starts_with("HTTP/1.1 200"), "wire was {wire:?}");
+    assert!(!wire.contains("grpc-status"), "wire was {wire:?}");
+}
+
+#[tokio::test]
+async fn h1_upstream_trailers_and_no_trailer_terminal_are_preserved_exactly_once() {
+    init_without_mock_origin();
+    let trailered = spawn_h1_chunked_origin(true).await;
+    let (_, wire) = raw_h1_get(
+        trailered,
+        false,
+        "HTTP/1.1",
+        &[
+            ("x-retain-until-eos", "true"),
+            ("x-trailer-mutate", "true"),
+            ("x-assert-trailer-order", "true"),
+        ],
+    )
+    .await;
+    assert_eq!(wire.matches("|eos").count(), 1, "wire was {wire:?}");
+    assert!(wire.contains("grpc-status: 0"), "wire was {wire:?}");
+    assert!(wire.contains("x-origin: h1"), "wire was {wire:?}");
+    assert!(
+        wire.contains("x-filtered-trailer: yes"),
+        "wire was {wire:?}"
+    );
+
+    let no_trailers = spawn_h1_chunked_origin(false).await;
+    let (_, wire) = raw_h1_get(
+        no_trailers,
+        false,
+        "HTTP/1.1",
+        &[("x-retain-until-eos", "true"), ("x-trailer-error", "true")],
+    )
+    .await;
+    assert_eq!(wire.matches("|eos").count(), 1, "wire was {wire:?}");
+    assert!(!wire.contains("grpc-status"), "wire was {wire:?}");
+}
+
+#[tokio::test]
+async fn no_trailer_response_never_invokes_real_trailer_hook() {
+    init_without_mock_origin();
+    let port = spawn_origin(Termination::EndStreamOnLastData).await;
+    let response = reqwest::Client::new()
+        .get("http://127.0.0.1:6147/terminal-body")
+        .header("x-h2", "true")
+        .header("x-port", port.to_string())
+        .header("x-trailer-error", "true")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), whole_body());
 }
 
 /// `Trailer` claims the termination and the `Done` behind it must not dispatch
