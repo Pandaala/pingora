@@ -20,6 +20,10 @@ leaves termination sticky until the terminal boundary consumes it.
 - Mutated current bytes precede chunks pushed by the filter.
 - A terminal Header, terminal Body, Trailer or bare Done claims one terminal
   callback for the response.
+- Pump-batch completion is derived only from tasks actually processed. Tasks
+  queued behind an early `ResponseBodySink::terminate()` are discarded rather
+  than treated as completion evidence; a discarded failure still aborts cache
+  state and prevents H1 upstream reuse.
 - Trailer followed by Done still dispatches only once.
 - Failed responses claim without dispatching; truncation is never presented as
   a clean terminal body.
