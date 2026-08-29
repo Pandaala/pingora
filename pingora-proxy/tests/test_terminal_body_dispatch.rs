@@ -42,6 +42,7 @@ use utils::server_utils::{init_without_mock_origin, take_eos_dispatches};
 use pingora_proxy::RESPONSE_BODY_EMIT_CHUNK_BUDGET;
 
 const CHUNKS: [&str; 3] = ["alpha", "beta", "gamma"];
+const COMPRESSIBLE_BODY_LEN: usize = 4096;
 
 fn whole_body() -> String {
     CHUNKS.concat()
@@ -178,6 +179,32 @@ async fn spawn_h1_chunked_origin(with_trailers: bool) -> u16 {
     port
 }
 
+async fn spawn_h1_compressible_trailered_origin() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut io, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = io.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&chunk[..read]);
+        }
+        let body = "a".repeat(COMPRESSIBLE_BODY_LEN);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\
+             Connection: close\r\n\r\n{:X}\r\n{body}\r\n0\r\ngrpc-status: 0\r\n\r\n",
+            body.len()
+        );
+        io.write_all(response.as_bytes()).await.unwrap();
+        io.shutdown().await.unwrap();
+    });
+    port
+}
+
 async fn raw_h1_get(
     origin_port: u16,
     use_h2: bool,
@@ -224,6 +251,34 @@ async fn spawn_cacheable_trailered_origin() -> u16 {
             body.send_data(Bytes::from_static(chunk.as_bytes()), false)
                 .unwrap();
         }
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", "0".parse().unwrap());
+        body.send_trailers(trailers).unwrap();
+        while conn.accept().await.is_some() {}
+    });
+    port
+}
+
+/// Spawn a one-request H2 origin whose body is large enough to exercise gzip
+/// finalization at the trailer boundary. `cacheable` lets the same response
+/// shape cover both live delivery and cache fill/hit byte identity.
+async fn spawn_compressible_trailered_origin(cacheable: bool) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (io, _) = listener.accept().await.unwrap();
+        let mut conn = h2::server::handshake(io).await.unwrap();
+        let (_req, mut send_resp) = conn.accept().await.unwrap().unwrap();
+        let mut builder = Response::builder()
+            .status(StatusCode::OK)
+            .header(http::header::CONTENT_TYPE, "text/plain");
+        if cacheable {
+            builder = builder.header(http::header::CACHE_CONTROL, "public, max-age=60");
+        }
+        let response = builder.body(()).unwrap();
+        let mut body = send_resp.send_response(response, false).unwrap();
+        body.send_data(Bytes::from(vec![b'a'; COMPRESSIBLE_BODY_LEN]), false)
+            .unwrap();
         let mut trailers = HeaderMap::new();
         trailers.insert("grpc-status", "0".parse().unwrap());
         body.send_trailers(trailers).unwrap();
@@ -559,6 +614,58 @@ async fn trailered_response_dispatches_the_terminal_callback_exactly_once() {
     );
 }
 
+#[tokio::test]
+async fn compressed_trailered_response_is_complete_and_dispatches_eos_once() {
+    init_without_mock_origin();
+    let port = spawn_compressible_trailered_origin(false).await;
+    let probe = format!("compressed-trailered-{}-{port}", std::process::id());
+    let response = reqwest::ClientBuilder::new()
+        .gzip(true)
+        .build()
+        .unwrap()
+        .get("http://127.0.0.1:6147/terminal-body")
+        .header("x-h2", "true")
+        .header("x-port", port.to_string())
+        .header("x-upstream-compression", "true")
+        .header(http::header::ACCEPT_ENCODING, "gzip")
+        .header("x-eos-probe", &probe)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.bytes().await.unwrap(),
+        Bytes::from(vec![b'a'; COMPRESSIBLE_BODY_LEN])
+    );
+    assert_eq!(take_eos_dispatches(&probe), 1);
+}
+
+#[tokio::test]
+async fn h1_compressed_trailered_response_is_complete_and_dispatches_eos_once() {
+    init_without_mock_origin();
+    let port = spawn_h1_compressible_trailered_origin().await;
+    let probe = format!("h1-compressed-trailered-{}-{port}", std::process::id());
+    let response = reqwest::ClientBuilder::new()
+        .gzip(true)
+        .build()
+        .unwrap()
+        .get("http://127.0.0.1:6147/terminal-body")
+        .header("x-port", port.to_string())
+        .header(http::header::ACCEPT_ENCODING, "gzip")
+        .header("x-eos-probe", &probe)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.bytes().await.unwrap(),
+        Bytes::from(vec![b'a'; COMPRESSIBLE_BODY_LEN])
+    );
+    assert_eq!(take_eos_dispatches(&probe), 1);
+}
+
 /// Released bytes are body: they must reach the wire ahead of the trailer, not
 /// after the task that terminates the response. A response whose bytes landed
 /// after the terminal marker would arrive truncated.
@@ -725,4 +832,49 @@ async fn cached_body_matches_the_wire_body_for_a_trailered_response() {
         .unwrap();
     assert_eq!(hit.headers().get("x-cache-status").unwrap(), "hit");
     assert_eq!(hit.text().await.unwrap(), miss_body);
+}
+
+#[tokio::test]
+async fn compressed_trailered_cache_hit_is_byte_identical_to_the_fill() {
+    init_without_mock_origin();
+    let port = spawn_compressible_trailered_origin(true).await;
+    let url = format!(
+        "http://127.0.0.1:6148/compressed-terminal-body-cache-{}",
+        std::process::id()
+    );
+    let client = reqwest::ClientBuilder::new().gzip(false).build().unwrap();
+
+    let miss = client
+        .get(&url)
+        .header("x-h2", "true")
+        .header("x-port", port.to_string())
+        .header("x-upstream-compression", "true")
+        .header(http::header::ACCEPT_ENCODING, "gzip")
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(miss.headers().get("x-cache-status").unwrap(), "miss");
+    assert_eq!(
+        miss.headers().get(http::header::CONTENT_ENCODING).unwrap(),
+        "gzip"
+    );
+    let miss_body = miss.bytes().await.unwrap();
+
+    let hit = client
+        .get(&url)
+        .header("x-h2", "true")
+        .header("x-port", port.to_string())
+        .header("x-upstream-compression", "true")
+        .header(http::header::ACCEPT_ENCODING, "gzip")
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hit.headers().get("x-cache-status").unwrap(), "hit");
+    assert_eq!(
+        hit.headers().get(http::header::CONTENT_ENCODING).unwrap(),
+        "gzip"
+    );
+    assert_eq!(hit.bytes().await.unwrap(), miss_body);
 }

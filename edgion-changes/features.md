@@ -42,7 +42,8 @@ implementation.
 4. Application termination is typed and non-retryable. A committed final
    response cannot enter a second response or retry path.
 5. Filtered bytes preserve order across live delivery, cache admission, and
-   cache hit; framing metadata agrees with transformed body semantics.
+   cache hit; compression finalizes before trailers, and framing metadata
+   agrees with transformed body semantics.
 6. H1 reuse is rejected when unread/rewritten state makes the next exchange
    ambiguous. H2 stream termination and connection health remain distinct.
 7. PROXY source trust is transport trust. Consumers must reject invalid trust

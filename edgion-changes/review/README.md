@@ -44,6 +44,8 @@ The `status` inside each record is authoritative.
   (H2-012): drive harness capabilities through end-to-end tests.
 - [Trailer/Done terminal dispatch](h2-grpc/trailer-done-terminal-body-dispatch.md):
   one latch dispatches EOS and orders released bytes before terminal tasks.
+- [Compression/trailer terminal ordering](compression/compression-trailer-terminal-order.md):
+  finalize compression before trailers and keep the following Done inert.
 - [Custom terminal 101](http1/custom-terminal-101-normalized-before-dispatch.md):
   normalize `Header(101, true)` to `Header(101, false) -> Done` at the producer.
 - [Custom early-response request abandonment](custom/custom-upstream-early-response-abandonment.md):

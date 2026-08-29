@@ -33,6 +33,7 @@ All H1, H2, and custom response pumps use this order:
 ```text
 final response header
   -> Data events
+  -> compression footer bytes, if trailers terminate an encoded response
   -> one typed terminal boundary
   -> awaited application trailer filter for a real trailer map
   -> cache and downstream trailer modules
@@ -47,6 +48,12 @@ Header EOS and a bare Done use `TerminalWithoutTrailers`. A terminal Body uses
 trailer-free completion. `Failed` claims the latch without dispatching a clean
 terminal event. Hook errors stop the trailer before cache, downstream modules,
 or the wire.
+
+Upstream compression finalizes at the first trailer boundary, not at the
+bookkeeping `Done` that follows it. Any encoder footer is exposed as a
+non-terminal body task immediately before the unchanged trailer. The
+compression context records finalization, so a split-batch `Done` cannot
+finalize the encoder again or dispatch a second body-hook EOS.
 
 ## HTTP/1 behavior
 

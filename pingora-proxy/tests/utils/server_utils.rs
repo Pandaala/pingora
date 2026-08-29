@@ -812,6 +812,14 @@ impl ProxyHttp for ExampleProxyCache {
         if session
             .req_header()
             .headers
+            .get("x-upstream-compression")
+            .is_some()
+        {
+            session.upstream_compression.adjust_level(6);
+        }
+        if session
+            .req_header()
+            .headers
             .get("x-downstream-compression")
             .is_some()
         {

@@ -34,6 +34,9 @@ boundary consumes it.
   than treated as completion evidence; a discarded failure still aborts cache
   state and prevents H1 upstream reuse.
 - Trailer followed by Done still dispatches only once.
+- Upstream compression finalizes before Trailer. H1, H2, and custom pumps feed
+  the returned non-terminal footer body through the ordinary filter/cache path
+  before processing the trailer; a following Done cannot emit more body bytes.
 - Failed responses claim without dispatching; truncation is never presented as
   a clean terminal body.
 - Upgrade responses retain `UpgradedBody` tagging for synthetic output.

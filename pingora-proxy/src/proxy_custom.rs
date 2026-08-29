@@ -390,7 +390,9 @@ where
             }
             #[cfg(feature = "upstream_modules")]
             session.upstream_modules_filter_task(&mut t).await?;
-            session.upstream_compression.response_filter(&mut t);
+            let compression_prefix = session
+                .upstream_compression
+                .response_filter_with_preceding(&mut t);
             // check error and abort
             // otherwise the error is surfaced via write_response_tasks()
             if !serve_from_cache.should_send_to_downstream() {
@@ -398,21 +400,40 @@ where
                     return Err(e);
                 }
             }
-            self.custom_response_filter(
-                session,
-                t,
-                ctx,
-                serve_from_cache,
-                range_body_filter,
-                false,
-                suppress_downstream_body,
-                filtered_terminal_header,
-                upstream_reusable,
-                sink,
-                terminal_body,
-                &mut filtered_tasks,
-            )
-            .await?;
+            if let Some(prefix) = compression_prefix {
+                self.custom_response_filter(
+                    session,
+                    prefix,
+                    ctx,
+                    serve_from_cache,
+                    range_body_filter,
+                    false,
+                    suppress_downstream_body,
+                    filtered_terminal_header,
+                    upstream_reusable,
+                    sink,
+                    terminal_body,
+                    &mut filtered_tasks,
+                )
+                .await?;
+            }
+            if !sink.is_terminated() {
+                self.custom_response_filter(
+                    session,
+                    t,
+                    ctx,
+                    serve_from_cache,
+                    range_body_filter,
+                    false,
+                    suppress_downstream_body,
+                    filtered_terminal_header,
+                    upstream_reusable,
+                    sink,
+                    terminal_body,
+                    &mut filtered_tasks,
+                )
+                .await?;
+            }
             if serve_from_cache.is_miss_header() {
                 response_state.enable_cached_response();
             }

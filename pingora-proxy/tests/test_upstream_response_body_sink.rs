@@ -152,6 +152,7 @@ const SUPPRESSION_ORIGIN_BODY_SIZE: usize = 256 * 1024;
 /// Body chunks the scripted custom origin streams before its trailers.
 const CUSTOM_TRAILERED_CHUNKS: [&[u8]; 3] = [b"alpha", b"beta", b"gamma"];
 const CUSTOM_TRAILERED_PATH: &str = "/custom_trailered";
+const CUSTOM_COMPRESSED_TRAILERED_PATH: &str = "/custom_compressed_trailered";
 /// Selects the trailered script in the custom session. A request HEADER, not
 /// the path: the upstream request URI is rewritten to "/" before it reaches
 /// `write_request_header`.
@@ -443,6 +444,7 @@ static CUSTOM_DOWNSTREAM_RESPONSE_CHANGED: Lazy<tokio::sync::Notify> =
     Lazy::new(tokio::sync::Notify::new);
 static CUSTOM_DOWNSTREAM_WRITER_FINISHES: AtomicUsize = AtomicUsize::new(0);
 static CUSTOM_DOWNSTREAM_WRITER_CLEANUPS: AtomicUsize = AtomicUsize::new(0);
+static CUSTOM_COMPRESSED_TRAILERED_EOS_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 fn assert_no_terminal_upgrade_read_after_eos() {
     assert!(
@@ -778,6 +780,8 @@ impl CustomSession for HeaderOnlyCustomSession {
             .is_some();
         if req.headers.get(CUSTOM_TRAILERED_HEADER.0).is_some() {
             self.response = ResponseHeader::build(200, None).unwrap();
+            self.response
+                .insert_header(http::header::CONTENT_TYPE, "text/plain")?;
             self.pending_body = CUSTOM_TRAILERED_CHUNKS
                 .iter()
                 .map(|c| Bytes::from_static(c))
@@ -1193,6 +1197,9 @@ impl ProxyHttp for EmitProxy {
             }
             _ => {}
         }
+        if session.req_header().uri.path() == CUSTOM_COMPRESSED_TRAILERED_PATH {
+            session.upstream_compression.adjust_level(6);
+        }
         let mut peer = Box::new(HttpPeer::new(
             format!("127.0.0.1:{}", self.origin_port),
             false,
@@ -1305,6 +1312,9 @@ impl ProxyHttp for EmitProxy {
                     *body = Some(Bytes::from(released));
                 }
             }
+            CUSTOM_COMPRESSED_TRAILERED_PATH if end_of_stream => {
+                CUSTOM_COMPRESSED_TRAILERED_EOS_CALLS.fetch_add(1, Ordering::SeqCst);
+            }
             "/emit_overflow" => {
                 // Push a chunk larger than the batch budget: `push` must
                 // reject it, and that rejection must surface as a failed
@@ -1364,7 +1374,10 @@ impl ProxyHttp for EmitProxy {
         trailers: &mut HeaderMap,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        if session.req_header().uri.path() == CUSTOM_TRAILERED_PATH {
+        if matches!(
+            session.req_header().uri.path(),
+            CUSTOM_TRAILERED_PATH | CUSTOM_COMPRESSED_TRAILERED_PATH
+        ) {
             if !ctx.terminal_before_trailers_seen {
                 return pingora_error::Error::e_explain(
                     pingora_error::ErrorType::InternalError,
@@ -3238,6 +3251,32 @@ async fn custom_trailered_response_dispatches_the_terminal_callback_once() {
         .await
         .unwrap();
     assert_eq!(body.matches("|eos").count(), 1, "body was {body:?}");
+}
+
+#[tokio::test]
+async fn custom_compressed_trailered_response_is_complete_and_dispatches_eos_once() {
+    CUSTOM_COMPRESSED_TRAILERED_EOS_CALLS.store(0, Ordering::SeqCst);
+    let harness = init();
+    let expected: Vec<u8> = CUSTOM_TRAILERED_CHUNKS.concat();
+    let response = reqwest::ClientBuilder::new()
+        .gzip(true)
+        .build()
+        .unwrap()
+        .get(format!(
+            "{}{CUSTOM_COMPRESSED_TRAILERED_PATH}",
+            harness.custom_base_url()
+        ))
+        .header(CUSTOM_TRAILERED_HEADER.0, CUSTOM_TRAILERED_HEADER.1)
+        .header(reqwest::header::ACCEPT_ENCODING, "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.bytes().await.unwrap(), Bytes::from(expected));
+    assert_eq!(
+        CUSTOM_COMPRESSED_TRAILERED_EOS_CALLS.load(Ordering::SeqCst),
+        1
+    );
 }
 
 #[tokio::test]
