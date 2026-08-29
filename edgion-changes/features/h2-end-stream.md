@@ -96,13 +96,23 @@ and both require the wire flag as well:
   interval is set correspondingly high and it never preempts a configured
   `write_timeout`.
 
+There is no completely unbounded H2 capacity wait. When the peer supplies no
+`write_timeout`, the pump uses a ten-second protocol-local write-progress floor;
+any explicitly configured shorter or longer timeout wins unchanged. Like the
+configured timeout, the floor is re-armed for each capacity grant and therefore
+does not impose a total upload duration on a stream that keeps making progress.
+
 In both cases the upload is abandoned and the response delivered. Nothing is
 concealed by that: the request half never receives its END_STREAM, so the
 stream is reset when the exchange ends and the origin sees a truncated upload
 rather than a whole one, and the swallow is logged at `warn`. Without the wire
 flag every one of these failures still costs the exchange, so a response the
 origin never flagged complete can neither be delivered nor admitted to cache on
-the strength of a stalled write.
+the strength of a stalled write. In particular, expiry of the protocol-local
+floor without the flag is propagated out of the duplex pump, sends
+`RST_STREAM(CANCEL)`, abandons any partial cache entry, and does not retry after
+a final response has already been committed. The H2 connection itself remains
+eligible for reuse after the failed stream releases its capacity.
 
 ## Version-tolerant tests
 

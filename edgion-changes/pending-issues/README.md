@@ -10,7 +10,6 @@ next action, and closure evidence.
 | --- | --- | --- | --- |
 | [Async response filter fast path](async-response-body-filter-fast-path.md) | Open performance investigation | Fork | [Finding 007](../review/findings/007-low-async-response-filter-adds-per-chunk-boxing.md) |
 | [Custom writer error context](custom-writer-error-context.md) | Open low-priority follow-up | Fork | [Review record](../review/custom/custom-upstream-early-response-abandonment.md) |
-| [H2 upload stall without END_STREAM](h2-request-body-stall-without-end-stream.md) | Open policy/design issue | Fork at an upstream boundary | [H2-007](../review/h2-grpc/h2-writer-capacity-stall-after-response.md) |
 | [Terminal HEADERS completion](h2-terminal-headers-completion.md) | Deferred/blocked | Upstream decoder, then fork integration | [Upstream limitation](../review/upstream-limitations.md) |
 | [H2 trailer validation](h2-trailer-validation.md) | Deferred upstream plus fork evidence maintenance | Split upstream/fork | [Upstream limitation](../review/upstream-limitations.md) |
 | [ResponseBodySink chunk count](../review/findings/003-medium-response-body-sink-does-not-bound-chunk-count.md) | Open review finding | Fork | No implementation task yet |

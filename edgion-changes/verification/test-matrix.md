@@ -33,35 +33,34 @@ Expected feature coverage:
 | --- | --- |
 | `pingora-core --lib` | body buffers, H1/H2 sessions, END_STREAM watch, listener and PROXY parser |
 | `pingora-core --lib --features boringssl test_listen_tls_proxy_protocol` | explicit PROXY-before-TLS rejection stages, successful handshake and address preservation |
-| `pingora-proxy --lib` | disposition truth tables, terminal latch, sink budget, EOS migration, retry guards |
+| `pingora-proxy --lib` | 119 disposition truth-table, H2 write-floor, terminal-latch, sink-budget, EOS-migration and retry-guard tests |
 | `test_request_body_seam` | 54 H1/H2 request-pump, framing, retry and termination scenarios |
-| `test_upstream_response_body_sink` | 50 response streaming/cache/custom scenarios |
-| `test_terminal_body_dispatch` | 9 self-contained terminal/trailer scenarios |
+| `test_upstream_response_body_sink` | 54 response streaming/cache/custom scenarios |
+| `test_terminal_body_dispatch` | 23 self-contained terminal/trailer scenarios |
 | `test_h2_upstream_no_error_reset` | 8 self-contained H2 reset/completion scenarios |
-| `test_h2_upstream_stalled_after_response` | 3 H2 request-body stall, configured-deadline and no-write-timeout scenarios |
-| `test_h2_upstream_cache_and_reuse` | 7 H2 cache-admission, upstream-connection-reuse and peer-window-handshake scenarios |
+| `test_h2_upstream_stalled_after_response` | 4 H2 request-body stall, configured-deadline, default-floor and END_STREAM discrimination scenarios |
+| `test_h2_upstream_cache_and_reuse` | 8 H2 cache-admission, upstream-connection-reuse, stalled-write cleanup and peer-window-handshake scenarios |
 
 ## Validation snapshot
 
-Validated on 2026-08-28 against the `edgion_v3` working tree based on
-`ff5f045`:
+Validated on 2026-08-29 against the working tree based on `ca45864d`:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo check -p pingora-core -p pingora-proxy`: passed.
 - `cargo check -p pingora-core --features "connection_filter boringssl"`:
   passed.
-- `cargo test -p pingora-core --lib`: 721 passed, 17 ignored.
-- `cargo test -p pingora-core --lib --features connection_filter`: 726 passed,
+- `cargo test -p pingora-core --lib`: 737 passed, 17 ignored.
+- `cargo test -p pingora-core --lib --features connection_filter`: 742 passed,
   17 ignored.
 - `cargo test -p pingora-core --lib --features boringssl test_listen_tls_proxy_protocol`:
   2 passed.
-- `cargo test -p pingora-proxy --lib`: 114 passed.
+- `cargo test -p pingora-proxy --lib`: 119 passed.
 - `test_request_body_seam`: 54 passed.
-- `test_upstream_response_body_sink`: 50 passed.
-- `test_terminal_body_dispatch`: 9 passed.
+- `test_upstream_response_body_sink`: 54 passed.
+- `test_terminal_body_dispatch`: 23 passed.
 - `test_h2_upstream_no_error_reset`: 8 passed.
-- `test_h2_upstream_stalled_after_response`: 3 passed.
-- `test_h2_upstream_cache_and_reuse`: 7 passed. Requires the `127.0.0.2`
+- `test_h2_upstream_stalled_after_response`: 4 passed.
+- `test_h2_upstream_cache_and_reuse`: 8 passed. Requires the `127.0.0.2`
   loopback alias described above.
 
 `cargo check -p pingora-core -p pingora-proxy --all-features` currently fails

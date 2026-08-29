@@ -159,7 +159,9 @@ enum UpstreamBodyOutcome {
 /// How the pump may write the upstream request body on this attempt.
 #[derive(Debug, Clone)]
 struct UpstreamBodyWrite {
-    /// Per-write timeout from the peer options.
+    /// Per-write timeout from the peer options. `None` means the caller did
+    /// not choose a timeout; the H2 pump still applies its protocol liveness
+    /// floor through [`effective_upstream_write_timeout`].
     timeout: Option<Duration>,
     /// The upstream request stream already carries its END_STREAM, so no
     /// request body byte may be written at all -- h2 answers a DATA frame on a
@@ -424,6 +426,24 @@ fn bound_undrained_downstream_body(session: &mut Session) {
 /// than an origin that is still draining the upload needs for one of them.
 const UPSTREAM_STALL_PROBE_INTERVAL: Duration = Duration::from_secs(10);
 
+/// H2 request-body write-progress floor when the caller supplied no timeout.
+///
+/// `h2::SendStream::poll_capacity` has no deadline of its own. Leaving a write
+/// completely unbounded therefore lets a peer that withholds both flow-control
+/// capacity and response END_STREAM retain the whole exchange forever. Keep
+/// this local to the H2 request pump: changing `PeerOptions::write_timeout`
+/// would also change H1 and custom-upstream defaults.
+///
+/// A configured timeout always wins, even when it is longer than this floor.
+/// Like `write_body`'s normal timeout, this bounds one capacity wait rather
+/// than the total upload, so a progressing upload can run for longer.
+const DEFAULT_H2_UPSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[inline]
+fn effective_upstream_write_timeout(configured: Option<Duration>) -> Duration {
+    configured.unwrap_or(DEFAULT_H2_UPSTREAM_WRITE_TIMEOUT)
+}
+
 /// How one request-body write ended.
 enum UpstreamBodyWriteEnd {
     /// `write_body` returned, successfully or not.
@@ -453,7 +473,12 @@ async fn write_upstream_body_watching_stall(
     // re-polls it by reference rather than moving it into a branch.
     mut stream_close: Option<Idle<'_>>,
 ) -> UpstreamBodyWriteEnd {
-    let write = write_body(client_body, data, end, body_write.timeout);
+    let write = write_body(
+        client_body,
+        data,
+        end,
+        Some(effective_upstream_write_timeout(body_write.timeout)),
+    );
     tokio::pin!(write);
     // Only a write nobody else bounded needs the probe; see the constant.
     let probe_stall = body_write.timeout.is_none();
@@ -861,13 +886,14 @@ where
             Some(Err(e)) => {
                 let upstream_read_timeout =
                     e.esource == ErrorSource::Upstream && matches!(e.etype, ReadTimedout);
+                let upstream_write_timeout =
+                    e.esource == ErrorSource::Upstream && matches!(e.etype, WriteTimedout);
                 let downstream_error = e.esource == ErrorSource::Downstream;
-                // On application level upstream read timeouts, send RST_STREAM CANCEL,
-                // we know we have not received END_STREAM at this point since we read timed out.
+                // On upstream read/write timeouts, send RST_STREAM CANCEL: a
+                // timeout that reaches this arm has no qualified END_STREAM
+                // evidence and the exchange is being failed.
                 // Also cancel the upstream stream when downstream goes away/resets so the
                 // upstream peer can release the stream promptly.
-                // TODO: implement for write timeouts?
-                //
                 // Whether or not the explicit reset below is sent, this arm
                 // abandons the upstream request stream: `client_body` is
                 // dropped on return and `h2` cancels a still-open stream when
@@ -876,7 +902,7 @@ where
                 // because a record published in between could no longer be
                 // retracted. See `Http2Session::note_local_reset`.
                 client_session.note_local_reset();
-                if upstream_read_timeout || downstream_error {
+                if upstream_read_timeout || upstream_write_timeout || downstream_error {
                     client_body.send_reset(h2::Reason::CANCEL);
                     if upstream_read_timeout {
                         // Mark the underlying H2 connection for shutdown so it's not used
@@ -1403,6 +1429,22 @@ where
                             finish_terminated_response(session).await;
                             restore_custom_message_reader(session, downstream_custom_message_reader.take());
                             return Ok(DownstreamRequestOutcome::Terminate);
+                        },
+                        Err(e)
+                            if e.esource == ErrorSource::Upstream
+                                && matches!(e.etype, WriteTimedout) =>
+                        {
+                            // This is the bounded failure policy when the peer
+                            // has NOT flagged its response complete. Waiting
+                            // for the read half here would defeat the write
+                            // deadline if that peer also withholds response
+                            // END_STREAM.
+                            //
+                            // The qualified END_STREAM case never reaches this
+                            // arm: `upstream_write_error_outcome` converts it
+                            // to `UpstreamDoneReceiving` above so the complete
+                            // response can still be delivered.
+                            return Err(e);
                         },
                         Err(e) => {
                             // Under `Bodyless` the upstream request stream is already
@@ -2751,6 +2793,28 @@ fn test_a_stalled_write_is_a_separate_swallowable_shape() {
             "{etype:?} is not the upstream withholding capacity"
         );
     }
+}
+
+#[test]
+fn test_h2_write_timeout_floor_only_fills_an_unconfigured_timeout() {
+    let shorter = Duration::from_millis(250);
+    let longer = DEFAULT_H2_UPSTREAM_WRITE_TIMEOUT + Duration::from_secs(30);
+
+    assert_eq!(
+        effective_upstream_write_timeout(None),
+        DEFAULT_H2_UPSTREAM_WRITE_TIMEOUT,
+        "an unconfigured H2 capacity wait must have a finite liveness floor"
+    );
+    assert_eq!(
+        effective_upstream_write_timeout(Some(shorter)),
+        shorter,
+        "an explicit shorter write timeout must win"
+    );
+    assert_eq!(
+        effective_upstream_write_timeout(Some(longer)),
+        longer,
+        "an explicit longer write timeout must not be clamped to the floor"
+    );
 }
 
 /// Neither swallowable shape may fire without the wire END_STREAM flag.

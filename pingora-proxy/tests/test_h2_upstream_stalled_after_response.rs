@@ -134,6 +134,36 @@ async fn h2_upstream_withholding_capacity_is_bounded_without_a_write_timeout() {
     );
 }
 
+/// The no-evidence mirror case: with no configured write or read timeout, the
+/// H2 writer's internal progress floor must fail the exchange instead of
+/// waiting forever. Unlike the complete-response case above, there is no
+/// END_STREAM evidence that could authorize upload abandonment or success.
+#[tokio::test]
+async fn h2_upstream_withholding_capacity_without_end_stream_fails_on_the_default_floor() {
+    init_without_mock_origin();
+    let port = spawn_answer_then_withhold_window_origin(false).await;
+    let start = Instant::now();
+    match post_through_proxy(port, None, None).await {
+        // Response headers and a partial body may already be committed before
+        // the request writer reaches its floor. If they are, the body must
+        // fail; otherwise a generated 5xx is the expected bounded failure.
+        Ok(res) => {
+            let status = res.status();
+            let body = res.text().await;
+            assert!(
+                status.is_server_error() || body.is_err(),
+                "a response without END_STREAM must not become complete when the default \
+                 H2 write floor expires: status={status}, body={body:?}"
+            );
+        }
+        Err(_) => { /* connection error is an acceptable failure shape */ }
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(40),
+        "the default H2 write floor must bound the exchange"
+    );
+}
+
 /// The negative control, and the reason the wire flag is half of the
 /// conjunction rather than the whole of it: the very same withheld window
 /// against a TRUNCATED response must still fail the exchange. Nothing about a
@@ -143,17 +173,17 @@ async fn h2_upstream_withholding_capacity_still_fails_a_truncated_response() {
     init_without_mock_origin();
     let port = spawn_answer_then_withhold_window_origin(false).await;
     match post_through_proxy(port, Some(300), Some(1000)).await {
-        // The proxy has already streamed 200 + partial body downstream by the
-        // time the stalled write is classified, so the failure surfaces as an
-        // incomplete response body rather than as a 502 -- the same shape as
-        // `h2_upstream_truncated_response_then_no_error_reset_is_an_error`.
+        // Depending on whether the response header wins the race against the
+        // write timeout, failure surfaces either as a generated 5xx or as an
+        // incomplete already-started response body.
         Ok(res) => {
-            assert_eq!(res.status(), StatusCode::OK);
+            let status = res.status();
             let body = res.text().await;
             assert!(
-                body.is_err(),
+                status.is_server_error() || body.is_err(),
                 "a response the origin never flagged complete must not read as a \
-                 complete body just because the request-body write stalled: {body:?}"
+                 complete body just because the request-body write stalled: \
+                 status={status}, body={body:?}"
             );
         }
         Err(_) => { /* connection error is an acceptable shape of the same failure */ }

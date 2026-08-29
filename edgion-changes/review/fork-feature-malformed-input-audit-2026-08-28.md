@@ -27,15 +27,19 @@ contradictory framing/termination shapes were treated as defensive test input.
   natural-completion downstream idle watcher. Fresh independent review returned
   LGTM and the project verification matrix passed.
 
+## Resolved after this audit
+
+- [H2 upload stall without END_STREAM](h2-grpc/h2-writer-stall-without-end-stream-bounded.md)
+  is bounded by the H2 writer's protocol-local progress floor when no explicit
+  write timeout exists. Expiry without qualified response END_STREAM fails the
+  exchange and releases stream capacity.
+
 ## Confirmed existing open findings
 
 - [ResponseBodySink chunk-count amplification](findings/003-medium-response-body-sink-does-not-bound-chunk-count.md)
   remains open. The byte budget does not bound the number of nonempty emitted
   chunks, so a filter can amplify one batch into roughly one million cache and
   downstream operations.
-- [H2 upload stall without END_STREAM](../pending-issues/h2-request-body-stall-without-end-stream.md)
-  remains an open policy issue when no write timeout is configured. Edgion's
-  normal peer configuration supplies a bounded timeout.
 - [H2 trailer validation](../pending-issues/h2-trailer-validation.md) and
   [terminal HEADERS completion](../pending-issues/h2-terminal-headers-completion.md)
   remain blocked/deferred at the accepted upstream `h2` decoder boundary.

@@ -39,7 +39,7 @@ use bytes::Bytes;
 use http::{Response, StatusCode};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use utils::server_utils::{cache_entry_state, init_without_mock_origin, CacheEntryState};
 
@@ -604,6 +604,49 @@ async fn spawn_flow_controlled_complete_origin() -> (u16, Arc<OriginStats>) {
     (port, stats)
 }
 
+/// Spawn an origin whose first stream withholds both request-body capacity and
+/// response END_STREAM. After the proxy's H2 write floor resets that stream,
+/// the same connection serves subsequent streams normally.
+async fn spawn_unterminated_stall_then_recover_origin() -> (u16, Arc<OriginStats>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let stats = Arc::new(OriginStats::default());
+    let origin_stats = stats.clone();
+    tokio::spawn(async move {
+        while let Ok((io, _)) = listener.accept().await {
+            origin_stats.connections.fetch_add(1, Ordering::Relaxed);
+            let conn_stats = origin_stats.clone();
+            tokio::spawn(async move {
+                let mut conn = h2::server::Builder::new()
+                    .initial_window_size(ORIGIN_ADVERTISED_WINDOW)
+                    .handshake(io)
+                    .await
+                    .unwrap();
+                while let Some(Ok((req, mut send_resp))) = conn.accept().await {
+                    let request_number = conn_stats.requests.fetch_add(1, Ordering::Relaxed) + 1;
+                    let response = Response::builder().status(StatusCode::OK).body(()).unwrap();
+                    let mut body = send_resp.send_response(response, false).unwrap();
+                    if request_number == 1 {
+                        body.send_data(Bytes::from_static(b"unterminated"), false)
+                            .unwrap();
+                        // Retain the RecvStream without polling it so no upload
+                        // WINDOW_UPDATE is generated. Retain the response
+                        // SendStream so this side also never supplies EOS.
+                        tokio::spawn(async move {
+                            std::future::pending::<()>().await;
+                            drop((req, body));
+                        });
+                    } else {
+                        drop(req);
+                        body.send_data(Bytes::from(ORIGIN_BODY), true).unwrap();
+                    }
+                }
+            });
+        }
+    });
+    (port, stats)
+}
+
 /// Spawn a cleartext-h2 origin that never reads the request body, enqueues a
 /// flow-controlled body WITHOUT END_STREAM, lets a large prefix of it reach the
 /// wire, and then drops the connection mid-body.
@@ -736,6 +779,58 @@ async fn h2_flow_controlled_stall_releases_capacity_and_reuses_the_connection() 
         stats.connections(),
         1,
         "reuse means the origin accepted exactly one connection"
+    );
+}
+
+/// Without response END_STREAM, the H2 write floor must fail the first
+/// exchange, abandon any partial cache entry, avoid retrying the failed upload,
+/// and release the stream slot so the connection can be reused. The generic
+/// committed-final-response retry guard is covered separately in proxy unit
+/// tests.
+#[tokio::test]
+async fn h2_unterminated_stall_fails_without_cache_or_capacity_leak() {
+    init_without_mock_origin();
+    let (port, stats) = spawn_unterminated_stall_then_recover_origin().await;
+    let path = unique_path("unterminated-stall");
+
+    let start = Instant::now();
+    let first = reqwest::Client::new()
+        .post(format!("http://{CACHE_PROXY_HOST}{path}"))
+        .header("x-h2", "true")
+        .header("x-port", port.to_string())
+        .body("x".repeat(UPLOAD_LEN))
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await;
+    if let Ok(res) = first {
+        let status = res.status();
+        let body = res.text().await;
+        assert!(
+            status.is_server_error() || body.is_err(),
+            "the unterminated response must fail: status={status}, body={body:?}"
+        );
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(20),
+        "the H2 write floor, not the client's timeout, must end the first exchange"
+    );
+
+    assert_eq!(stats.requests(), 1, "the failed upload must not be retried");
+    assert_ne!(
+        cache_entry_state(CACHE_PROXY_HOST, &path).await,
+        CacheEntryState::Complete,
+        "an unterminated response must not produce a complete cache entry"
+    );
+
+    let res = cache_proxy_get(port, &path).send().await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers().get("x-cache-status").unwrap(), "miss");
+    assert_eq!(res.text().await.unwrap(), ORIGIN_BODY);
+    assert_eq!(stats.requests(), 2, "the failed entry must miss cache");
+    assert_eq!(
+        stats.connections(),
+        1,
+        "the timed-out stream must release capacity for reuse on the same H2 connection"
     );
 }
 

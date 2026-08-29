@@ -135,12 +135,12 @@ Re-open this decision only if:
   need re-deriving.
 - Upstream Pingora fixes the unbounded `poll_capacity` wait itself, in which
   case the fork should adopt the upstream shape rather than keep this one.
-- The mirror case gains an answer: an upstream that withholds request-body
-  window and never flags END_STREAM, with no `write_timeout` configured, is
-  still unbounded and deliberately so -- there is no evidence that would
-  justify abandoning that upload. Recorded in the fork as
-  [`h2-request-body-stall-without-end-stream.md`](../../pending-issues/h2-request-body-stall-without-end-stream.md); a bound for it
-  is a policy decision, not a widening of this rule.
+- The mirror case now has a separate bounded-failure policy: an upstream that
+  withholds request-body window and never flags END_STREAM reaches the H2
+  writer's protocol-local progress floor when no explicit `write_timeout`
+  exists. That expiry fails the exchange; it does not widen this record's
+  successful-abandonment rule. See
+  [`h2-writer-stall-without-end-stream-bounded.md`](h2-writer-stall-without-end-stream-bounded.md).
 
 ## Reference cases
 
