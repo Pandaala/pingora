@@ -136,11 +136,15 @@ const HTTP10_BODYLESS_OK_ORIGIN_HEADER: (&str, &str) = ("x-http10-bodyless-ok-or
 const BODYLESS_NO_CONTENT_HEADER: (&str, &str) = ("x-bodyless-no-content", "1");
 const BODYLESS_NOT_MODIFIED_HEADER: (&str, &str) = ("x-bodyless-not-modified", "1");
 const MANY_CHUNK_HEADER: (&str, &str) = ("x-many-chunks", "1");
+const TRAILERED_ORIGIN_HEADER: (&str, &str) = ("x-trailered-origin", "1");
 const CUSTOM_POST_TERMINAL_FAILURE_HEADER: (&str, &str) = ("x-custom-post-terminal-failure", "1");
 const CUSTOM_REQUEST_BODY_SCRIPT_HEADER: &str = "x-custom-request-body-script";
 const CUSTOM_EARLY_RESPONSE_SCRIPT: &str = "early-response";
 const CUSTOM_REJECT_FIRST_WRITE_SCRIPT: &str = "reject-first-write";
 const CUSTOM_REJECT_LATER_WRITE_SCRIPT: &str = "reject-later-write";
+const CUSTOM_REJECT_WRITE_AND_ABANDON_FILTER_SCRIPT: &str = "reject-write-and-abandon-filter";
+const CUSTOM_REJECT_WRITE_WITH_COMPETING_RESPONSE_ERROR_SCRIPT: &str =
+    "reject-write-with-competing-response-error";
 const CUSTOM_COMPLETE_UPLOAD_SCRIPT: &str = "complete-upload";
 const CUSTOM_DOWNSTREAM_EARLY_RESPONSE_SCRIPT: &str = "custom-downstream-early-response";
 const CUSTOM_WAIT_FOR_H1_CLOSE_SCRIPT: &str = "wait-for-h1-close";
@@ -227,6 +231,8 @@ async fn serve_origin_connection(mut stream: TcpStream) {
             serve_cl_framed_delayed(&mut stream).await
         } else if has_header(MANY_CHUNK_HEADER) {
             serve_many_chunks(&mut stream).await
+        } else if has_header(TRAILERED_ORIGIN_HEADER) {
+            serve_trailered_body(&mut stream).await
         } else {
             serve_fixed_body(&mut stream).await
         };
@@ -261,6 +267,15 @@ async fn serve_fixed_body(stream: &mut TcpStream) -> std::io::Result<()> {
     );
     stream.write_all(response.as_bytes()).await?;
     stream.write_all(ORIGIN_BODY).await
+}
+
+async fn serve_trailered_body(stream: &mut TcpStream) -> std::io::Result<()> {
+    stream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n\
+              B\r\nhello world\r\n0\r\ngrpc-status: 0\r\n\r\n",
+        )
+        .await
 }
 
 async fn serve_many_chunks(stream: &mut TcpStream) -> std::io::Result<()> {
@@ -429,6 +444,9 @@ struct CustomRequestBodyRecord {
     events: Vec<RequestBodyEvent>,
     logging_calls: usize,
     had_error: bool,
+    error_type: Option<pingora_error::ErrorType>,
+    error_source: Option<pingora_error::ErrorSource>,
+    error_text: Option<String>,
 }
 
 static CUSTOM_REQUEST_BODY_RECORDS: Lazy<
@@ -445,6 +463,42 @@ static CUSTOM_DOWNSTREAM_RESPONSE_CHANGED: Lazy<tokio::sync::Notify> =
 static CUSTOM_DOWNSTREAM_WRITER_FINISHES: AtomicUsize = AtomicUsize::new(0);
 static CUSTOM_DOWNSTREAM_WRITER_CLEANUPS: AtomicUsize = AtomicUsize::new(0);
 static CUSTOM_COMPRESSED_TRAILERED_EOS_CALLS: AtomicUsize = AtomicUsize::new(0);
+static CUSTOM_WRITER_RACE_HOOK_PENDING: AtomicBool = AtomicBool::new(false);
+static CUSTOM_WRITER_RACE_HOOK_ENTERED: Lazy<tokio::sync::Notify> =
+    Lazy::new(tokio::sync::Notify::new);
+static CUSTOM_WRITER_RACE_SECONDARY_ERROR_EMITTED: AtomicBool = AtomicBool::new(false);
+static DOWNSTREAM_TRAILER_FILTER_CALLS: Lazy<Mutex<std::collections::HashMap<String, usize>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+static DOWNSTREAM_TRAILER_LOG_ERRORS: Lazy<Mutex<std::collections::HashMap<String, String>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+static EMIT_CHUNK_LIMIT_LOG_ERRORS: Lazy<Mutex<std::collections::HashMap<String, String>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn take_downstream_trailer_filter_calls(probe: &str) -> usize {
+    DOWNSTREAM_TRAILER_FILTER_CALLS
+        .lock()
+        .unwrap()
+        .remove(probe)
+        .unwrap_or(0)
+}
+
+fn take_downstream_trailer_log_error(probe: &str) -> Option<String> {
+    DOWNSTREAM_TRAILER_LOG_ERRORS.lock().unwrap().remove(probe)
+}
+
+async fn wait_for_emit_chunk_limit_error(probe: &str) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        if let Some(error) = EMIT_CHUNK_LIMIT_LOG_ERRORS.lock().unwrap().remove(probe) {
+            return error;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "chunk-limit request {probe} did not reach logging with an error"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
 
 fn assert_no_terminal_upgrade_read_after_eos() {
     assert!(
@@ -638,6 +692,11 @@ impl BodyWrite for NoopBodyWriter {
             (self.script.as_deref(), attempt),
             (Some(CUSTOM_REJECT_FIRST_WRITE_SCRIPT), 1)
                 | (Some(CUSTOM_REJECT_LATER_WRITE_SCRIPT), 2)
+                | (Some(CUSTOM_REJECT_WRITE_AND_ABANDON_FILTER_SCRIPT), 1)
+                | (
+                    Some(CUSTOM_REJECT_WRITE_WITH_COMPETING_RESPONSE_ERROR_SCRIPT),
+                    1,
+                )
         );
         if reject {
             CUSTOM_REJECTED_WRITER_ATTEMPTS
@@ -699,7 +758,12 @@ impl HeaderOnlyCustomSession {
 
     async fn wait_for_scripted_request_body_state(&self) {
         let ready = || match self.request_body_script.as_deref() {
-            Some(CUSTOM_EARLY_RESPONSE_SCRIPT | CUSTOM_REJECT_FIRST_WRITE_SCRIPT) => {
+            Some(
+                CUSTOM_EARLY_RESPONSE_SCRIPT
+                | CUSTOM_REJECT_FIRST_WRITE_SCRIPT
+                | CUSTOM_REJECT_WRITE_AND_ABANDON_FILTER_SCRIPT
+                | CUSTOM_REJECT_WRITE_WITH_COMPETING_RESPONSE_ERROR_SCRIPT,
+            ) => {
                 self.request_body_progress
                     .write_attempts
                     .load(Ordering::SeqCst)
@@ -824,6 +888,18 @@ impl CustomSession for HeaderOnlyCustomSession {
 
     async fn read_response_header(&mut self) -> Result<()> {
         self.wait_for_scripted_request_body_state().await;
+        if self.request_body_script.as_deref()
+            == Some(CUSTOM_REJECT_WRITE_WITH_COMPETING_RESPONSE_ERROR_SCRIPT)
+        {
+            while !CUSTOM_WRITER_RACE_HOOK_PENDING.load(Ordering::SeqCst) {
+                CUSTOM_WRITER_RACE_HOOK_ENTERED.notified().await;
+            }
+            CUSTOM_WRITER_RACE_SECONDARY_ERROR_EMITTED.store(true, Ordering::SeqCst);
+            return pingora_error::Error::e_explain(
+                pingora_error::ErrorType::ReadError,
+                "scripted competing custom response error",
+            );
+        }
         if matches!(
             self.request_body_script.as_deref(),
             Some(CUSTOM_WAIT_FOR_H1_CLOSE_SCRIPT | CUSTOM_WAIT_FOR_H2_CLOSE_SCRIPT)
@@ -948,12 +1024,29 @@ impl ProxyHttp for EmitProxy {
 
     async fn request_body_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         _body: &mut Option<Bytes>,
         event: RequestBodyEvent,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         ctx.request_body_events.push(event);
+        if event == RequestBodyEvent::Abandoned
+            && session.get_header_bytes(CUSTOM_REQUEST_BODY_SCRIPT_HEADER)
+                == CUSTOM_REJECT_WRITE_AND_ABANDON_FILTER_SCRIPT.as_bytes()
+        {
+            return pingora_error::Error::e_explain(
+                pingora_error::ErrorType::InternalError,
+                "scripted abandonment filter teardown rejection",
+            );
+        }
+        if event == RequestBodyEvent::Abandoned
+            && session.get_header_bytes(CUSTOM_REQUEST_BODY_SCRIPT_HEADER)
+                == CUSTOM_REJECT_WRITE_WITH_COMPETING_RESPONSE_ERROR_SCRIPT.as_bytes()
+        {
+            CUSTOM_WRITER_RACE_HOOK_PENDING.store(true, Ordering::SeqCst);
+            CUSTOM_WRITER_RACE_HOOK_ENTERED.notify_waiters();
+            return std::future::pending().await;
+        }
         Ok(())
     }
 
@@ -963,6 +1056,7 @@ impl ProxyHttp for EmitProxy {
             let storage: &'static (dyn Storage + Sync) = if path
                 .starts_with("/cache/suppressed_sink_extras/")
                 || path.starts_with("/cache/non_streaming_range/")
+                || path.starts_with("/cache/non_streaming_trailer_error/")
             {
                 &*NON_STREAMING_CACHE_BACKEND
             } else {
@@ -1389,6 +1483,29 @@ impl ProxyHttp for EmitProxy {
         Ok(())
     }
 
+    async fn response_trailer_filter(
+        &self,
+        session: &mut Session,
+        _trailers: &mut HeaderMap,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<Bytes>> {
+        if session.get_header_bytes("x-downstream-trailer-error") == b"true" {
+            let probe =
+                String::from_utf8_lossy(session.get_header_bytes("x-downstream-trailer-probe"))
+                    .into_owned();
+            *DOWNSTREAM_TRAILER_FILTER_CALLS
+                .lock()
+                .unwrap()
+                .entry(probe)
+                .or_insert(0) += 1;
+            return pingora_error::Error::e_explain(
+                pingora_error::ErrorType::InternalError,
+                "scripted custom downstream trailer rejection",
+            );
+        }
+        Ok(None)
+    }
+
     fn response_body_filter(
         &self,
         session: &mut Session,
@@ -1461,6 +1578,26 @@ impl ProxyHttp for EmitProxy {
         error: Option<&pingora_error::Error>,
         ctx: &mut Self::CTX,
     ) {
+        if session.get_header_bytes("x-downstream-trailer-error") == b"true" {
+            if let Some(error) = error {
+                let probe =
+                    String::from_utf8_lossy(session.get_header_bytes("x-downstream-trailer-probe"))
+                        .into_owned();
+                DOWNSTREAM_TRAILER_LOG_ERRORS.lock().unwrap().insert(
+                    probe,
+                    format!("{:?}|{:?}|{error}", error.etype(), error.esource()),
+                );
+            }
+        }
+        let emit_probe = session.get_header_bytes("x-emit-chunk-limit-probe");
+        if !emit_probe.is_empty() {
+            if let Some(error) = error {
+                EMIT_CHUNK_LIMIT_LOG_ERRORS.lock().unwrap().insert(
+                    String::from_utf8_lossy(emit_probe).into_owned(),
+                    format!("{:?}|{:?}|{error}", error.etype(), error.esource()),
+                );
+            }
+        }
         if session
             .req_header()
             .headers
@@ -1475,6 +1612,11 @@ impl ProxyHttp for EmitProxy {
         record.events = ctx.request_body_events.clone();
         record.logging_calls += 1;
         record.had_error = error.is_some();
+        if let Some(error) = error {
+            record.error_type = Some(error.etype().clone());
+            record.error_source = Some(error.esource().clone());
+            record.error_text = Some(error.to_string());
+        }
     }
 }
 
@@ -1887,8 +2029,14 @@ async fn completed_200_body(url: &str) -> Option<String> {
 async fn completed_body_with_status(
     url: &str,
     expected_status: reqwest::StatusCode,
+    emit_chunk_limit_probe: &str,
 ) -> Option<Bytes> {
-    let response = reqwest::get(url).await.ok()?;
+    let response = reqwest::Client::new()
+        .get(url)
+        .header("x-emit-chunk-limit-probe", emit_chunk_limit_probe)
+        .send()
+        .await
+        .ok()?;
     if response.status() != expected_status {
         return None;
     }
@@ -1952,15 +2100,30 @@ async fn exceeding_the_emit_chunk_limit_fails_h1_and_custom_responses() {
             reqwest::StatusCode::SERVICE_UNAVAILABLE,
         ),
     ] {
+        let probe = format!(
+            "emit-chunk-overflow-{}-{}",
+            normal_status.as_u16(),
+            std::process::id()
+        );
         let observed = completed_body_with_status(
             &format!("{base_url}/emit_chunk_limit_overflow"),
             normal_status,
+            &probe,
         )
         .await;
         assert!(
             observed.is_none(),
             "a response that exceeds the emitted-chunk limit must fail closed, got {} complete bytes",
             observed.as_ref().map_or(0, Bytes::len)
+        );
+        let error = wait_for_emit_chunk_limit_error(&probe).await;
+        let expected = format!(
+            "response body emit chunk budget exhausted: maximum {} nonempty chunks per batch",
+            RESPONSE_BODY_EMIT_CHUNK_BUDGET
+        );
+        assert!(
+            error.starts_with("InternalError|") && error.contains(&expected),
+            "{base_url} overflow failed for the wrong reason: {error}"
         );
     }
 }
@@ -3064,6 +3227,12 @@ async fn custom_writer_rejection_dispatches_abandoned_exactly_once() {
             &[[b'a'; 4], [b'b'; 4]][..],
             2,
         ),
+        (
+            "/custom_reject_write_and_abandon_filter",
+            CUSTOM_REJECT_WRITE_AND_ABANDON_FILTER_SCRIPT,
+            &[[b'a'; 4]][..],
+            1,
+        ),
     ] {
         CUSTOM_REJECTED_WRITER_ATTEMPTS
             .lock()
@@ -3074,7 +3243,7 @@ async fn custom_writer_rejection_dispatches_abandoned_exactly_once() {
         assert_request_body_terminal_events(
             &record.events,
             RequestBodyEvent::Abandoned,
-            DataEventCount::AtLeastOne,
+            DataEventCount::Any,
             script,
         );
         assert_eq!(
@@ -3091,7 +3260,100 @@ async fn custom_writer_rejection_dispatches_abandoned_exactly_once() {
             record.had_error,
             "writer rejection must remain an upstream error"
         );
+        assert_eq!(
+            record.error_type.as_ref(),
+            Some(&pingora_error::ErrorType::WriteError),
+            "{script} lost the writer error type: {record:?}"
+        );
+        assert_eq!(
+            record.error_source.as_ref(),
+            Some(&pingora_error::ErrorSource::Upstream),
+            "{script} lost the upstream source: {record:?}"
+        );
+        let error_text = record.error_text.as_deref().unwrap();
+        assert!(
+            error_text.contains("scripted custom request-body writer rejection"),
+            "{script} lost the writer context: {error_text}"
+        );
+        assert!(
+            !error_text.contains("scripted abandonment filter teardown rejection"),
+            "{script} let a teardown failure replace the writer root cause: {error_text}"
+        );
     }
+}
+
+#[tokio::test]
+async fn custom_writer_error_survives_cancellation_while_abandoned_hook_is_pending() {
+    let path = "/custom_reject_write_with_competing_response_error";
+    let script = CUSTOM_REJECT_WRITE_WITH_COMPETING_RESPONSE_ERROR_SCRIPT;
+    CUSTOM_REQUEST_BODY_RECORDS.lock().unwrap().remove(path);
+    CUSTOM_REJECTED_WRITER_ATTEMPTS
+        .lock()
+        .unwrap()
+        .remove(script);
+    CUSTOM_WRITER_RACE_HOOK_PENDING.store(false, Ordering::SeqCst);
+    CUSTOM_WRITER_RACE_SECONDARY_ERROR_EMITTED.store(false, Ordering::SeqCst);
+
+    let harness = init();
+    let mut io = TcpStream::connect(("127.0.0.1", harness.custom_proxy_port))
+        .await
+        .unwrap();
+    io.write_all(
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\
+             Connection: keep-alive\r\n{CUSTOM_REQUEST_BODY_SCRIPT_HEADER}: {script}\r\n\r\n\
+             4\r\ndata\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    io.flush().await.unwrap();
+
+    let record = wait_for_custom_request_body_record(path).await;
+    assert!(
+        CUSTOM_WRITER_RACE_HOOK_PENDING.load(Ordering::SeqCst),
+        "the abandonment hook never entered its deterministic pending state"
+    );
+    assert!(
+        CUSTOM_WRITER_RACE_SECONDARY_ERROR_EMITTED.load(Ordering::SeqCst),
+        "the competing response error was not emitted"
+    );
+    assert_request_body_terminal_events(
+        &record.events,
+        RequestBodyEvent::Abandoned,
+        DataEventCount::Any,
+        script,
+    );
+    assert_eq!(
+        CUSTOM_REJECTED_WRITER_ATTEMPTS
+            .lock()
+            .unwrap()
+            .get(script)
+            .copied(),
+        Some(1),
+        "the fixture did not reject the first real writer attempt"
+    );
+    assert_eq!(record.logging_calls, 1);
+    assert_eq!(
+        record.error_type.as_ref(),
+        Some(&pingora_error::ErrorType::WriteError),
+        "the competing response error replaced the writer type: {record:?}"
+    );
+    assert_eq!(
+        record.error_source.as_ref(),
+        Some(&pingora_error::ErrorSource::Upstream),
+        "the competing response error replaced the writer source: {record:?}"
+    );
+    let error_text = record.error_text.as_deref().unwrap();
+    assert!(
+        error_text.contains("scripted custom request-body writer rejection"),
+        "the competing response error replaced the writer context: {error_text}"
+    );
+    assert!(
+        !error_text.contains("scripted competing custom response error"),
+        "the secondary response error escaped as the root cause: {error_text}"
+    );
 }
 
 #[tokio::test]
@@ -3302,6 +3564,110 @@ async fn custom_trailer_hook_mutates_after_terminal_and_before_h1_write() {
         released < trailer,
         "custom terminal output followed trailers: {wire:?}"
     );
+}
+
+#[tokio::test]
+async fn custom_downstream_trailer_filter_error_aborts_before_trailer_write() {
+    let harness = init();
+    let probe = format!("custom-downstream-trailer-error-{}", std::process::id());
+    let mut io = TcpStream::connect(("127.0.0.1", harness.custom_proxy_port))
+        .await
+        .unwrap();
+    let request = format!(
+        "GET {CUSTOM_TRAILERED_PATH} HTTP/1.1\r\nHost: localhost\r\n{}: {}\r\n\
+         x-downstream-trailer-error: true\r\nx-downstream-trailer-probe: {probe}\r\n\r\n",
+        CUSTOM_TRAILERED_HEADER.0, CUSTOM_TRAILERED_HEADER.1,
+    );
+    io.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), io.read_to_end(&mut response))
+        .await
+        .expect("custom trailer-filter failure left the downstream connection open")
+        .unwrap();
+    if io
+        .write_all(b"GET /must-not-run HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .is_ok()
+    {
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_millis(200), io.read(&mut byte)).await;
+        assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))));
+    }
+    let wire = String::from_utf8(response).unwrap();
+
+    assert!(wire.starts_with("HTTP/1.1 200"), "wire was {wire:?}");
+    assert_eq!(
+        take_downstream_trailer_filter_calls(&probe),
+        1,
+        "custom downstream trailer hook did not run exactly once"
+    );
+    assert!(!wire.contains("grpc-status"), "wire was {wire:?}");
+    assert!(
+        !wire.contains("|eos"),
+        "custom terminal sink output leaked after trailer rejection: {wire:?}"
+    );
+    assert!(
+        !wire.ends_with("0\r\n\r\n"),
+        "custom response completed cleanly after trailer rejection: {wire:?}"
+    );
+    assert!(
+        take_downstream_trailer_log_error(&probe).is_some_and(|error| {
+            error.starts_with("InternalError|Unset|")
+                && error.contains("scripted custom downstream trailer rejection")
+        }),
+        "custom logging lost the trailer error classification/context"
+    );
+}
+
+#[tokio::test]
+async fn non_streaming_cache_does_not_admit_trailered_responses_with_or_without_hook_error() {
+    let harness = init();
+    let probe = format!("non-streaming-cache-trailer-error-{}", std::process::id());
+    let path = format!("/cache/non_streaming_trailer_error/{probe}");
+    let url = format!("{}{path}", harness.cache_base_url());
+    let client = reqwest::Client::new();
+
+    let first = client
+        .get(&url)
+        .header(TRAILERED_ORIGIN_HEADER.0, TRAILERED_ORIGIN_HEADER.1)
+        .header("x-downstream-trailer-error", "true")
+        .header("x-downstream-trailer-probe", &probe)
+        .send()
+        .await;
+    if let Ok(response) = first {
+        let _ = response.bytes().await;
+    }
+    assert_eq!(take_downstream_trailer_filter_calls(&probe), 1);
+    assert!(take_downstream_trailer_log_error(&probe).is_some());
+
+    let second = client
+        .get(&url)
+        .header(TRAILERED_ORIGIN_HEADER.0, TRAILERED_ORIGIN_HEADER.1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.headers()["x-cache-status"], "miss");
+    assert_eq!(second.text().await.unwrap(), "hello world");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let trace = Span::inactive().handle();
+    let key = CacheKey::new(path.clone(), String::new());
+    assert!(
+        NON_STREAMING_CACHE_BACKEND
+            .lookup(&key, &trace)
+            .await
+            .unwrap()
+            .is_none(),
+        "the baseline non-streaming path unexpectedly admitted a trailered response"
+    );
+
+    let third = client
+        .get(&url)
+        .header(TRAILERED_ORIGIN_HEADER.0, TRAILERED_ORIGIN_HEADER.1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(third.headers()["x-cache-status"], "miss");
+    assert_eq!(third.text().await.unwrap(), "hello world");
 }
 
 /// A cleanly closed upgrade may yield no `UpgradedBody` task at all. Bytes

@@ -116,13 +116,19 @@ eligible for reuse after the failed stream releases its capacity.
 
 ## Version-tolerant tests
 
-Current `h2` releases may preserve END_STREAM after a later reset, while older
-ones exposed the overwritten state that motivated the watch. Behavioral tests
-therefore assert clean EOF or truncation, not a particular private receive
-state. The frame-scanner unit tests independently prove record/reset ordering.
-The workspace currently requires `h2 >= 0.4.16`; dependency upgrades must run
-these contract tests because the implementation observes wire frames around a
-library whose private reset behavior may change.
+Supported h2 0.4.19 preserves END_STREAM after a later reset, while releases
+before h2 0.4.16 exposed the overwritten state that originally motivated the watch.
+Behavioral tests therefore assert clean EOF or truncation, not a particular
+private receive state. The frame-scanner unit tests independently prove
+record/reset ordering.
+
+The workspace requires `h2 >= 0.4.19`. A 2026-08-29 minimum audit found that
+0.4.16, 0.4.17, and 0.4.18 reproducibly close the fork's large-window
+continuing-upload case with `too_many_data_frames`; 0.4.19 scales its automatic
+small-DATA-frame budget with the configured connection window and passes. The
+upper bound remains open, so dependency upgrades must run the minimum/current
+contracts and re-audit the private receive-queue, GOAWAY, buffer-lifetime, and
+frame-order handoff recorded beside the watcher.
 
 ## Implementation concentration
 

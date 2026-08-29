@@ -33,21 +33,26 @@ contradictory framing/termination shapes were treated as defensive test input.
   is bounded by the H2 writer's protocol-local progress floor when no explicit
   write timeout exists. Expiry without qualified response END_STREAM fails the
   exchange and releases stream capacity.
+- [ResponseBodySink chunk-count amplification](findings/003-medium-response-body-sink-does-not-bound-chunk-count.md)
+  is resolved by independent 1 MiB and 2048-nonempty-chunk per-batch budgets.
+  Exact-limit and precisely observed overflow tests cover H1, H2, custom, and
+  cache paths.
+- [Async response filter fast path](findings/007-low-async-response-filter-adds-per-chunk-boxing.md)
+  is resolved by an allocation-free zero-sized default future and direct typed
+  delegation. Object compatibility and existing async overrides are retained.
+- [Watcher dependency evidence](findings/004-medium-end-stream-watch-is-not-pinned-to-an-audited-h2.md)
+  is resolved by an audited h2 0.4.19 handoff checklist and a raised minimum;
+  0.4.16-0.4.18 reproducibly failed the large-window continuing-upload case.
+- [TLS bind-test error classification](findings/008-low-tls-feature-bind-test-rejects-observed-bind-error.md)
+  is resolved without changing production semantics. Local bind failure remains
+  `InternalError -> BindError`; localhost-only fixtures remove this finding's
+  routing-dependent failures on macOS and Linux.
 
 ## Confirmed existing open findings
 
-- [ResponseBodySink chunk-count amplification](findings/003-medium-response-body-sink-does-not-bound-chunk-count.md)
-  remains open. The byte budget does not bound the number of nonempty emitted
-  chunks, so a filter can amplify one batch into roughly one million cache and
-  downstream operations.
 - [H2 trailer validation](../pending-issues/h2-trailer-validation.md) and
   [terminal HEADERS completion](../pending-issues/h2-terminal-headers-completion.md)
   remain blocked/deferred at the accepted upstream `h2` decoder boundary.
-- [Watcher dependency evidence](findings/004-medium-end-stream-watch-is-not-pinned-to-an-audited-h2.md)
-  still needs its stale `h2 0.4.15` audit claims aligned with the supported
-  version range. Its old exact-pin recommendation is superseded.
-- [Async response filter fast path](../pending-issues/async-response-body-filter-fast-path.md)
-  remains a measured performance investigation, not a correctness finding.
 - `../Edgion/tasks/todo/issue-compression-trailer-double-eos.md` remains the
   canonical record for the fork-owned compression + Trailer/Done double-EOS
   defect. Edgion currently does not enable upstream compression.

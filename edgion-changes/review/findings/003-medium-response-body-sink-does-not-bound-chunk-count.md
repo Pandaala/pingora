@@ -1,6 +1,6 @@
 # ResponseBodySink bounds payload bytes but not emitted chunk count
 
-Status: open
+Status: resolved
 
 Severity: medium
 
@@ -74,3 +74,52 @@ future optimization and is not relied on for safety.
 
 Final command results and closure status are recorded only after the project
 verification gate completes.
+
+## Closure evidence
+
+At `bd89d47` plus the working tree tests on 2026-08-29:
+
+- sink units cover atomic byte/item rejection, free empty chunks,
+  unbudgeted current-chunk materialization, batch reset, and sticky terminate;
+- the shared drain regression proves that a full 1 MiB fragmented budget
+  creates exactly 2048 downstream tasks and migrates EOS only to the last;
+- H1, H2, custom, cache miss, and cache hit accept the exact 2048 boundary;
+- H1, H2, and custom reject item 2049; request-scoped probes at `logging()`
+  require `InternalError` and the complete chunk-budget marker, so unrelated
+  connection/origin failures cannot make the negative tests pass; and
+- both H1/H2/custom downstream drains and cache admission reuse the bounded
+  sink and reset both budgets once per bounded input batch.
+
+Independent review first rejected the overflow tests because they accepted any
+failure. After the out-of-band error probes were added, the same reviewer
+checked probe isolation, asynchronous logging, error discrimination, all pump
+reset points, cache fan-out, and the Edgion consumer, then returned LGTM.
+
+The Edgion checkout `83408c11` has no production loop that emits multiple sink
+chunks per callback. Its AI and guardrail paths push at most one bounded
+terminal event and handle rejection; its processor and quota documentation now
+states both independent budgets. The lockfile still selects fork `57f6183`, so
+this source review is not deployment-version evidence.
+
+The complete repository matrix passed:
+
+- `cargo fmt --all -- --check`, `git diff --check`, and both required
+  `cargo check` configurations;
+- `pingora-core --lib`: 737 passed, 17 ignored;
+- `pingora-core --lib --features connection_filter`: 742 passed, 17 ignored;
+- the boringssl PROXY-before-TLS tests: 2 passed;
+- `pingora-proxy --lib`: 119 passed;
+- `test_request_body_seam`: 54 passed;
+- `test_upstream_response_body_sink`: 57 passed;
+- `test_terminal_body_dispatch`: 26 passed;
+- `test_h2_upstream_no_error_reset`: 8 passed;
+- `test_h2_upstream_stalled_after_response`: 4 passed; and
+- `test_h2_upstream_cache_and_reuse`: 8 passed.
+
+## Revisit triggers
+
+- The pump batch topology gains another independently scheduled producer or
+  sender, or stops sharing one sink across every task drained in a batch.
+- A new path materializes `sink` output without using the bounded `push()` API.
+- Edgion adds a processor that intentionally emits many additional chunks per
+  callback or ignores `push()` failure.

@@ -23,6 +23,14 @@ plus the bounded channel's already queued tasks. `reset_batch` restores both
 budgets but intentionally leaves termination sticky until the terminal
 boundary consumes it.
 
+The default legacy hook returns the same object-safe boxed-future type emitted
+by `async_trait`, but its concrete ready future is zero-sized and therefore
+`Box::pin` does not request allocator storage. The typed default returns that
+legacy future directly instead of wrapping it in another async block. Existing
+`#[async_trait] async fn` overrides remain source-compatible, boxed, and
+awaited; the proxy never skips an override through an inferred capability
+flag.
+
 ## Ordering and terminal dispatch
 
 - Mutated current bytes precede chunks pushed by the filter.
@@ -66,6 +74,8 @@ length.
 - `pingora-proxy/src/proxy_common.rs`: terminal latch and shared outcomes.
 - `pingora-proxy/src/proxy_cache.rs`: EOS migration and synthetic cache marker.
 - `proxy_h1.rs`, `proxy_h2.rs`, `proxy_custom.rs`: protocol pumps.
+- `proxy_trait.rs`: allocation-free object-safe defaults and compatible async
+  override surface.
 
 ## Tests
 

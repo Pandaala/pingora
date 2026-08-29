@@ -1,7 +1,7 @@
 ---
 name: h2-dependency-baseline-tests-version-robust
 description: Use when reviewing the unwatched h2 "laundering baseline" tests in the Pingora fork, or any test that asserts a specific upstream h2 behavior; covers why a dependency characterization must accept both sides of an upstream fix and report the change instead of failing.
-status: implemented-pending-project-checks
+status: implemented
 finding_id: H2-011
 closed: 2026-08-28
 ---
@@ -25,7 +25,7 @@ accepted**.
 
 **1. An open dependency bound means the vulnerable behavior is not a contract**
 
-The workspace declares `h2 = ">=0.4.16"` with no upper bound. Any
+The workspace declares `h2 = ">=0.4.19"` with no upper bound. Any
 `cargo update` may resolve an `h2` that rejects trailer pseudo-headers at the
 decoder (the fix H2-001 and H2-004 are waiting on). Two tests used to require
 the vulnerable behavior:
@@ -113,6 +113,12 @@ Re-open this decision only if:
   two-sided characterization unnecessary for the pinned leg.
 
 ## Reference cases
+
+- The 2026-08-29 minimum/current audit raised the minimum from 0.4.16 to
+  0.4.19 after 0.4.16-0.4.18 failed the fork's large-window continuing-upload
+  contract. This does not change the two-sided trailer characterization: h2
+  0.4.19 still exposes the known decoder limitation, while a future normal
+  upstream release may fix it.
 
 - H2-011, whole-change H2 audit 2026-08-26; fixed in the Pingora fork branch
   `edgion_v3` on 2026-08-28.

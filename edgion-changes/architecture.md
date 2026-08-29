@@ -35,13 +35,24 @@ layer.
   upstream acquisition, pooling, sessions, and response decoding.
 - `pingora-core/src/upstreams/peer.rs`: peer and transport options.
 
+Large protocol regression suites that need private implementation access live
+in behavior-grouped sibling files such as `v1/server_test_*.rs`,
+`v2/*_tests*.rs`, and `pingora-proxy/src/*_tests.rs`. Their parent production
+module includes them with `#[cfg(test)]` plus `#[path]`, so tests retain parent
+privacy access without widening production APIs or creating extra Cargo test
+targets. Small tests that directly exercise one private detail remain inline.
+
 ## Proxy implementation map
 
 - `pingora-proxy/src/proxy_trait.rs`: public `ProxyHttp` lifecycle contract.
 - `pingora-proxy/src/lib.rs`: `HttpProxy`, `Session`, cache short-circuit,
   upstream selection/retry, errors, and pump dispatch.
 - `proxy_h1.rs`, `proxy_h2.rs`, `proxy_custom.rs`: protocol-specific duplex
-  request/response pumps.
+  request/response pumps, transport cancellation, framing, and reuse outcomes.
+- `response_pipeline.rs`: shared response-task semantic stages: upstream and
+  terminal hooks, cache admission, downstream transforms, sink drain, and
+  prepared task batches. `ResponseProtocol` keeps the H1/H2/custom wire and
+  upgrade differences explicit without dynamic dispatch.
 - `proxy_common.rs`: shared event, completion, retry, and reuse decisions.
 - `proxy_cache.rs`: cache lookup/fill/hit interleaved with body processing.
 - `response_body_sink.rs`: fork response-body emission/termination surface.
@@ -105,8 +116,8 @@ consumer tree.
   proxy retry and pumps.
 - H2 evidence: `protocols/http/v2/end_stream_watch.rs` -> H2 client -> connector
   -> proxy H2 and cache completion.
-- Streaming: `proxy_trait.rs` and `response_body_sink.rs` -> `proxy_common.rs` ->
-  all pumps -> `proxy_cache.rs`.
+- Streaming: `proxy_trait.rs` and `response_body_sink.rs` ->
+  `response_pipeline.rs` / `proxy_common.rs` -> all pumps -> `proxy_cache.rs`.
 
 ## Progressive review order
 

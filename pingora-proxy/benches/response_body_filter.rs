@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Microbenchmark for the per-chunk `ProxyHttp::upstream_response_body_filter` cost.
+//! Microbenchmark for the per-chunk response-body event dispatch cost.
 //!
 //! Run with:
 //! `cargo bench -p pingora-proxy --bench response_body_filter`
@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::Result;
-use pingora_proxy::{ProxyHttp, ResponseBodySink, Session};
+use pingora_proxy::{ProxyHttp, ResponseBodySink, Session, UpstreamResponseBodyEvent};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -196,7 +196,7 @@ fn measure_sync(iterations: usize, chunk_size: usize) -> Measurement {
     }
 }
 
-async fn measure_default_async(iterations: usize, chunk_size: usize) -> Measurement {
+async fn measure_default_event(iterations: usize, chunk_size: usize) -> Measurement {
     let filter = DefaultsOnly;
     let mut session = mock_session();
     let mut body = Some(Bytes::from(vec![0; chunk_size]));
@@ -206,7 +206,15 @@ async fn measure_default_async(iterations: usize, chunk_size: usize) -> Measurem
     for _ in 0..1_024 {
         black_box(
             filter
-                .upstream_response_body_filter(&mut session, &mut body, false, &mut sink, &mut ctx)
+                .upstream_response_body_filter_event(
+                    &mut session,
+                    &mut body,
+                    UpstreamResponseBodyEvent::Data {
+                        end_of_stream: false,
+                    },
+                    &mut sink,
+                    &mut ctx,
+                )
                 .await
                 .unwrap(),
         );
@@ -216,7 +224,15 @@ async fn measure_default_async(iterations: usize, chunk_size: usize) -> Measurem
     for _ in 0..iterations {
         black_box(
             filter
-                .upstream_response_body_filter(&mut session, &mut body, false, &mut sink, &mut ctx)
+                .upstream_response_body_filter_event(
+                    &mut session,
+                    &mut body,
+                    UpstreamResponseBodyEvent::Data {
+                        end_of_stream: false,
+                    },
+                    &mut sink,
+                    &mut ctx,
+                )
                 .await
                 .unwrap(),
         );
@@ -228,7 +244,15 @@ async fn measure_default_async(iterations: usize, chunk_size: usize) -> Measurem
     for _ in 0..iterations {
         black_box(
             filter
-                .upstream_response_body_filter(&mut session, &mut body, false, &mut sink, &mut ctx)
+                .upstream_response_body_filter_event(
+                    &mut session,
+                    &mut body,
+                    UpstreamResponseBodyEvent::Data {
+                        end_of_stream: false,
+                    },
+                    &mut sink,
+                    &mut ctx,
+                )
                 .await
                 .unwrap(),
         );
@@ -252,7 +276,15 @@ async fn measure_yielding(iterations: usize, chunk_size: usize) -> Measurement {
     for _ in 0..128 {
         black_box(
             filter
-                .upstream_response_body_filter(&mut session, &mut body, false, &mut sink, &mut ctx)
+                .upstream_response_body_filter_event(
+                    &mut session,
+                    &mut body,
+                    UpstreamResponseBodyEvent::Data {
+                        end_of_stream: false,
+                    },
+                    &mut sink,
+                    &mut ctx,
+                )
                 .await
                 .unwrap(),
         );
@@ -262,7 +294,15 @@ async fn measure_yielding(iterations: usize, chunk_size: usize) -> Measurement {
     for _ in 0..iterations {
         black_box(
             filter
-                .upstream_response_body_filter(&mut session, &mut body, false, &mut sink, &mut ctx)
+                .upstream_response_body_filter_event(
+                    &mut session,
+                    &mut body,
+                    UpstreamResponseBodyEvent::Data {
+                        end_of_stream: false,
+                    },
+                    &mut sink,
+                    &mut ctx,
+                )
                 .await
                 .unwrap(),
         );
@@ -274,7 +314,15 @@ async fn measure_yielding(iterations: usize, chunk_size: usize) -> Measurement {
     for _ in 0..iterations {
         black_box(
             filter
-                .upstream_response_body_filter(&mut session, &mut body, false, &mut sink, &mut ctx)
+                .upstream_response_body_filter_event(
+                    &mut session,
+                    &mut body,
+                    UpstreamResponseBodyEvent::Data {
+                        end_of_stream: false,
+                    },
+                    &mut sink,
+                    &mut ctx,
+                )
                 .await
                 .unwrap(),
         );
@@ -309,12 +357,23 @@ fn main() {
         "case", "chunk", "iterations", "ns/call", "allocs/call", "bytes/call", "frees/call"
     );
     for chunk_size in [1_024, 64 * 1_024] {
-        measure_sync(iterations, chunk_size).print("sync_noop", chunk_size);
-        runtime
-            .block_on(measure_default_async(iterations, chunk_size))
-            .print("async_default", chunk_size);
-        runtime
-            .block_on(measure_yielding(yield_iterations, chunk_size))
-            .print("async_yield", chunk_size);
+        let sync = measure_sync(iterations, chunk_size);
+        sync.print("sync_noop", chunk_size);
+        assert_eq!(sync.allocations.allocations, 0);
+
+        let default = runtime.block_on(measure_default_event(iterations, chunk_size));
+        default.print("default_event", chunk_size);
+        assert_eq!(
+            default.allocations.allocations, 0,
+            "the default typed response-body event must stay allocation-free"
+        );
+        assert_eq!(default.allocations.allocated_bytes, 0);
+
+        let yielding = runtime.block_on(measure_yielding(yield_iterations, chunk_size));
+        yielding.print("yielding_event", chunk_size);
+        assert_eq!(
+            yielding.allocations.allocations, yield_iterations as u64,
+            "the real async override must still construct one future per event"
+        );
     }
 }

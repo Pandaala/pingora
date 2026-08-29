@@ -8,17 +8,10 @@ next action, and closure evidence.
 
 | Issue | Status | Ownership | Related review |
 | --- | --- | --- | --- |
-| [Async response filter fast path](async-response-body-filter-fast-path.md) | Open performance investigation | Fork | [Finding 007](../review/findings/007-low-async-response-filter-adds-per-chunk-boxing.md) |
-| [Custom writer error context](custom-writer-error-context.md) | Open low-priority follow-up | Fork | [Review record](../review/custom/custom-upstream-early-response-abandonment.md) |
 | [Terminal HEADERS completion](h2-terminal-headers-completion.md) | Deferred/blocked | Upstream decoder, then fork integration | [Upstream limitation](../review/upstream-limitations.md) |
-| [H2 trailer validation](h2-trailer-validation.md) | Deferred upstream plus fork evidence maintenance | Split upstream/fork | [Upstream limitation](../review/upstream-limitations.md) |
-| [ResponseBodySink chunk count](../review/findings/003-medium-response-body-sink-does-not-bound-chunk-count.md) | Open review finding | Fork | No implementation task yet |
-| [Watcher dependency evidence](../review/findings/004-medium-end-stream-watch-is-not-pinned-to-an-audited-h2.md) | Open; exact-pin proposal superseded | Fork docs/tests; accepted upstream range | [H2-011](../review/h2-grpc/h2-dependency-baseline-tests-version-robust.md) |
-| [TLS bind-test classification](../review/findings/008-low-tls-feature-bind-test-rejects-observed-bind-error.md) | Open review finding | Fork | No implementation task yet |
-
-Finding 007 and the async fast-path issue describe the same work. The pending
-issue owns progress; the finding preserves discovery. Do not maintain two
-independent status narratives.
+| [H2 trailer validation](h2-trailer-validation.md) | Deferred upstream | Upstream decoder, then fork integration | [Upstream limitation](../review/upstream-limitations.md) |
+| [Non-streaming cache trailer completion](non-streaming-cache-trailer-completion.md) | Open | Fork | Discovered while closing [trailer filter parity](../review/response-trailer-filter-error-parity.md) |
+| [Custom conditional-filter gate](custom-conditional-filter-gate.md) | Open investigation | Fork custom response pump | Preserved explicitly by the shared response pipeline |
 
 ## Required issue fields
 

@@ -95,12 +95,13 @@ which predates the current ignore set on `edgion_v3`.
 
 The fork's `build.yml` runs a generic `cargo test --lib --bins --tests` on two
 of its three toolchain legs (the `1.85.0` MSRV leg is gated to fmt/check only),
-which does execute the enabled contracts but pins nothing about `h2`. Because
-`Cargo.toml` declares `h2 = ">=0.4.16"`, CI resolves exactly one version
-(0.4.19 as of this writing), so the declared minimum 0.4.16 has never been
-compiled or tested **in CI** — H2-001's evidence section shows 0.4.16 decoder
-behavior was examined by hand, which is precisely the manual step this gate was
-meant to replace. That gap is real and deliberately left open here.
+which does execute the enabled contracts but pins nothing about `h2`. The
+2026-08-29 manual dependency audit raised the declaration to
+`h2 = ">=0.4.19"`; the minimum and current resolution are both 0.4.19 at this
+snapshot. The CI job still resolves only one version, so this temporary
+coincidence is not a minimum/current matrix and will stop covering both ends as
+soon as the normal upstream resolution advances. That automation gap remains
+real and deliberately out of scope here.
 
 ## Fix Suggestions Not Accepted
 
@@ -130,7 +131,7 @@ Re-open this decision only if:
   starts being maintained through this workflow;
 - the rule this entry establishes — CI/CD changes are not handled through the
   review-issue workflow — is lifted or superseded by a rule recorded elsewhere;
-- `Cargo.toml` replaces the `h2 = ">=0.4.16"` range with an exact pin,
+- `Cargo.toml` replaces the `h2 = ">=0.4.19"` range with an exact pin,
   which changes what a dependency matrix would even mean.
 
 ## Reference Cases

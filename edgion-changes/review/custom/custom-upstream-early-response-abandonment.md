@@ -217,9 +217,9 @@ tree fix:
 - `test_h2_upstream_stalled_after_response`: 3 passed; and
 - `test_h2_upstream_cache_and_reuse`: 7 passed.
 
-The original writer error context is tracked separately by
-`pending-issues/custom-writer-error-context.md`; it was not changed as part of
-this terminal-latch correction.
+The separately owned writer error propagation issue is resolved in
+[`custom-writer-error-context.md`](custom-writer-error-context.md); it was not
+part of this terminal-latch correction.
 
 ## Superseded initial closure evidence
 

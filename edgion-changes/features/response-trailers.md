@@ -35,8 +35,9 @@ final response header
   -> Data events
   -> compression footer bytes, if trailers terminate an encoded response
   -> one typed terminal boundary
-  -> awaited application trailer filter for a real trailer map
-  -> cache and downstream trailer modules
+  -> awaited upstream_response_trailer_filter for a real trailer map
+  -> cache handling for the validated upstream representation
+  -> awaited downstream response_trailer_filter and trailer modules
   -> downstream filtering for bytes released at the boundary
   -> body bytes, then trailers on the wire
   -> Done without a second terminal event
@@ -46,8 +47,16 @@ Header EOS and a bare Done use `TerminalWithoutTrailers`. A terminal Body uses
 `Data { end_of_stream: true }`. A real trailer map uses
 `TerminalBeforeTrailers`; an absent or application-emptied map is normalized to
 trailer-free completion. `Failed` claims the latch without dispatching a clean
-terminal event. Hook errors stop the trailer before cache, downstream modules,
-or the wire.
+terminal event. An upstream trailer-hook error stops before cache handling; a
+downstream trailer-hook error stops downstream trailer processing and wire
+delivery on paths that deliver a real trailer task. A streaming-partial-write
+cache miss/readback serves the stored upstream body representation instead of
+passing that upstream `Trailer` through the downstream pump, so it does not
+invoke this downstream-only hook. Non-streaming storage follows the inline
+downstream pump, but currently cannot complete admission for a trailered H1
+response even when the hook succeeds; that separate limitation is tracked in
+`pending-issues/non-streaming-cache-trailer-completion.md` and must not be
+attributed to trailer-hook error propagation.
 
 Upstream compression finalizes at the first trailer boundary, not at the
 bookkeeping `Done` that follows it. Any encoder footer is exposed as a

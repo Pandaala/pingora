@@ -212,6 +212,7 @@ mod proxy_h2;
 mod proxy_purge;
 mod proxy_trait;
 mod response_body_sink;
+mod response_pipeline;
 pub mod subrequest;
 
 use subrequest::{BodyMode, Ctx as SubrequestCtx};

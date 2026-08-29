@@ -54,24 +54,43 @@ The `status` inside each record is authoritative.
 - [Custom early-response request abandonment](custom/custom-upstream-early-response-abandonment.md):
   abandonment stops body polling while natural completion retains downstream
   idle monitoring; the second correction is independently reviewed and fixed.
+- [Custom writer error context](custom/custom-writer-error-context.md): preserve
+  the first upstream writer root cause before asynchronous abandonment and
+  joined-future teardown can replace it.
 - [Negative-test observation](testing/negative-tests-need-out-of-band-observation.md):
   failure-path negative assertions need out-of-band evidence and a positive
   control.
+- [Response trailer filter error parity](response-trailer-filter-error-parity.md):
+  H1/H2/custom propagate downstream trailer hook failures consistently; cache
+  capability and protocol-specific reuse boundaries are recorded explicitly.
+- [ResponseBodySink chunk-count bound](findings/003-medium-response-body-sink-does-not-bound-chunk-count.md):
+  independent byte and nonempty-chunk budgets cap downstream and cache fan-out
+  per pump batch.
+- [Shared response-task pipeline](response-task-pipeline-consolidation.md): H1,
+  H2, and custom share hook/cache/terminal/sink semantics while retaining
+  explicit protocol framing and upgrade policy.
+- [Private protocol test extraction](test-module-extraction.md): twelve large
+  H1/H2/proxy suites moved to behavior-grouped sibling modules without changing
+  test identities, visibility, ignored coverage, or Cargo target topology.
+- [Allocation-free default response body hooks](findings/007-low-async-response-filter-adds-per-chunk-boxing.md):
+  a zero-sized boxed default plus direct typed delegation removes allocator
+  traffic while preserving object compatibility and real async overrides.
+- [H2 watcher dependency evidence](findings/004-medium-end-stream-watch-is-not-pinned-to-an-audited-h2.md):
+  stale h2 0.4.15 premises were replaced by an audited 0.4.19 handoff checklist;
+  the minimum was raised after 0.4.16-0.4.18 reproducibly failed the fork's
+  continuing-upload contract.
+- [TLS bind-test error classification](findings/008-low-tls-feature-bind-test-rejects-observed-bind-error.md):
+  retain the inherited `InternalError -> BindError -> AddrInUse` production
+  chain and use localhost-only deterministic bind/TLS failures in feature tests.
 
 ## Open review findings
 
 - [2026-08-28 fork feature and malformed-input audit](fork-feature-malformed-input-audit-2026-08-28.md),
   including the discovery provenance for the resolved custom-upstream
   abandonment and idle-watch corrections.
-- [003: ResponseBodySink chunk-count bound](findings/003-medium-response-body-sink-does-not-bound-chunk-count.md)
-- [004: watcher dependency evidence](findings/004-medium-end-stream-watch-is-not-pinned-to-an-audited-h2.md)
-- [007: async response filter boxing](findings/007-low-async-response-filter-adds-per-chunk-boxing.md),
-  tracked by [the pending task](../pending-issues/async-response-body-filter-fast-path.md)
-- [008: TLS bind-test error classification](findings/008-low-tls-feature-bind-test-rejects-observed-bind-error.md)
-
-Finding 004 predates the accepted normal `h2` version-range policy. Its stale
-evidence/docs concern remains fork-owned; its exact-pin recommendation is not
-accepted. Follow [upstream policy](upstream-limitations.md) and H2-011.
+- [Non-streaming cache trailer completion](../pending-issues/non-streaming-cache-trailer-completion.md):
+  a real H1 trailer does not currently finish admission for storage without
+  streaming partial-write support.
 
 ## Cross-repository rule
 

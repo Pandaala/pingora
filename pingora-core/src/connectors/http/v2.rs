@@ -663,9 +663,10 @@ pub async fn handshake(stream: Stream, settings: H2HandshakeSettings) -> Result<
         proxy_digest: stream.get_proxy_digest(),
         socket_digest: stream.get_socket_digest(),
     };
-    // Watch the peer's frame headers on their way into `h2` so that a stream
-    // the peer ended with END_STREAM stays provably ended even after the peer
-    // resets it, which `h2` cannot report on its own.
+    // Watch the peer's frame headers on their way into `h2`. Supported h2
+    // preserves received END_STREAM across reset, but its public state does not
+    // prove wire/delivered byte equality or express Pingora's terminal-HEADERS,
+    // local-reset, and GOAWAY evidence boundaries.
     let end_stream_watch = EndStreamWatch::new();
     let stream = EndStreamWatchStream::new(stream, end_stream_watch.clone());
     let stream_window = settings.stream_window_size.unwrap_or(H2_WINDOW_SIZE);

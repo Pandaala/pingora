@@ -33,11 +33,15 @@ mod utils;
 
 use bytes::Bytes;
 use http::{HeaderMap, Response, StatusCode};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::{io::AsyncReadExt, io::AsyncWriteExt, net::TcpListener, net::TcpStream};
-use utils::server_utils::{init_without_mock_origin, take_eos_dispatches};
+use utils::server_utils::{
+    init_without_mock_origin, take_downstream_trailer_filter_calls,
+    take_downstream_trailer_logging_error, take_emit_chunk_limit_logging_error,
+    take_eos_dispatches,
+};
 
 use pingora_proxy::RESPONSE_BODY_EMIT_CHUNK_BUDGET;
 
@@ -103,6 +107,98 @@ async fn spawn_origin(how: Termination) -> u16 {
         while conn.accept().await.is_some() {}
     });
     port
+}
+
+/// Spawn a cleartext-h2 origin that keeps accepting streams and connections.
+/// The counters make connection reuse observable independently of proxy-added
+/// response headers.
+async fn spawn_reusable_trailered_origin() -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let origin_connections = connections.clone();
+    let origin_requests = requests.clone();
+
+    tokio::spawn(async move {
+        while let Ok((io, _)) = listener.accept().await {
+            origin_connections.fetch_add(1, Ordering::SeqCst);
+            let requests = origin_requests.clone();
+            tokio::spawn(async move {
+                let Ok(mut conn) = h2::server::handshake(io).await else {
+                    return;
+                };
+                while let Some(Ok((_req, mut send_resp))) = conn.accept().await {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    let response = Response::builder().status(StatusCode::OK).body(()).unwrap();
+                    let Ok(mut body) = send_resp.send_response(response, false) else {
+                        continue;
+                    };
+                    for chunk in CHUNKS {
+                        if body
+                            .send_data(Bytes::from_static(chunk.as_bytes()), false)
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    let mut trailers = HeaderMap::new();
+                    trailers.insert("grpc-status", "0".parse().unwrap());
+                    let _ = body.send_trailers(trailers);
+                }
+            });
+        }
+    });
+
+    (port, connections, requests)
+}
+
+async fn spawn_reusable_h1_trailered_origin() -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let origin_connections = connections.clone();
+    let origin_requests = requests.clone();
+
+    tokio::spawn(async move {
+        while let Ok((mut io, _)) = listener.accept().await {
+            origin_connections.fetch_add(1, Ordering::SeqCst);
+            let requests = origin_requests.clone();
+            tokio::spawn(async move {
+                let mut pending = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    while !pending.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match io.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => pending.extend_from_slice(&chunk[..read]),
+                        }
+                    }
+                    let header_end = pending
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .unwrap()
+                        + 4;
+                    pending.drain(..header_end);
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    if io
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+                              5\r\nalpha\r\n4\r\nbeta\r\n5\r\ngamma\r\n\
+                              0\r\ngrpc-status: 0\r\n\r\n",
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    (port, connections, requests)
 }
 
 /// Emit HEADERS, one DATA frame, and trailers without yielding so the proxy
@@ -232,6 +328,46 @@ async fn raw_h1_get(
     (started.elapsed(), String::from_utf8(response).unwrap())
 }
 
+async fn raw_h1_get_and_probe_downstream_close(
+    origin_port: u16,
+    use_h2: bool,
+    extra_headers: &[(&str, &str)],
+) -> String {
+    let mut stream = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+    let mut request =
+        format!("GET /terminal-body HTTP/1.1\r\nHost: 127.0.0.1\r\nx-port: {origin_port}\r\n");
+    if use_h2 {
+        request.push_str("x-h2: true\r\n");
+    }
+    for (name, value) in extra_headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut response))
+        .await
+        .expect("failed trailer-filter exchange left the downstream connection open")
+        .unwrap();
+
+    let second_request =
+        b"GET /must-not-run HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    if stream.write_all(second_request).await.is_ok() {
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_millis(200), stream.read(&mut byte)).await;
+        assert!(
+            matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+            "the failed response's downstream connection accepted a second request"
+        );
+    }
+
+    String::from_utf8(response).unwrap()
+}
+
 /// Spawn a cacheable trailered origin. Answers ONE request: the cache hit that
 /// follows must be served without touching it.
 async fn spawn_cacheable_trailered_origin() -> u16 {
@@ -347,22 +483,42 @@ async fn get_probed(port: u16, probe: &str) -> reqwest::Result<reqwest::Response
         .await
 }
 
-async fn get_with_chunk_limit(port: u16, mode: &str) -> reqwest::Result<reqwest::Response> {
-    reqwest::Client::new()
+async fn get_with_chunk_limit(
+    port: u16,
+    mode: &str,
+    probe: Option<&str>,
+) -> reqwest::Result<reqwest::Response> {
+    let mut request = reqwest::Client::new()
         .get("http://127.0.0.1:6147/terminal-body")
         .header("x-h2", "true")
         .header("x-port", port.to_string())
         .header("x-emit-chunk-limit", mode)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
+        .timeout(Duration::from_secs(10));
+    if let Some(probe) = probe {
+        request = request.header("x-emit-chunk-limit-probe", probe);
+    }
+    request.send().await
+}
+
+async fn wait_for_emit_chunk_limit_error(probe: &str) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        if let Some(error) = take_emit_chunk_limit_logging_error(probe) {
+            return error;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "chunk-limit request {probe} did not reach logging with an error"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 #[tokio::test]
 async fn h2_upstream_drains_exactly_the_emitted_chunk_limit() {
     init_without_mock_origin();
     let port = spawn_origin(Termination::EndStreamOnLastData).await;
-    let response = get_with_chunk_limit(port, "exact").await.unwrap();
+    let response = get_with_chunk_limit(port, "exact", None).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.bytes().await.unwrap();
     assert_eq!(body.len(), RESPONSE_BODY_EMIT_CHUNK_BUDGET);
@@ -373,7 +529,8 @@ async fn h2_upstream_drains_exactly_the_emitted_chunk_limit() {
 async fn h2_upstream_rejects_the_next_chunk_after_the_limit() {
     init_without_mock_origin();
     let port = spawn_origin(Termination::EndStreamOnLastData).await;
-    let response = get_with_chunk_limit(port, "overflow").await;
+    let probe = format!("h2-emit-chunk-overflow-{}", std::process::id());
+    let response = get_with_chunk_limit(port, "overflow", Some(&probe)).await;
     let completed_ok = match response {
         Ok(response) if response.status() == StatusCode::OK => response.bytes().await.ok(),
         _ => None,
@@ -381,6 +538,15 @@ async fn h2_upstream_rejects_the_next_chunk_after_the_limit() {
     assert!(
         completed_ok.is_none(),
         "an H2 response that exceeds the emitted-chunk limit must fail closed"
+    );
+    let error = wait_for_emit_chunk_limit_error(&probe).await;
+    let expected = format!(
+        "response body emit chunk budget exhausted: maximum {} nonempty chunks per batch",
+        RESPONSE_BODY_EMIT_CHUNK_BUDGET
+    );
+    assert!(
+        error.starts_with("InternalError|") && error.contains(&expected),
+        "H2 overflow failed for the wrong reason: {error}"
     );
 }
 
@@ -532,6 +698,143 @@ async fn async_trailer_hook_error_prevents_trailer_forwarding() {
 
     assert!(wire.starts_with("HTTP/1.1 200"), "wire was {wire:?}");
     assert!(!wire.contains("grpc-status"), "wire was {wire:?}");
+}
+
+#[tokio::test]
+async fn downstream_trailer_filter_error_aborts_h1_and_h2_upstream_responses() {
+    init_without_mock_origin();
+
+    for (protocol, use_h2, origin_port) in [
+        ("h1", false, spawn_h1_chunked_origin(true).await),
+        ("h2", true, spawn_origin(Termination::Trailers).await),
+    ] {
+        let probe = format!("downstream-trailer-error-{protocol}-{}", std::process::id());
+        let wire = raw_h1_get_and_probe_downstream_close(
+            origin_port,
+            use_h2,
+            &[
+                ("x-downstream-trailer-error", "true"),
+                ("x-downstream-trailer-probe", &probe),
+                ("x-retain-until-eos", "true"),
+            ],
+        )
+        .await;
+
+        assert!(
+            wire.starts_with("HTTP/1.1 500") || wire.starts_with("HTTP/1.1 200"),
+            "{protocol} trailer rejection produced an unexpected response: {wire:?}"
+        );
+        assert_eq!(
+            take_downstream_trailer_filter_calls(&probe),
+            1,
+            "{protocol} downstream trailer hook did not run exactly once"
+        );
+        assert!(
+            !wire.contains("grpc-status"),
+            "{protocol} rejected trailer reached the wire: {wire:?}"
+        );
+        assert!(
+            !wire.contains("|eos"),
+            "{protocol} terminal sink output leaked after trailer rejection: {wire:?}"
+        );
+        assert!(
+            !wire.ends_with("0\r\n\r\n"),
+            "{protocol} response completed cleanly after trailer rejection: {wire:?}"
+        );
+        let logged = take_downstream_trailer_logging_error(&probe)
+            .unwrap_or_else(|| panic!("{protocol} trailer error did not reach logging"));
+        assert!(
+            logged.starts_with("InternalError|Unset|")
+                && logged.contains("scripted downstream response trailer rejection"),
+            "{protocol} logging lost the trailer error classification/context: {logged}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn downstream_trailer_filter_error_uses_existing_h1_upstream_discard_policy() {
+    init_without_mock_origin();
+    let (origin_port, connections, requests) = spawn_reusable_h1_trailered_origin().await;
+    let probe = format!("downstream-trailer-h1-reuse-{}", std::process::id());
+
+    let failed_wire = raw_h1_get_and_probe_downstream_close(
+        origin_port,
+        false,
+        &[
+            ("x-downstream-trailer-error", "true"),
+            ("x-downstream-trailer-probe", &probe),
+        ],
+    )
+    .await;
+    assert_eq!(take_downstream_trailer_filter_calls(&probe), 1);
+    assert!(!failed_wire.contains("grpc-status"));
+    assert!(take_downstream_trailer_logging_error(&probe).is_some());
+
+    let response = reqwest::Client::new()
+        .get("http://127.0.0.1:6147/terminal-body")
+        .header("x-port", origin_port.to_string())
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-conn-reuse")
+            .and_then(|value| value.to_str().ok()),
+        None,
+        "the H1 failure path unexpectedly pooled the upstream session"
+    );
+    assert_eq!(response.text().await.unwrap(), whole_body());
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        2,
+        "the H1 failure path did not use its conservative connection discard policy"
+    );
+}
+
+#[tokio::test]
+async fn downstream_trailer_filter_error_keeps_completed_h2_upstream_reusable() {
+    init_without_mock_origin();
+    let (origin_port, connections, requests) = spawn_reusable_trailered_origin().await;
+    let probe = format!("downstream-trailer-reuse-{}", std::process::id());
+
+    let (_, failed_wire) = raw_h1_get(
+        origin_port,
+        true,
+        "HTTP/1.1",
+        &[
+            ("x-downstream-trailer-error", "true"),
+            ("x-downstream-trailer-probe", &probe),
+        ],
+    )
+    .await;
+    assert_eq!(take_downstream_trailer_filter_calls(&probe), 1);
+    assert!(!failed_wire.contains("grpc-status"));
+    assert!(
+        take_downstream_trailer_logging_error(&probe).is_some(),
+        "trailer rejection did not finish before the reuse probe"
+    );
+
+    let response = get(origin_port, false).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-conn-reuse")
+            .and_then(|v| v.to_str().ok()),
+        Some("1"),
+        "the next stream did not use Pingora's pooled H2 connection"
+    );
+    assert_eq!(response.text().await.unwrap(), whole_body());
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        1,
+        "the trailer-hook failure discarded a healthy H2 connection"
+    );
 }
 
 #[tokio::test]

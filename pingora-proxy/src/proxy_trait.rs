@@ -34,6 +34,24 @@ pub enum UpstreamResponseBodyEvent {
     TerminalWithoutTrailers,
 }
 
+/// The allocation-free default behind the object-safe async-trait signature.
+///
+/// `Box::pin()` does not ask the allocator for storage for a zero-sized type.
+/// Keeping the result construction in `poll()` is important: a `Ready<Result>`
+/// future would store the result and would no longer be zero-sized.
+struct NoopUpstreamResponseBodyFilter;
+
+impl std::future::Future for NoopUpstreamResponseBodyFilter {
+    type Output = Result<Option<Duration>>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::task::Poll::Ready(Ok(None))
+    }
+}
+
 /// Context for proxy warning logs that can be suppressed by
 /// [`ProxyHttp::suppress_proxy_warn_log`].
 ///
@@ -736,18 +754,32 @@ pub trait ProxyHttp {
     /// serving are not forwarded response representations and do not receive
     /// this synthetic body event. Ordinary cache hits skip this upstream hook
     /// entirely; use `Self::response_body_filter` for cache-hit observation.
-    async fn upstream_response_body_filter(
-        &self,
-        _session: &mut Session,
-        _body: &mut Option<Bytes>,
+    ///
+    /// The manually expanded return type matches `async_trait`'s object-safe
+    /// ABI. Its default boxes a zero-sized ready future, which preserves dyn
+    /// compatibility without asking the allocator for storage. Existing
+    /// `#[async_trait] async fn` overrides remain source-compatible and retain
+    /// their normal boxed async behavior.
+    fn upstream_response_body_filter<'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait>(
+        &'life0 self,
+        _session: &'life1 mut Session,
+        _body: &'life2 mut Option<Bytes>,
         _end_of_stream: bool,
-        _sink: &mut ResponseBodySink,
-        _ctx: &mut Self::CTX,
-    ) -> Result<Option<Duration>>
+        _sink: &'life3 mut ResponseBodySink,
+        _ctx: &'life4 mut Self::CTX,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<Duration>>> + Send + 'async_trait>,
+    >
     where
         Self::CTX: Send + Sync,
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        Self: Sync + 'async_trait,
     {
-        Ok(None)
+        Box::pin(NoopUpstreamResponseBodyFilter)
     }
 
     /// Typed response-body lifecycle hook.
@@ -756,29 +788,35 @@ pub trait ProxyHttp {
     /// delegate with `end_of_stream = true`, preserving the pre-typed contract
     /// that legacy filters receive exactly one terminal callback even when
     /// trailers follow. Trailer-aware implementations should override this
-    /// method to distinguish the two terminal variants.
-    async fn upstream_response_body_filter_event(
-        &self,
-        session: &mut Session,
-        body: &mut Option<Bytes>,
+    /// method to distinguish the two terminal variants. The default returns
+    /// the legacy hook's future directly instead of wrapping it in a second
+    /// async-trait future; an async legacy or typed override is still awaited
+    /// exactly as supplied by the application.
+    fn upstream_response_body_filter_event<'life0, 'life1, 'life2, 'life3, 'life4, 'async_trait>(
+        &'life0 self,
+        session: &'life1 mut Session,
+        body: &'life2 mut Option<Bytes>,
         event: UpstreamResponseBodyEvent,
-        sink: &mut ResponseBodySink,
-        ctx: &mut Self::CTX,
-    ) -> Result<Option<Duration>>
+        sink: &'life3 mut ResponseBodySink,
+        ctx: &'life4 mut Self::CTX,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<Duration>>> + Send + 'async_trait>,
+    >
     where
         Self::CTX: Send + Sync,
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        'life3: 'async_trait,
+        'life4: 'async_trait,
+        Self: Sync + 'async_trait,
     {
-        match event {
-            UpstreamResponseBodyEvent::Data { end_of_stream } => {
-                self.upstream_response_body_filter(session, body, end_of_stream, sink, ctx)
-                    .await
-            }
+        let end_of_stream = match event {
+            UpstreamResponseBodyEvent::Data { end_of_stream } => end_of_stream,
             UpstreamResponseBodyEvent::TerminalBeforeTrailers
-            | UpstreamResponseBodyEvent::TerminalWithoutTrailers => {
-                self.upstream_response_body_filter(session, body, true, sink, ctx)
-                    .await
-            }
-        }
+            | UpstreamResponseBodyEvent::TerminalWithoutTrailers => true,
+        };
+        self.upstream_response_body_filter(session, body, end_of_stream, sink, ctx)
     }
 
     /// Similar to [Self::upstream_response_filter()] but for response trailers
@@ -1123,6 +1161,13 @@ mod tests {
         let io = tokio_test::io::Builder::new().build();
         let session = Session::new_h1(Box::new(io));
         assert!(DefaultsOnly.request_retry_allowed(&session, &()));
+    }
+
+    #[test]
+    fn proxy_http_remains_object_compatible() {
+        fn accept_dyn(_proxy: &dyn ProxyHttp<CTX = ()>) {}
+
+        accept_dyn(&DefaultsOnly);
     }
 
     struct LegacyBodyFilter;

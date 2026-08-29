@@ -263,12 +263,58 @@ impl ProxyHttp for ExampleProxyHttps {
 static EOS_PROBES: Lazy<std::sync::Mutex<HashMap<String, usize>>> =
     Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
 
+/// Downstream `response_trailer_filter` invocations, keyed by the request's
+/// `x-downstream-trailer-probe` value. This is separate from client-visible
+/// bytes so failure tests can prove the hook ran even though the response is
+/// intentionally aborted before its trailers are written.
+static DOWNSTREAM_TRAILER_PROBES: Lazy<std::sync::Mutex<HashMap<String, usize>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+static DOWNSTREAM_TRAILER_LOG_ERRORS: Lazy<std::sync::Mutex<HashMap<String, String>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+static EMIT_CHUNK_LIMIT_LOG_ERRORS: Lazy<std::sync::Mutex<HashMap<String, String>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
 /// Remove and return the terminal dispatch count recorded for `probe`.
 ///
 /// Removing on read keeps the map bounded and keeps a probe id from leaking
 /// into another test.
 pub fn take_eos_dispatches(probe: &str) -> usize {
     EOS_PROBES.lock().unwrap().remove(probe).unwrap_or(0)
+}
+
+pub fn take_downstream_trailer_filter_calls(probe: &str) -> usize {
+    DOWNSTREAM_TRAILER_PROBES
+        .lock()
+        .unwrap()
+        .remove(probe)
+        .unwrap_or(0)
+}
+
+pub fn take_downstream_trailer_logging_error(probe: &str) -> Option<String> {
+    DOWNSTREAM_TRAILER_LOG_ERRORS.lock().unwrap().remove(probe)
+}
+
+pub fn take_emit_chunk_limit_logging_error(probe: &str) -> Option<String> {
+    EMIT_CHUNK_LIMIT_LOG_ERRORS.lock().unwrap().remove(probe)
+}
+
+fn record_downstream_trailer_filter(session: &Session) -> Result<()> {
+    let probe = session.get_header_bytes("x-downstream-trailer-probe");
+    if !probe.is_empty() {
+        let probe = String::from_utf8_lossy(probe).into_owned();
+        *DOWNSTREAM_TRAILER_PROBES
+            .lock()
+            .unwrap()
+            .entry(probe)
+            .or_insert(0) += 1;
+    }
+    if session.get_header_bytes("x-downstream-trailer-error") == b"true" {
+        return Error::e_explain(
+            InternalError,
+            "scripted downstream response trailer rejection",
+        );
+    }
+    Ok(())
 }
 
 /// Count one terminal dispatch for the request's probe id, if it carries one.
@@ -559,6 +605,37 @@ impl ProxyHttp for ExampleProxyHttp {
             trailers.clear();
         }
         Ok(())
+    }
+
+    async fn response_trailer_filter(
+        &self,
+        session: &mut Session,
+        _trailers: &mut http::HeaderMap,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<Bytes>> {
+        record_downstream_trailer_filter(session)?;
+        Ok(None)
+    }
+
+    async fn logging(&self, session: &mut Session, error: Option<&Error>, _ctx: &mut Self::CTX) {
+        let trailer_probe = session.get_header_bytes("x-downstream-trailer-probe");
+        if !trailer_probe.is_empty() {
+            if let Some(error) = error {
+                DOWNSTREAM_TRAILER_LOG_ERRORS.lock().unwrap().insert(
+                    String::from_utf8_lossy(trailer_probe).into_owned(),
+                    format!("{:?}|{:?}|{error}", error.etype(), error.esource()),
+                );
+            }
+        }
+        let emit_probe = session.get_header_bytes("x-emit-chunk-limit-probe");
+        if !emit_probe.is_empty() {
+            if let Some(error) = error {
+                EMIT_CHUNK_LIMIT_LOG_ERRORS.lock().unwrap().insert(
+                    String::from_utf8_lossy(emit_probe).into_owned(),
+                    format!("{:?}|{:?}|{error}", error.etype(), error.esource()),
+                );
+            }
+        }
     }
 
     async fn upstream_response_header_filter_event(
