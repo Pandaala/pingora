@@ -40,7 +40,7 @@ Expected feature coverage:
 | `pingora-core --lib` | body buffers, H1/H2 sessions, END_STREAM watch, listener and PROXY parser |
 | `pingora-core --lib --features boringssl` | complete TLS-backed core suite, including deterministic direct/high-level local source-bind classification and timeout-context separation |
 | `pingora-core --lib --features boringssl test_listen_tls_proxy_protocol` | explicit PROXY-before-TLS rejection stages, successful handshake and address preservation |
-| `pingora-proxy --lib` | 124 passed plus 1 ignored manual benchmark: disposition truth-table, H2 write-floor, terminal-latch, object-compatible response hooks, shared response-pipeline parity, sink-budget, EOS-migration and retry-guard tests |
+| `pingora-proxy --lib` | 125 passed plus 1 ignored manual benchmark: disposition truth-table, H2 write-floor and abandoned-reservation cleanup, terminal-latch, object-compatible response hooks, shared response-pipeline parity, sink-budget, EOS-migration and retry-guard tests |
 | `test_request_body_seam` | 54 H1/H2 request-pump, framing, retry and termination scenarios |
 | `test_upstream_response_body_sink` | 57 response streaming/cache/custom scenarios |
 | `test_terminal_body_dispatch` | 26 self-contained terminal/trailer scenarios |
@@ -83,7 +83,7 @@ not raise this workspace's Rust 1.85 MSRV.
 
 ## Validation snapshot
 
-Validated on 2026-08-29 against the working tree based on `bd89d47`:
+Validated on 2026-08-29 against the working tree based on `4dd9ce2`:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo check -p pingora-core -p pingora-proxy`: passed.
@@ -99,7 +99,7 @@ Validated on 2026-08-29 against the working tree based on `bd89d47`:
   of relying on TEST-NET routing.
 - `cargo test -p pingora-core --lib --features boringssl test_listen_tls_proxy_protocol`:
   2 passed.
-- `cargo test -p pingora-proxy --lib`: 124 passed, 1 ignored manual response
+- `cargo test -p pingora-proxy --lib`: 125 passed, 1 ignored manual response
   pipeline benchmark.
 - `test_request_body_seam`: 54 passed.
 - `test_upstream_response_body_sink`: 57 passed.
@@ -108,6 +108,11 @@ Validated on 2026-08-29 against the working tree based on `bd89d47`:
 - `test_h2_upstream_stalled_after_response`: 4 passed.
 - `test_h2_upstream_cache_and_reuse`: 8 passed. Requires the `127.0.0.2`
   loopback alias described above.
+
+The four preceding terminal/H2 standalone targets were run in the project's
+Linux arm64 builder container with the repository mounted read-only because
+the macOS host did not have that alias. Linux treats all of `127.0.0.0/8` as
+loopback, so the same checked-in `pingora_conf.yaml` ran unchanged.
 
 The 2026-08-29 private-test-module extraction preserved the complete unit-test
 lists byte-for-byte after sorting:

@@ -304,6 +304,17 @@ fn upstream_write_error_outcome(
     })
 }
 
+/// Release flow-control capacity requested by an upstream body write that the
+/// pump has decided never to resume.
+///
+/// Dropping the capacity-wait future does not cancel its request: h2 keeps the
+/// reservation on the `SendStream`, and capacity assigned later cannot be used
+/// by sibling streams. Every successful upload-abandonment path must therefore
+/// pass through this helper while the send handle is still alive.
+fn cancel_abandoned_upstream_body_capacity(client_body: &mut h2::SendStream<Bytes>) {
+    client_body.reserve_capacity(0);
+}
+
 /// Whether a failed `write_body` means the upstream request stream is GONE, as
 /// opposed to still being there and merely not cooperating.
 ///
@@ -1946,7 +1957,7 @@ where
                 // The write future is gone by now, so the capacity it was
                 // holding out for can be handed back to the connection instead
                 // of staying reserved for a stream nothing will write again.
-                client_body.reserve_capacity(0);
+                cancel_abandoned_upstream_body_capacity(client_body);
                 warn!(
                     "upstream granted no request-body capacity for \
                      {UPSTREAM_STALL_PROBE_INTERVAL:?} after flagging its response complete; \
@@ -1966,7 +1977,9 @@ where
             if eos_write_optional {
                 debug!("upstream request stream would not take the final END_STREAM: {e}");
             } else {
-                return upstream_write_error_outcome(e, end, body_write);
+                let outcome = upstream_write_error_outcome(e, end, body_write)?;
+                cancel_abandoned_upstream_body_capacity(client_body);
+                return Ok(outcome);
             }
         }
 
@@ -2463,6 +2476,83 @@ fn test_h2_write_timeout_floor_only_fills_an_unconfigured_timeout() {
         longer,
         "an explicit longer write timeout must not be clamped to the floor"
     );
+}
+
+/// A successful upload abandonment must release connection capacity before
+/// the abandoned `SendStream` is dropped. Otherwise a slow response consumer
+/// can keep that handle alive and starve sibling streams on the same H2
+/// connection.
+#[tokio::test]
+async fn test_abandoning_an_h2_upload_releases_capacity_to_a_live_sibling_stream() {
+    use std::future::poll_fn;
+    use tokio::io::duplex;
+
+    let (client_io, server_io) = duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let mut conn = h2::server::handshake(server_io).await.unwrap();
+        let mut streams = Vec::new();
+        while let Some(stream) = conn.accept().await {
+            streams.push(stream.unwrap());
+        }
+        streams
+    });
+
+    let (mut send_request, connection) = h2::client::handshake(client_io).await.unwrap();
+    let client = tokio::spawn(async move { connection.await });
+
+    send_request = send_request.ready().await.unwrap();
+    let first = http::Request::builder()
+        .uri("https://example.test/first")
+        .body(())
+        .unwrap();
+    let (_, mut first_body) = send_request.send_request(first, false).unwrap();
+
+    send_request = send_request.ready().await.unwrap();
+    let second = http::Request::builder()
+        .uri("https://example.test/second")
+        .body(())
+        .unwrap();
+    let (_, mut second_body) = send_request.send_request(second, false).unwrap();
+
+    const CONNECTION_WINDOW: usize = 65_535;
+    first_body.reserve_capacity(CONNECTION_WINDOW);
+    let first_capacity = tokio::time::timeout(
+        Duration::from_secs(1),
+        poll_fn(|cx| first_body.poll_capacity(cx)),
+    )
+    .await
+    .expect("the first stream must receive the connection window")
+    .expect("the first stream must remain open")
+    .expect("the first stream capacity request must succeed");
+    assert_eq!(first_capacity, CONNECTION_WINDOW);
+
+    second_body.reserve_capacity(1);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            poll_fn(|cx| second_body.poll_capacity(cx)),
+        )
+        .await
+        .is_err(),
+        "the first stream must initially hold all connection capacity"
+    );
+
+    cancel_abandoned_upstream_body_capacity(&mut first_body);
+
+    let second_capacity = tokio::time::timeout(
+        Duration::from_secs(1),
+        poll_fn(|cx| second_body.poll_capacity(cx)),
+    )
+    .await
+    .expect("cancelling the abandoned reservation must wake the sibling stream")
+    .expect("the sibling stream must remain open")
+    .expect("the sibling capacity request must succeed");
+    assert_eq!(second_capacity, 1);
+    assert_eq!(first_body.capacity(), 0);
+
+    drop((first_body, second_body, send_request));
+    client.abort();
+    server.abort();
 }
 
 /// Neither swallowable shape may fire without the wire END_STREAM flag.

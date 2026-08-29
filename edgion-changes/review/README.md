@@ -38,6 +38,9 @@ The `status` inside each record is authoritative.
 - [Writer stall without response END_STREAM](h2-grpc/h2-writer-stall-without-end-stream-bounded.md):
   every H2 capacity wait has a finite progress bound; without qualified
   response END_STREAM, expiry fails the exchange and releases stream capacity.
+- [Configured-timeout capacity cleanup](h2-grpc/h2-configured-timeout-capacity-reservation.md):
+  every successful upload abandonment cancels its outstanding H2 capacity
+  reservation before response delivery continues.
 - [Shutdown allocation](h2-grpc/h2-shutdown-connection-not-allocatable.md)
   (H2-008): enforce shutdown at allocation and pool selection.
 - [Version-robust baselines](h2-grpc/h2-dependency-baseline-tests-version-robust.md)

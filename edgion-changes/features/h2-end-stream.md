@@ -105,11 +105,15 @@ does not impose a total upload duration on a stream that keeps making progress.
 In both cases the upload is abandoned and the response delivered. Nothing is
 concealed by that: the request half never receives its END_STREAM, so the
 stream is reset when the exchange ends and the origin sees a truncated upload
-rather than a whole one, and the swallow is logged at `warn`. Without the wire
-flag every one of these failures still costs the exchange, so a response the
-origin never flagged complete can neither be delivered nor admitted to cache on
-the strength of a stalled write. In particular, expiry of the protocol-local
-floor without the flag is propagated out of the duplex pump, sends
+rather than a whole one, and the swallow is logged at `warn`. Before response
+delivery continues, every successful abandonment also cancels the request
+body's outstanding `SendStream` capacity request. This returns capacity already
+assigned to the abandoned stream and prevents a still-live response from
+pinning connection capacity away from sibling streams. Without the wire flag
+every one of these failures still costs the exchange, so a response the origin
+never flagged complete can neither be delivered nor admitted to cache on the
+strength of a stalled write. In particular, expiry of the protocol-local floor
+without the flag is propagated out of the duplex pump, sends
 `RST_STREAM(CANCEL)`, abandons any partial cache entry, and does not retry after
 a final response has already been committed. The H2 connection itself remains
 eligible for reuse after the failed stream releases its capacity.
@@ -120,7 +124,10 @@ Supported h2 0.4.19 preserves END_STREAM after a later reset, while releases
 before h2 0.4.16 exposed the overwritten state that originally motivated the watch.
 Behavioral tests therefore assert clean EOF or truncation, not a particular
 private receive state. The frame-scanner unit tests independently prove
-record/reset ordering.
+record/reset ordering. The proxy capacity test holds one abandoned
+`SendStream` alive after assigning it the whole connection window and proves
+that cancellation lets a sibling stream acquire capacity before the first
+handle is dropped.
 
 The workspace requires `h2 >= 0.4.19`. A 2026-08-29 minimum audit found that
 0.4.16, 0.4.17, and 0.4.18 reproducibly close the fork's large-window
