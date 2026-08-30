@@ -448,7 +448,9 @@ where
             return Ok(None);
         }
 
-        session.write_response_tasks(filtered_tasks).await?;
+        if !filtered_tasks.is_empty() {
+            session.write_response_tasks(filtered_tasks).await?;
+        }
 
         Ok(Some(source_done))
     }

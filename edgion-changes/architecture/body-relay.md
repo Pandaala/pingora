@@ -593,12 +593,17 @@ an unbounded SSE stream. Correctness cannot depend on a header and decisive
 body chunk happening to arrive in the same pump batch, nor on wire END_STREAM
 alone.
 
-Before implementation it must define H1/H2/custom writer behavior, cache fill
-and cache-hit semantics, cancellation before commit, terminal/trailer handling,
-compression ordering, overflow, observability, and the point at which retries
-become impossible. It may justify moving an opaque application handle into a
-broader Pingora response lifecycle only if that lifecycle also spans downstream
-write outcome and explicit handback to Edgion logging.
+The accepted v1 design and its intentionally unsupported combinations are in
+[the response-head commit barrier design](../review/response-head-commit-barrier-design.md).
+Implementation and closure evidence are tracked separately in
+[the Phase 4 pending record](../pending-issues/response-head-commit-barrier.md).
+
+The accepted design defines H1/H2 writer behavior, cache bypass, cancellation,
+terminal/trailer handling, compression ordering, overflow, observability, and
+the point at which retries become impossible. Implementation must preserve
+those boundaries. Moving an opaque application handle into a broader Pingora
+response lifecycle remains unjustified unless that lifecycle also spans
+downstream write outcome and explicit handback to Edgion logging.
 
 ## Source map
 

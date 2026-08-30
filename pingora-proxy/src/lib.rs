@@ -213,6 +213,7 @@ mod proxy_purge;
 mod proxy_trait;
 mod request_relay;
 mod response_body_sink;
+mod response_head_barrier;
 mod response_pipeline;
 pub mod subrequest;
 #[cfg(test)]
@@ -230,12 +231,19 @@ pub use proxy_trait::{
 pub use response_body_sink::{
     ResponseBodySink, RESPONSE_BODY_EMIT_BUDGET, RESPONSE_BODY_EMIT_CHUNK_BUDGET,
 };
+pub use response_head_barrier::{
+    ResponseHeadBoundary, ResponseHeadBoundaryAction, ResponseHeadCommitPlan,
+    ResponseHeadHoldLimits, ResponseHeadHoldPlan, ResponseHeadOutcome, ResponseHeadReplacement,
+    ResponseHeadSource, ResponseHeadUsage,
+};
 
 pub mod prelude {
     pub use crate::{
         http_proxy, http_proxy_service, ProxyHttp, ProxyWarnLogContext, RequestBodyAction,
-        RequestRelayPlan, RequestRelayRetryState, RequestReplayPolicy, Session,
-        UpstreamRequestBodyDisposition, UpstreamResponseBodyEvent,
+        RequestRelayPlan, RequestRelayRetryState, RequestReplayPolicy, ResponseHeadBoundary,
+        ResponseHeadBoundaryAction, ResponseHeadCommitPlan, ResponseHeadHoldLimits,
+        ResponseHeadHoldPlan, ResponseHeadOutcome, ResponseHeadReplacement, ResponseHeadSource,
+        ResponseHeadUsage, Session, UpstreamRequestBodyDisposition, UpstreamResponseBodyEvent,
     };
 }
 
@@ -514,7 +522,13 @@ where
                         (server_reused, error)
                     }
                 };
-                let error = error.map(|e| {
+                let error = error.map(|mut e| {
+                    // Product hooks may consume retry budget or advance an
+                    // attempt scheduler. Close retry before invoking them once
+                    // a final response selected the bounded head processor.
+                    if session.response_head_retry_closed() {
+                        e.retry = false.into();
+                    }
                     self.inner
                         .error_while_proxy(&peer, session, e, ctx, client_reused)
                 });
@@ -720,6 +734,11 @@ pub struct Session {
     /// Number of response header tasks whose downstream module filtering was
     /// completed early so a same-batch trailer hook can query planned framing.
     prepared_response_headers: usize,
+    /// A final upstream response has activated the bounded head barrier. The
+    /// response processor set may already have consumed body input even though
+    /// no downstream final header has been written, so this request must never
+    /// start another upstream attempt.
+    response_head_attempt_selected: bool,
     /// Flag that is set when the shutdown process has begun.
     shutdown_flag: Arc<AtomicBool>,
 }
@@ -752,8 +771,27 @@ impl Session {
             request_attempt_id: None,
             native_retry_buffer_state: request_relay::NativeRetryBufferState::NotStarted,
             prepared_response_headers: 0,
+            response_head_attempt_selected: false,
             shutdown_flag,
         }
+    }
+
+    pub(crate) fn mark_response_head_attempt_selected(&mut self) {
+        self.response_head_attempt_selected = true;
+    }
+
+    pub(crate) fn mark_response_head_writer_handoff(&mut self) {
+        self.response_head_attempt_selected = true;
+    }
+
+    /// Whether retry is permanently closed by final-response selection or
+    /// commit for this request.
+    ///
+    /// Product retry hooks must check this before consuming retry budget or
+    /// advancing an attempt scheduler. Pingora also enforces it after the hook,
+    /// but that later guard cannot roll back product-side effects.
+    pub fn response_head_retry_closed(&self) -> bool {
+        self.response_head_attempt_selected || final_response_committed(self.response_written())
     }
 
     fn freeze_request_relay_plan(&mut self, requested: RequestRelayPlan) -> Result<()> {
@@ -1524,7 +1562,7 @@ where
 
             match e {
                 Some(mut error) => {
-                    if final_response_committed(session.response_written()) {
+                    if session.response_head_retry_closed() {
                         error.retry = false.into();
                     }
                     if !session.request_relay_retry_state().can_start_next_attempt() {

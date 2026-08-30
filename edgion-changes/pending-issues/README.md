@@ -12,7 +12,7 @@ next action, and closure evidence.
 | [H2 trailer validation](h2-trailer-validation.md) | Deferred upstream | Upstream decoder, then fork integration | [Upstream limitation](../review/upstream-limitations.md) |
 | [Non-streaming cache trailer completion](non-streaming-cache-trailer-completion.md) | Open | Fork | Discovered while closing [trailer filter parity](../review/response-trailer-filter-error-parity.md) |
 | [Custom conditional-filter gate](custom-conditional-filter-gate.md) | Open investigation | Fork custom response pump | Preserved explicitly by the shared response pipeline |
-| [Body relay semantic-layer refactor](body-relay-refactor.md) | Open; phases 1-3 complete, response-head barrier remains | Cross-repository | [Current architecture](../architecture/body-relay.md), [assessment](../review/body-relay-architecture-assessment.md) |
+| [Bounded response-head commit barrier](response-head-commit-barrier.md) | Open; design accepted, implementation not started | Cross-repository | [Design](../review/response-head-commit-barrier-design.md), [current Phase 1-3 architecture](../architecture/body-relay.md) |
 
 ## Required issue fields
 

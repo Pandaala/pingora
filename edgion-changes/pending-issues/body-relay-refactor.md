@@ -2,12 +2,11 @@
 
 ## Status
 
-Open architecture/refactor work; phase 1 request-event extraction, phase 2
-request-scoped relay planning, and phase 3 Edgion response-processor ownership
-are complete. The bounded response-head commit phase remains. Severity:
-maintainability and feature-safety, not a presently reproduced wire defect.
-Ownership: cross-repository, with generic mechanics in this fork and product
-policy in `../Edgion`.
+Completed parent refactor for phases 1-3. The bounded response-head commit work
+has been split into
+[`response-head-commit-barrier.md`](response-head-commit-barrier.md) with an
+independently reviewed design. This record retains migration history and phase
+1-3 evidence; it no longer owns actionable work.
 
 Origin: body buffering/streaming architecture assessment on 2026-08-30.
 Baseline: Pingora `44dbef281584f6ef4412fd44eea07dd56c5ae630` and Edgion
@@ -39,7 +38,7 @@ are canonicalized in
 The original rationale, rejected alternatives, target boundary, and migration
 history are retained in
 [`review/body-relay-architecture-assessment.md`](../review/body-relay-architecture-assessment.md).
-This pending record owns only the remaining phase-4 action and closure status.
+The linked Phase 4 pending record owns remaining action and closure status.
 
 ## Completed phase 1
 
@@ -165,13 +164,13 @@ Phase-3 validation includes `cargo check -p edgion-gateway --tests`, 24 body
 processor cases, 9 trailer cases, 9 logging cases, and the full Edgion library
 suite at 3301 passed / 2 ignored.
 
-## Next action
+## Phase 4 handoff
 
-Design the bounded response-head commit barrier as a separate, explicitly
-observable feature. It must define release/replacement/overflow/cancellation
-behavior and cache plus H1/H2/custom interaction before implementation.
+The bounded response-head commit barrier is now a separate change with an
+accepted design and action record:
 
-Do not begin the response-head commit barrier in the same change.
+- [design](../review/response-head-commit-barrier-design.md)
+- [implementation pending](response-head-commit-barrier.md)
 
 ## Required closure evidence
 
@@ -191,9 +190,9 @@ Do not begin the response-head commit barrier in the same change.
 - The assessment is updated if implementation evidence changes its boundary or
   migration order.
 
-Completing phases 1-3 does not close the response-head barrier. Split that work
-into a linked pending record when its concrete API and acceptance tests are
-proposed.
+Completing phases 1-3 did not close the response-head barrier. Its concrete API,
+acceptance tests, and remaining work now live in the linked Phase 4 design and
+pending records above.
 
 ## Revisit triggers
 

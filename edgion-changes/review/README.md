@@ -85,6 +85,9 @@ The `status` inside each record is authoritative.
   final response processors remain Edgion-owned in one request-local driver;
   body/trailer execution leases distinguish callback cancellation from normal
   pump errors while logging retains durable finalization access.
+- [Bounded response-head commit barrier design](response-head-commit-barrier-design.md):
+  accepted Phase 4 v1 scope, state machine, ownership, budgets, deadlines,
+  protocol/cache boundary, and delivery slices.
 - [Private protocol test extraction](test-module-extraction.md): twelve large
   H1/H2/proxy suites moved to behavior-grouped sibling modules without changing
   test identities, visibility, ignored coverage, or Cargo target topology.

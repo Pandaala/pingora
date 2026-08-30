@@ -23,17 +23,20 @@ use crate::proxy_cache::{
     ServeFromCache,
 };
 use crate::proxy_common::{normalize_trailers, TerminalBodyDispatch};
+use crate::response_body_sink::ResponseHeadDecision;
+use crate::response_head_barrier::{ResponseHeadBarrier, ResponseHeadBarrierOutput};
 use crate::{
     abort_cache_after_response_source_failure, custom, downstream_response_body_forbidden,
     is_downstream_followup, reconcile_terminal_cache_header, reconcile_terminal_response_tasks,
-    reject_mismatched_h1_upgrade_101, HttpProxy, ProxyHttp, ResponseBodySink, Session,
-    UpstreamResponseBodyEvent,
+    reject_mismatched_h1_upgrade_101, HttpProxy, ProxyHttp, ResponseBodySink,
+    ResponseHeadCommitPlan, ResponseHeadSource, Session, UpstreamResponseBodyEvent,
 };
 use http::version::Version;
 use log::trace;
 use pingora_core::protocols::http::HttpTask;
-use pingora_error::Result;
+use pingora_error::{Error, ErrorType::InternalError, Result};
 use pingora_http::ResponseHeader;
+use std::future::Future;
 use tokio::time;
 
 /// Protocol-specific response behavior retained at the shared pipeline seam.
@@ -59,6 +62,7 @@ pub(crate) struct ResponsePipelineState {
     pub(crate) upstream_reusable: bool,
     pub(crate) sink: ResponseBodySink,
     pub(crate) terminal_body: TerminalBodyDispatch,
+    pub(crate) head_barrier: ResponseHeadBarrier,
 }
 
 impl Default for ResponsePipelineState {
@@ -70,7 +74,49 @@ impl Default for ResponsePipelineState {
             upstream_reusable: true,
             sink: ResponseBodySink::new(),
             terminal_body: TerminalBodyDispatch::default(),
+            head_barrier: ResponseHeadBarrier::default(),
         }
+    }
+}
+
+impl ResponsePipelineState {
+    pub(crate) fn response_head_deadline(&self) -> Option<time::Instant> {
+        self.head_barrier.deadline()
+    }
+
+    pub(crate) fn fail_response_head_timeout(&mut self) -> pingora_error::BError {
+        self.sink.disarm_response_head_release();
+        self.upstream_reusable = false;
+        self.head_barrier.timeout()
+    }
+
+    fn finish_head_deadline_wait<T>(
+        &mut self,
+        waited: std::result::Result<Result<T>, time::error::Elapsed>,
+    ) -> Result<T> {
+        match waited {
+            Ok(result) => result,
+            Err(_) => Err(self.fail_response_head_timeout()),
+        }
+    }
+
+    pub(crate) async fn wait_with_response_head_deadline<T>(
+        &mut self,
+        future: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let deadline = self.response_head_deadline();
+        let waited = await_response_head_deadline(deadline, future).await;
+        self.finish_head_deadline_wait(waited)
+    }
+}
+
+async fn await_response_head_deadline<T>(
+    deadline: Option<time::Instant>,
+    future: impl Future<Output = Result<T>>,
+) -> std::result::Result<Result<T>, time::error::Elapsed> {
+    match deadline {
+        Some(deadline) => time::timeout_at(deadline, future).await,
+        None => Ok(future.await),
     }
 }
 
@@ -100,6 +146,38 @@ where
     SV: ProxyHttp,
     C: custom::Connector,
 {
+    async fn downstream_response_filter_tasks_in_order(
+        &self,
+        session: &mut Session,
+        tasks: &mut [HttpTask],
+        ctx: &mut SV::CTX,
+    ) -> Result<()>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        for task in tasks {
+            if let HttpTask::Trailer(trailers) = task {
+                let buffer = match trailers.as_mut() {
+                    Some(trailers) => {
+                        self.inner
+                            .response_trailer_filter(session, trailers, ctx)
+                            .await?
+                    }
+                    None => None,
+                };
+                *task = if let Some(buffer) = buffer {
+                    HttpTask::Body(Some(buffer), true)
+                } else {
+                    HttpTask::Trailer(normalize_trailers(std::mem::take(trailers)))
+                };
+            }
+            self.downstream_response_body_filter_tasks(session, std::slice::from_mut(task), ctx)
+                .await?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn response_task_pipeline(
         &self,
@@ -116,6 +194,8 @@ where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
+        let source_failed = matches!(&task, HttpTask::Failed(_));
+        let source_clean_terminal = task.is_end() && !source_failed;
         let terminal_header = !from_cache
             && matches!(
                 &task,
@@ -136,12 +216,21 @@ where
                 }
             }
 
-            if let Some(duration) = self
-                .upstream_filter(session, &mut task, &mut state.sink, ctx)
-                .await?
-            {
+            let deadline = state.response_head_deadline();
+            let filtered = await_response_head_deadline(
+                deadline,
+                self.upstream_filter(session, &mut task, &mut state.sink, ctx),
+            )
+            .await;
+            if let Some(duration) = state.finish_head_deadline_wait(filtered)? {
                 trace!("delaying upstream response for {duration:?}");
-                time::sleep(duration).await;
+                let deadline = state.response_head_deadline();
+                let slept = await_response_head_deadline(deadline, async {
+                    time::sleep(duration).await;
+                    Ok(())
+                })
+                .await;
+                state.finish_head_deadline_wait(slept)?;
             }
 
             if protocol.validates_upgrade_after_upstream_filter() {
@@ -153,18 +242,32 @@ where
 
             terminal_event = state.terminal_body.claim_for(&task);
             if let Some(event) = terminal_event {
-                if let Some(duration) = self
-                    .terminal_upstream_body_filter(session, event, &mut state.sink, ctx)
-                    .await?
-                {
+                let deadline = state.response_head_deadline();
+                let filtered = await_response_head_deadline(
+                    deadline,
+                    self.terminal_upstream_body_filter(session, event, &mut state.sink, ctx),
+                )
+                .await;
+                if let Some(duration) = state.finish_head_deadline_wait(filtered)? {
                     trace!("delaying terminal upstream response for {duration:?}");
-                    time::sleep(duration).await;
+                    let deadline = state.response_head_deadline();
+                    let slept = await_response_head_deadline(deadline, async {
+                        time::sleep(duration).await;
+                        Ok(())
+                    })
+                    .await;
+                    state.finish_head_deadline_wait(slept)?;
                 }
             }
             if let HttpTask::Trailer(Some(trailers)) = &mut task {
-                self.inner
-                    .upstream_response_trailer_filter(session, trailers, ctx)
-                    .await?;
+                let deadline = state.response_head_deadline();
+                let filtered = await_response_head_deadline(
+                    deadline,
+                    self.inner
+                        .upstream_response_trailer_filter(session, trailers, ctx),
+                )
+                .await;
+                state.finish_head_deadline_wait(filtered)?;
             }
 
             if terminal_header {
@@ -257,9 +360,52 @@ where
                             state.range_body_filter.set(range_type);
                         }
                     }
-                    self.inner
-                        .response_filter(session, &mut header, ctx)
-                        .await?;
+                    let deadline = state.response_head_deadline();
+                    let filtered = await_response_head_deadline(
+                        deadline,
+                        self.inner.response_filter(session, &mut header, ctx),
+                    )
+                    .await;
+                    state.finish_head_deadline_wait(filtered)?;
+                }
+
+                let final_header = !header.status.is_informational()
+                    || header.status == http::StatusCode::SWITCHING_PROTOCOLS;
+                if final_header && state.head_barrier.is_awaiting_final_head() {
+                    let source = if from_cache {
+                        ResponseHeadSource::Cache
+                    } else {
+                        ResponseHeadSource::Origin
+                    };
+                    let plan = self
+                        .inner
+                        .response_head_commit_plan(session, source, &header, ctx)?;
+                    if matches!(&plan, ResponseHeadCommitPlan::Hold(_)) {
+                        let unsupported = from_cache
+                            || protocol == ResponseProtocol::Custom
+                            || serve_from_cache.is_on()
+                            || session.cache.enabled()
+                            || header.status == http::StatusCode::SWITCHING_PROTOCOLS
+                            || downstream_response_body_forbidden(session, &header)
+                            || session.req_header().method == http::Method::CONNECT
+                            || session.as_downstream().is_upgrade_req();
+                        if unsupported {
+                            return Error::e_explain(
+                                InternalError,
+                                "bounded response-head Hold is unsupported for cache, custom, upgrade, or tunnel responses",
+                            );
+                        }
+                    }
+                    state.head_barrier.select(plan)?;
+                    if state.head_barrier.is_holding() {
+                        if !state.sink.arm_response_head_release() {
+                            return Error::e_explain(
+                                InternalError,
+                                "response-head release latch was already armed",
+                            );
+                        }
+                        session.mark_response_head_attempt_selected();
+                    }
                 }
 
                 if protocol != ResponseProtocol::H1
@@ -271,17 +417,26 @@ where
                 }
 
                 if terminal_header {
-                    if let Some(duration) = self
-                        .terminal_upstream_body_filter(
+                    let deadline = state.response_head_deadline();
+                    let filtered = await_response_head_deadline(
+                        deadline,
+                        self.terminal_upstream_body_filter(
                             session,
                             UpstreamResponseBodyEvent::TerminalWithoutTrailers,
                             &mut state.sink,
                             ctx,
-                        )
-                        .await?
-                    {
+                        ),
+                    )
+                    .await;
+                    if let Some(duration) = state.finish_head_deadline_wait(filtered)? {
                         trace!("delaying terminal upstream response for {duration:?}");
-                        time::sleep(duration).await;
+                        let deadline = state.response_head_deadline();
+                        let slept = await_response_head_deadline(deadline, async {
+                            time::sleep(duration).await;
+                            Ok(())
+                        })
+                        .await;
+                        state.finish_head_deadline_wait(slept)?;
                     }
                     let mut cache_header =
                         cache_header.expect("terminal header must retain its cache representation");
@@ -374,21 +529,7 @@ where
             HttpTask::UpgradedBody(..) => {
                 panic!("Unexpected UpgradedBody task while proxy h2")
             }
-            HttpTask::Trailer(mut trailers) => {
-                let trailer_buffer = match trailers.as_mut() {
-                    Some(trailers) => {
-                        self.inner
-                            .response_trailer_filter(session, trailers, ctx)
-                            .await?
-                    }
-                    None => None,
-                };
-                if let Some(buffer) = trailer_buffer {
-                    HttpTask::Body(Some(buffer), true)
-                } else {
-                    HttpTask::Trailer(normalize_trailers(trailers))
-                }
-            }
+            HttpTask::Trailer(trailers) => HttpTask::Trailer(trailers),
             HttpTask::Done if from_cache => HttpTask::Body(None, true),
             task @ (HttpTask::Done | HttpTask::Failed(_)) => task,
         };
@@ -407,23 +548,91 @@ where
             drain_emitted_chunks(task, &mut state.sink, out_tasks);
         }
 
-        if terminal_header {
-            let downstream_body_forbidden = match &out_tasks[start] {
-                HttpTask::Header(header, _) => downstream_response_body_forbidden(session, header),
-                _ => unreachable!("terminal response must start with a header"),
+        let decision = state.sink.take_response_head_decision();
+        let release_requested = matches!(decision, Some(ResponseHeadDecision::Release));
+        let must_resolve = source_clean_terminal
+            || (state.head_barrier.is_holding()
+                && state.sink.is_terminated()
+                && !release_requested);
+        let barrier_output =
+            match decision {
+                Some(ResponseHeadDecision::Release) | None => state
+                    .head_barrier
+                    .capture_or_release(out_tasks, start, release_requested, must_resolve),
+                Some(ResponseHeadDecision::Replace(replacement)) => {
+                    state.upstream_reusable = false;
+                    state.head_barrier.replace(out_tasks, start, replacement)
+                }
+                Some(ResponseHeadDecision::Fail(error)) => {
+                    state.upstream_reusable = false;
+                    state.head_barrier.abort();
+                    out_tasks.truncate(start);
+                    Err(error)
+                }
             };
-            if !downstream_body_forbidden {
-                self.downstream_response_body_filter_tasks(session, &mut out_tasks[start..], ctx)
+        let barrier_output = match barrier_output {
+            Ok(output) => output,
+            Err(error) => {
+                state.sink.disarm_response_head_release();
+                return Err(error);
+            }
+        };
+        match barrier_output {
+            ResponseHeadBarrierOutput::PrepareFrom(start)
+            | ResponseHeadBarrierOutput::PrepareReplacementFrom(start) => {
+                let replacement = matches!(
+                    barrier_output,
+                    ResponseHeadBarrierOutput::PrepareReplacementFrom(_)
+                );
+                if terminal_header || replacement {
+                    let downstream_body_forbidden = match &out_tasks[start] {
+                        HttpTask::Header(header, _) => {
+                            downstream_response_body_forbidden(session, header)
+                        }
+                        _ => unreachable!("terminal response must start with a header"),
+                    };
+                    if !downstream_body_forbidden {
+                        self.downstream_response_filter_tasks_in_order(
+                            session,
+                            &mut out_tasks[start..],
+                            ctx,
+                        )
+                        .await?;
+                    }
+                    reconcile_terminal_response_tasks(out_tasks, start, downstream_body_forbidden)?;
+                    if replacement {
+                        state.suppress_downstream_body = true;
+                    }
+                } else if filter_downstream_body || terminal_event.is_some() {
+                    // A Release batch starts at the retained final head, so
+                    // this slice covers the complete ordered prefix. Body and
+                    // trailer hooks are interleaved by task order and each
+                    // downstream-only hook runs exactly once.
+                    self.downstream_response_filter_tasks_in_order(
+                        session,
+                        &mut out_tasks[start..],
+                        ctx,
+                    )
+                    .await?;
+                }
+                if let Some(header) = out_tasks[start..].iter().find_map(|task| match task {
+                    HttpTask::Header(header, _)
+                        if !header.status.is_informational()
+                            || header.status == http::StatusCode::SWITCHING_PROTOCOLS =>
+                    {
+                        Some(header.as_ref())
+                    }
+                    _ => None,
+                }) {
+                    self.inner.response_head_will_commit(session, header, ctx)?;
+                    session.mark_response_head_writer_handoff();
+                }
+                session
+                    .prepare_response_headers(&mut out_tasks[start..])
                     .await?;
             }
-            reconcile_terminal_response_tasks(out_tasks, start, downstream_body_forbidden)?;
-        } else if filter_downstream_body || terminal_event.is_some() {
-            self.downstream_response_body_filter_tasks(session, &mut out_tasks[start..], ctx)
-                .await?;
+            ResponseHeadBarrierOutput::Held => {}
         }
-        session
-            .prepare_response_headers(&mut out_tasks[start..])
-            .await?;
         Ok(())
     }
 }

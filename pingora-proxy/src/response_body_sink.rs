@@ -31,8 +31,9 @@
 //! per batch. Revisit this bound if a producer is ever scheduled independently
 //! or the channel gains another sender.
 
+use crate::ResponseHeadReplacement;
 use bytes::Bytes;
-use pingora_error::{Error, ErrorType::InternalError, Result};
+use pingora_error::{BError, Error, ErrorType::InternalError, Result};
 
 /// Maximum bytes a filter may emit through the sink within one pump batch.
 /// In-place growth of the current chunk is outside this limit.
@@ -49,6 +50,22 @@ pub struct ResponseBodySink {
     remaining: usize,
     remaining_chunks: usize,
     terminate: bool,
+    head_control: ResponseHeadControl,
+}
+
+#[derive(Debug)]
+enum ResponseHeadControl {
+    Disarmed,
+    Armed,
+    Release,
+    Replace(ResponseHeadReplacement),
+    Fail(BError),
+}
+
+pub(crate) enum ResponseHeadDecision {
+    Release,
+    Replace(ResponseHeadReplacement),
+    Fail(BError),
 }
 
 impl Default for ResponseBodySink {
@@ -64,7 +81,91 @@ impl ResponseBodySink {
             remaining: RESPONSE_BODY_EMIT_BUDGET,
             remaining_chunks: RESPONSE_BODY_EMIT_CHUNK_BUDGET,
             terminate: false,
+            head_control: ResponseHeadControl::Disarmed,
         }
+    }
+
+    /// Request release of a response head currently held by the bounded
+    /// response-head barrier.
+    ///
+    /// Returns `true` only for the first request while a head is armed. The
+    /// default Immediate path is disarmed and returns `false`. This signal is
+    /// intentionally independent of [`Self::terminate`]: releasing a head
+    /// permits normal streaming to continue.
+    pub fn release_response_head(&mut self) -> bool {
+        if matches!(self.head_control, ResponseHeadControl::Armed) {
+            self.head_control = ResponseHeadControl::Release;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether a bounded response head is currently awaiting or carrying a
+    /// callback-local decision.
+    pub fn response_head_is_held(&self) -> bool {
+        !matches!(self.head_control, ResponseHeadControl::Disarmed)
+    }
+
+    /// Replace the held origin prefix with one complete bounded response.
+    /// A pending Release may be upgraded within the same callback.
+    pub fn replace_response_head(&mut self, replacement: ResponseHeadReplacement) -> Result<()> {
+        if matches!(
+            self.head_control,
+            ResponseHeadControl::Armed | ResponseHeadControl::Release
+        ) {
+            self.head_control = ResponseHeadControl::Replace(replacement);
+            Ok(())
+        } else {
+            Error::e_explain(
+                InternalError,
+                "response head Replace requested without an undecided Hold",
+            )
+        }
+    }
+
+    /// Fail the held response before its original head reaches the writer.
+    /// A pending Release may be upgraded within the same callback.
+    pub fn fail_response_head(&mut self, error: BError) -> Result<()> {
+        if matches!(
+            self.head_control,
+            ResponseHeadControl::Armed | ResponseHeadControl::Release
+        ) {
+            self.head_control = ResponseHeadControl::Fail(error);
+            Ok(())
+        } else {
+            Error::e_explain(
+                InternalError,
+                "response head Fail requested without an undecided Hold",
+            )
+        }
+    }
+
+    pub(crate) fn arm_response_head_release(&mut self) -> bool {
+        if !matches!(self.head_control, ResponseHeadControl::Disarmed) {
+            return false;
+        }
+        self.head_control = ResponseHeadControl::Armed;
+        true
+    }
+
+    pub(crate) fn take_response_head_decision(&mut self) -> Option<ResponseHeadDecision> {
+        match std::mem::replace(&mut self.head_control, ResponseHeadControl::Disarmed) {
+            ResponseHeadControl::Disarmed => None,
+            ResponseHeadControl::Armed => {
+                self.head_control = ResponseHeadControl::Armed;
+                None
+            }
+            ResponseHeadControl::Release => Some(ResponseHeadDecision::Release),
+            ResponseHeadControl::Replace(replacement) => {
+                Some(ResponseHeadDecision::Replace(replacement))
+            }
+            ResponseHeadControl::Fail(error) => Some(ResponseHeadDecision::Fail(error)),
+        }
+    }
+
+    pub(crate) fn disarm_response_head_release(&mut self) {
+        self.head_control = ResponseHeadControl::Disarmed;
     }
 
     /// Queue an additional chunk to be written downstream after the current
@@ -184,6 +285,94 @@ mod tests {
             vec![Bytes::from_static(b"a"), Bytes::from_static(b"bc")]
         );
         assert!(sink.take_extra().is_empty(), "take must drain");
+    }
+
+    #[test]
+    fn head_release_is_disarmed_by_default() {
+        let mut sink = ResponseBodySink::new();
+        assert!(!sink.release_response_head());
+        assert!(sink.take_response_head_decision().is_none());
+    }
+
+    #[test]
+    fn armed_head_release_latches_once() {
+        let mut sink = ResponseBodySink::new();
+        assert!(sink.arm_response_head_release());
+        assert!(sink.release_response_head());
+        assert!(!sink.release_response_head());
+        assert!(matches!(
+            sink.take_response_head_decision(),
+            Some(ResponseHeadDecision::Release)
+        ));
+        assert!(!sink.release_response_head());
+        assert!(sink.take_response_head_decision().is_none());
+    }
+
+    #[test]
+    fn reset_batch_preserves_head_release_state() {
+        let mut armed = ResponseBodySink::new();
+        assert!(armed.arm_response_head_release());
+        armed.reset_batch();
+        assert!(armed.release_response_head());
+
+        let mut requested = ResponseBodySink::new();
+        assert!(requested.arm_response_head_release());
+        assert!(requested.release_response_head());
+        requested.reset_batch();
+        assert!(matches!(
+            requested.take_response_head_decision(),
+            Some(ResponseHeadDecision::Release)
+        ));
+    }
+
+    #[test]
+    fn disarm_prevents_late_release() {
+        let mut sink = ResponseBodySink::new();
+        assert!(sink.arm_response_head_release());
+        sink.disarm_response_head_release();
+        assert!(!sink.release_response_head());
+    }
+
+    #[test]
+    fn release_can_be_upgraded_to_replace_or_fail() {
+        let mut replace = ResponseBodySink::new();
+        assert!(replace.arm_response_head_release());
+        assert!(replace.release_response_head());
+        replace
+            .replace_response_head(ResponseHeadReplacement::new(
+                Box::new(pingora_http::ResponseHeader::build(403, None).unwrap()),
+                vec![Bytes::from_static(b"blocked")],
+            ))
+            .unwrap();
+        assert!(matches!(
+            replace.take_response_head_decision(),
+            Some(ResponseHeadDecision::Replace(_))
+        ));
+
+        let mut fail = ResponseBodySink::new();
+        assert!(fail.arm_response_head_release());
+        assert!(fail.release_response_head());
+        fail.fail_response_head(Error::explain(InternalError, "decision failure"))
+            .unwrap();
+        assert!(matches!(
+            fail.take_response_head_decision(),
+            Some(ResponseHeadDecision::Fail(error)) if error.to_string().contains("decision failure")
+        ));
+    }
+
+    #[test]
+    fn conflicting_terminal_head_decisions_fail_closed() {
+        let mut sink = ResponseBodySink::new();
+        assert!(sink.arm_response_head_release());
+        sink.replace_response_head(ResponseHeadReplacement::new(
+            Box::new(pingora_http::ResponseHeader::build(403, None).unwrap()),
+            Vec::new(),
+        ))
+        .unwrap();
+        assert!(sink
+            .fail_response_head(Error::explain(InternalError, "late fail"))
+            .is_err());
+        assert!(sink.response_head_is_held());
     }
 
     #[test]

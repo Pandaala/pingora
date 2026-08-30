@@ -31,6 +31,10 @@ implementation.
 
 The cross-cutting composition and ownership of request and response body
 features is canonicalized in [the body relay architecture](architecture/body-relay.md).
+The bounded response-head commit barrier is still an uncommitted Phase 4
+implementation and is therefore not yet part of this current feature inventory;
+its accepted contract and live progress are tracked in
+[the Phase 4 pending record](pending-issues/response-head-commit-barrier.md).
 
 ## Cross-feature invariants
 

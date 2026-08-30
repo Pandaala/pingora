@@ -496,7 +496,12 @@ where
         let mut tasks = tasks.into_iter();
         for mut t in tasks.by_ref() {
             let task_source_done = t.is_end();
-            if self.revalidate_or_stale(session, &mut t, ctx).await {
+            let revalidated = pipeline
+                .wait_with_response_head_deadline(async {
+                    Ok(self.revalidate_or_stale(session, &mut t, ctx).await)
+                })
+                .await?;
+            if revalidated {
                 serve_from_cache.enable();
                 response_state.enable_cached_response();
                 // skip downstream filtering entirely as the 304 will not be sent
@@ -504,12 +509,19 @@ where
             }
             #[cfg(feature = "upstream_modules")]
             if let HttpTask::Header(header, end_of_stream) = &t {
-                self.inner
-                    .adjust_upstream_modules(session, header, *end_of_stream, ctx)
+                pipeline
+                    .wait_with_response_head_deadline(self.inner.adjust_upstream_modules(
+                        session,
+                        header,
+                        *end_of_stream,
+                        ctx,
+                    ))
                     .await?;
             }
             #[cfg(feature = "upstream_modules")]
-            session.upstream_modules_filter_task(&mut t).await?;
+            pipeline
+                .wait_with_response_head_deadline(session.upstream_modules_filter_task(&mut t))
+                .await?;
             let compression_prefix = session
                 .upstream_compression
                 .response_filter_with_preceding(&mut t);
@@ -570,7 +582,9 @@ where
             return Ok(None);
         }
 
-        session.write_response_tasks(filtered_tasks).await?;
+        if !filtered_tasks.is_empty() {
+            session.write_response_tasks(filtered_tasks).await?;
+        }
 
         Ok(Some((
             source_done,
@@ -732,6 +746,10 @@ where
                 .as_mut()
                 .map(|reader| reader.next())
                 .into();
+            let response_head_timeout: OptionFuture<_> = response_pipeline
+                .response_head_deadline()
+                .map(tokio::time::sleep_until)
+                .into();
 
             // partial read support, this check will also be false if cache is disabled.
             let support_cache_partial_read =
@@ -739,6 +757,10 @@ where
             let upgraded = session.was_upgraded();
 
             tokio::select! {
+                Some(()) = response_head_timeout => {
+                    return Err(response_pipeline.fail_response_head_timeout());
+                },
+
                 // only try to send to pipe if there is capacity to avoid deadlock
                 // Otherwise deadlock could happen if both upstream and downstream are blocked
                 // on sending to their corresponding pipes which are both full.
