@@ -17,6 +17,10 @@ The `status` inside each record is authoritative.
 
 - [Known upstream limitations](upstream-limitations.md): `h2` trailer gap,
   retained guards, and adoption triggers.
+- [Incomplete subrequest saved-body replay](subrequest/incomplete-saved-body-replay.md):
+  upstream's alpha `SavedBody -> InputBody` conversion erases capture state;
+  the fork does not locally replace the public API and Edgion has no current
+  pipe consumer.
 - [H2 CI enforcement](h2-grpc/h2-ci-contract-enforcement-out-of-scope.md)
   (`wont-fix` in the originating workflow): CI is a separate fork task and a
   blanket ban on ignored H2 tests is invalid.
@@ -93,6 +97,9 @@ The `status` inside each record is authoritative.
 
 ## Open review findings
 
+- [Body relay architecture assessment](body-relay-architecture-assessment.md):
+  adopt a thin semantic station with separate request/response lanes; keep
+  protocol pumps, entity-cache policy, and Edgion storage/AI policy outside it.
 - [2026-08-28 fork feature and malformed-input audit](fork-feature-malformed-input-audit-2026-08-28.md),
   including the discovery provenance for the resolved custom-upstream
   abandonment and idle-watch corrections.

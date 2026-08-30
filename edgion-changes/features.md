@@ -34,8 +34,12 @@ implementation.
 1. A downstream request-body terminal event is delivered at most once as
    `Complete` or `Abandoned`; H1, H2, and custom upstream pumps all stop an
    unfinished upload with `Abandoned` after the response completes.
-2. Partial, cancelled, drained, or poisoned capture is never replayed as a
-   complete request body.
+2. A fork-owned `RequestBodyBuffer` capture that is partial, cancelled,
+   drained, or poisoned is never replayed as a complete request body. This
+   guarantee does not cover upstream's alpha subrequest `SavedBody` API: its
+   infallible conversion to `InputBody` erases incomplete/truncated state, so
+   chained consumers must reject incomplete capture before conversion. See the
+   [upstream limitation](review/subrequest/incomplete-saved-body-replay.md).
 3. A normal response gets exactly one typed terminal event across Header-EOS,
    Body-EOS, Trailer, and Done; a real trailer receives
    `TerminalBeforeTrailers`, while an abort gets no synthetic clean terminal.

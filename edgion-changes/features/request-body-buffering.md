@@ -22,6 +22,14 @@ The buffer is rejected after body consumption starts, for upgrade/CONNECT
 shapes that change body semantics, or when Pingora's native retry buffer is
 already active.
 
+This contract is specific to the fork-owned `RequestBodyBuffer` seam. It does
+not apply to upstream's alpha `pingora_proxy::subrequest::pipe::SavedBody`,
+whose infallible conversion to `InputBody` does not preserve whether capture
+was complete or truncated. A chained subrequest consumer must check
+`SavedBody::is_body_complete()` before that conversion, or avoid saved-body
+replay. See the
+[recorded upstream limitation](../review/subrequest/incomplete-saved-body-replay.md).
+
 ## Safety rules
 
 - Cancellation during capture poisons the capture. The consumed transport
