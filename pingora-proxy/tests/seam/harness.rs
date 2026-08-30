@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use h2::Reason;
 use http::Response;
+use log::error;
 use once_cell::sync::Lazy;
 use pingora_cache::lock::{CacheKeyLockImpl, CacheLock};
 use pingora_cache::{CacheKey, MemCache};
@@ -19,9 +20,9 @@ use pingora_core::server::configuration::ServerConf;
 use pingora_core::server::Server;
 use pingora_core::services::ServiceWithDependents;
 use pingora_core::upstreams::peer::HttpPeer;
-use pingora_error::Result;
+use pingora_error::{Error, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
-use pingora_proxy::{ProxyHttp, RequestBodyEvent, Session};
+use pingora_proxy::{FailToProxy, ProxyHttp, RequestBodyEvent, Session};
 use std::any::Any;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -303,6 +304,23 @@ pub struct SeamCtx {
 
 pub struct SeamProxy {}
 
+/// Build the ordinary H1 peer shared by the seam proxy variants. Keeping the
+/// test-only `x-port` routing in one place lets narrow proxy implementations
+/// exercise isolated hooks without copying the main proxy's H2 policy.
+fn h1_peer_from_request(session: &Session) -> Box<HttpPeer> {
+    let port = session
+        .req_header()
+        .headers
+        .get("x-port")
+        .and_then(|v| v.to_str().ok())
+        .expect("tests must set x-port");
+    Box::new(HttpPeer::new(
+        format!("127.0.0.1:{port}"),
+        false,
+        "".to_string(),
+    ))
+}
+
 #[async_trait]
 impl ProxyHttp for SeamProxy {
     type CTX = SeamCtx;
@@ -321,6 +339,55 @@ impl ProxyHttp for SeamProxy {
     fn init_downstream_modules(&self, modules: &mut HttpModules) {
         modules.add_module(ResponseCompressionBuilder::enable(0));
         modules.add_module(Box::new(BodyEventProbeBuilder));
+    }
+
+    fn persist_connection_context(
+        &self,
+        session: &Session,
+        _ctx: &Self::CTX,
+    ) -> Option<Box<dyn Any + Send + Sync>> {
+        // Only the dedicated admission-order test opts into persistence. This
+        // keeps its adversarial reuse hook from changing the lifecycle of the
+        // rest of the process-wide seam proxy.
+        session
+            .req_header()
+            .headers
+            .contains_key("x-persist-connection-context")
+            .then(|| Box::new(()) as Box<dyn Any + Send + Sync>)
+    }
+
+    fn on_connection_reuse(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX,
+        _prev_ctx: Box<dyn Any + Send + Sync>,
+    ) {
+        if let Some(port) = session
+            .req_header()
+            .headers
+            .get("x-rewrite-upstream-port-on-reuse")
+            .cloned()
+        {
+            // Positive control for the fixture itself: redirecting `x-port`
+            // to a test-owned origin is locally observable and proves that a
+            // persisted context was restored and this hook really ran.
+            session
+                .req_header_mut()
+                .insert_header("x-port", port)
+                .expect("the test-supplied upstream port must be a valid header value");
+        }
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-remove-transfer-encoding-on-reuse")
+        {
+            // Deliberately model a buggy or policy-driven application hook.
+            // Proxy admission must inspect the external field before this
+            // mutable hook can hide it.
+            session
+                .req_header_mut()
+                .remove_header(&http::header::TRANSFER_ENCODING);
+        }
     }
 
     /// Only bookkeeping: record that the proxy ADMITTED a request carrying an
@@ -345,18 +412,7 @@ impl ProxyHttp for SeamProxy {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let port = session
-            .req_header()
-            .headers
-            .get("x-port")
-            .and_then(|v| v.to_str().ok())
-            .expect("tests must set x-port")
-            .to_string();
-        let mut peer = Box::new(HttpPeer::new(
-            format!("127.0.0.1:{port}"),
-            false,
-            "".to_string(),
-        ));
+        let mut peer = h1_peer_from_request(session);
         if session.req_header().headers.get("x-h2").is_some() {
             // default is 1, 1
             peer.options.set_http_version(2, 2);
@@ -634,18 +690,7 @@ impl ProxyHttp for LegacyHookProxy {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let port = session
-            .req_header()
-            .headers
-            .get("x-port")
-            .and_then(|v| v.to_str().ok())
-            .expect("tests must set x-port")
-            .to_string();
-        Ok(Box::new(HttpPeer::new(
-            format!("127.0.0.1:{port}"),
-            false,
-            "".to_string(),
-        )))
+        Ok(h1_peer_from_request(session))
     }
 
     /// The legacy hook. Nothing in this impl mentions
@@ -675,7 +720,58 @@ impl ProxyHttp for LegacyHookProxy {
     }
 }
 
-/// The three proxy listeners this file drives, on EPHEMERAL ports.
+/// Isolated adversarial application for the H1 transfer-coding rejection.
+///
+/// Its renderer and logger deliberately reopen the downstream connection, so
+/// the proxy's force-close policy has to override both hooks. Keeping this on a
+/// dedicated listener means the process-wide [`SeamProxy`] retains the real
+/// default `fail_to_proxy` contract used by every unrelated seam scenario.
+pub struct ReopeningErrorProxy {}
+
+#[async_trait]
+impl ProxyHttp for ReopeningErrorProxy {
+    type CTX = ();
+
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn upstream_peer(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        Ok(h1_peer_from_request(session))
+    }
+
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &Error,
+        _ctx: &mut Self::CTX,
+    ) -> FailToProxy {
+        let code = match e.etype() {
+            ErrorType::HTTPStatus(code) => *code,
+            _ => 500,
+        };
+        session.respond_error(code).await.unwrap_or_else(|e| {
+            error!("failed to send adversarial error response to downstream: {e}");
+        });
+
+        // Deliberately undo admission's initial keepalive disable and claim
+        // reuse is safe. The proxy-owned force-close decision must win.
+        session.set_keepalive(Some(60));
+        FailToProxy {
+            error_code: code,
+            can_reuse_downstream: true,
+        }
+    }
+
+    async fn logging(&self, session: &mut Session, _e: Option<&Error>, _ctx: &mut Self::CTX) {
+        // This runs after `fail_to_proxy` and reopens keepalive a second time.
+        session.set_keepalive(Some(60));
+    }
+}
+
+/// The proxy listeners this file drives, on EPHEMERAL ports.
 ///
 /// Fixed ports are not merely inconvenient here, they are unsound: two
 /// concurrent runs of this binary (two checkouts, a `cargo test` racing a
@@ -690,6 +786,8 @@ pub struct SeamPorts {
     h2c: u16,
     /// HTTP/1.1 downstream in front of [`LegacyHookProxy`].
     legacy: u16,
+    /// HTTP/1.1 downstream in front of [`ReopeningErrorProxy`].
+    reopening_error: u16,
 }
 
 impl SeamPorts {
@@ -701,6 +799,9 @@ impl SeamPorts {
     }
     pub fn legacy_addr(&self) -> String {
         format!("127.0.0.1:{}", self.legacy)
+    }
+    pub fn reopening_error_addr(&self) -> String {
+        format!("127.0.0.1:{}", self.reopening_error)
     }
 }
 
@@ -736,9 +837,20 @@ fn start_seam_server() -> SeamPorts {
         h1: reserve_port(),
         h2c: reserve_port(),
         legacy: reserve_port(),
+        reopening_error: reserve_port(),
     };
-    let (h1_addr, h2c_addr, legacy_addr) = (ports.h1_addr(), ports.h2c_addr(), ports.legacy_addr());
-    let addrs = [h1_addr.clone(), h2c_addr.clone(), legacy_addr.clone()];
+    let (h1_addr, h2c_addr, legacy_addr, reopening_error_addr) = (
+        ports.h1_addr(),
+        ports.h2c_addr(),
+        ports.legacy_addr(),
+        ports.reopening_error_addr(),
+    );
+    let addrs = [
+        h1_addr.clone(),
+        h2c_addr.clone(),
+        legacy_addr.clone(),
+        reopening_error_addr.clone(),
+    ];
 
     thread::spawn(move || {
         let conf = Arc::new(ServerConf {
@@ -779,8 +891,15 @@ fn start_seam_server() -> SeamPorts {
         let mut legacy = pingora_proxy::http_proxy_service(&conf, LegacyHookProxy {});
         legacy.add_tcp(&legacy_addr);
 
-        let services: Vec<Box<dyn ServiceWithDependents>> =
-            vec![Box::new(h1), Box::new(h2c), Box::new(legacy)];
+        let mut reopening_error = pingora_proxy::http_proxy_service(&conf, ReopeningErrorProxy {});
+        reopening_error.add_tcp(&reopening_error_addr);
+
+        let services: Vec<Box<dyn ServiceWithDependents>> = vec![
+            Box::new(h1),
+            Box::new(h2c),
+            Box::new(legacy),
+            Box::new(reopening_error),
+        ];
         server.add_services(services);
         server.run_forever();
     });

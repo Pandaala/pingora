@@ -49,9 +49,10 @@ fn apply_upstream_body_disposition(
 
 /// Build the `Transfer-Encoding` value for a `Streamed` upstream request.
 ///
-/// Any content coding the client applied (`Transfer-Encoding: gzip, chunked`)
-/// still describes the bytes the proxy is about to forward, so dropping it
-/// while keeping the coded bytes would corrupt the message. Only the
+/// External HTTP/1 requests with transfer codings before `chunked` are rejected
+/// at proxy admission. Non-`chunked` values can still be present here when an
+/// application synthesized them in `upstream_request_filter`; those values
+/// describe the bytes supplied by that application and are preserved. Only the
 /// `chunked` token is re-derived: it is re-appended last, as RFC 9112 §6.1
 /// requires.
 fn streamed_transfer_encoding<'a>(

@@ -63,6 +63,17 @@ by `h2`, and do not use wire-level END_STREAM alone as proof for cache
 admission. See
 [`review/upstream-limitations.md`](edgion-changes/review/upstream-limitations.md).
 
+## HTTP/1 request transfer coding
+
+Pre-admission handling first rejects HTTP/1.0 transfer coding, a missing or
+non-`chunked` final coding token, and disabled CONNECT.
+Of the external H1 requests that reach `HttpProxy`, only an
+absent `Transfer-Encoding` or one trimmed, case-insensitive `chunked` field is
+forwardable; any other form enters the 501 error-rendering path and is forced
+non-reusable before filters, cache, or upstream selection. See the status-code
+and custom-renderer details in
+[`request-body-transport.md`](edgion-changes/features/request-body-transport.md#http1-transfer-coding-admission).
+
 ## Cross-repository review
 
 Review with `../Edgion` whenever a change touches a public hook, `Session` API,

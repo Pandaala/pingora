@@ -7,14 +7,301 @@
 //! [`super::scenarios`] instead.
 
 use super::harness::*;
+use super::{Combo, Down, Step, Up};
 use bytes::Bytes;
 use pingora_proxy::RequestBodyEvent;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Notify;
+
+fn unsupported_h1_transfer_coding_fails_closed(up: Up) {
+    let ports = init();
+    let upstream = match up {
+        Up::H1 => spawn_scripted_upstream(vec![UpstreamStep::Respond(OK_KEEPALIVE)]),
+        Up::H2 => spawn_scripted_h2_upstream(vec![H2UpstreamStep::Ok200]),
+    };
+    upstream.expect_unused();
+    let (port, rec) = (upstream.port(), upstream.rec().clone());
+    let h2 = if up == Up::H2 { "x-h2: 1\r\n" } else { "" };
+
+    // A real gzip member containing `hello`. The H1 decoder removes only the
+    // surrounding chunk framing; it deliberately does not decode these bytes.
+    const GZIP_HELLO: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xcb, 0x48, 0xcd, 0xc9, 0xc9,
+        0x07, 0x00, 0x86, 0xa6, 0x10, 0x36, 0x05, 0x00, 0x00, 0x00,
+    ];
+
+    RT.block_on(async {
+        let mut request = format!(
+            "POST /invalid HTTP/1.1\r\nHost: t\r\nx-port: {port}\r\n{h2}\
+             Connection: Transfer-Encoding\r\n\
+             Transfer-Encoding: gzip, chunked\r\n\r\n\
+             {:x}\r\n",
+            GZIP_HELLO.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(GZIP_HELLO);
+        request.extend_from_slice(
+            format!(
+                "\r\n0\r\n\r\nGET /must-not-run HTTP/1.1\r\nHost: t\r\nx-port: {port}\r\n{h2}\r\n"
+            )
+            .as_bytes(),
+        );
+
+        let (mut stream, mut response) =
+            raw_h1_roundtrip(&ports.h1_addr(), &request, b"HTTP/1.1 501").await;
+        let mut tail = Vec::new();
+        match tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut tail)).await {
+            Ok(Ok(_)) | Ok(Err(_)) => {} // FIN and RST both prove the connection is not reusable.
+            Err(_) => panic!("the rejected H1 connection must close promptly"),
+        }
+        response.extend_from_slice(&tail);
+        let text = String::from_utf8_lossy(&response);
+        assert!(
+            text.starts_with("HTTP/1.1 501"),
+            "the unsupported transfer coding must receive 501: {text}"
+        );
+        assert!(
+            !text.contains("HTTP/1.1 200"),
+            "the pipelined follow-up must not be served: {text}"
+        );
+
+        expect_ok(
+            rec.expect_none(
+                "an unsupported transfer-coded request or its pipelined follow-up reaching the origin",
+                Duration::from_millis(300),
+                |event| matches!(event, UpEvent::ConnAccepted { .. }),
+            )
+            .await,
+        );
+    });
+
+    assert_eq!(
+        rec.connections(),
+        0,
+        "fail-close must happen before selecting or connecting to the origin:\n{}",
+        rec.dump()
+    );
+}
+
+#[test]
+fn unsupported_h1_transfer_coding_skips_h1_origin_and_closes_downstream() {
+    unsupported_h1_transfer_coding_fails_closed(Up::H1);
+}
+
+#[test]
+fn unsupported_h1_transfer_coding_skips_h2_origin_and_closes_downstream() {
+    unsupported_h1_transfer_coding_fails_closed(Up::H2);
+}
+
+#[test]
+fn custom_error_renderer_cannot_reenable_rejected_h1_connection() {
+    let ports = init();
+    let upstream = spawn_scripted_upstream(vec![UpstreamStep::Respond(OK_KEEPALIVE)]);
+    upstream.expect_unused();
+    let (port, rec) = (upstream.port(), upstream.rec().clone());
+
+    RT.block_on(async {
+        let request = format!(
+            "POST /invalid HTTP/1.1\r\nHost: t\r\nx-port: {port}\r\n\
+             Transfer-Encoding: gzip, chunked\r\n\r\n\
+             5\r\ncoded\r\n0\r\n\r\n"
+        );
+        let mut stream = TcpStream::connect(ports.reopening_error_addr())
+            .await
+            .unwrap();
+        let mut pending = Vec::new();
+        let response = h1_request_response(&mut stream, &mut pending, &request).await;
+        assert!(response.starts_with("HTTP/1.1 501"), "{response}");
+        assert!(
+            pending.is_empty(),
+            "the complete 501 reader left unexpected surplus bytes: {:?}",
+            String::from_utf8_lossy(&pending)
+        );
+
+        // This is deliberately sequential, not pipelined: the first request
+        // body and complete 501 have crossed the socket before the follow-up is
+        // written. Without the proxy's force-close decision, default H1
+        // pipelining rejection cannot mask reuse and this request reaches the
+        // test-owned origin.
+        let follow_up =
+            format!("GET /must-not-run HTTP/1.1\r\nHost: t\r\nx-port: {port}\r\n\r\n");
+        if stream.write_all(follow_up.as_bytes()).await.is_ok() {
+            let mut byte = [0u8; 1];
+            match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut byte)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => {}
+                Ok(Ok(_)) => panic!(
+                    "the renderer/logger reopened the rejected connection; follow-up response began with {:?}",
+                    &byte
+                ),
+                Err(_) => panic!("the custom-rendered rejection did not close promptly"),
+            }
+        }
+
+        expect_ok(
+            rec.expect_none(
+                "a sequential request reaching the origin after its renderer/logger forced reuse",
+                Duration::from_millis(300),
+                |event| matches!(event, UpEvent::ConnAccepted { .. }),
+            )
+            .await,
+        );
+    });
+
+    assert_eq!(
+        rec.connections(),
+        0,
+        "a custom renderer must not bypass forced close:\n{}",
+        rec.dump()
+    );
+}
+
+#[test]
+fn reused_connection_hook_cannot_hide_unsupported_h1_transfer_coding() {
+    let ports = init();
+    let first = spawn_scripted_upstream(vec![UpstreamStep::Respond(OK_KEEPALIVE)]);
+    let positive = spawn_scripted_upstream(vec![UpstreamStep::Respond(OK_KEEPALIVE)]);
+    let positive_decoy = spawn_scripted_upstream(vec![UpstreamStep::Respond(OK_KEEPALIVE)]);
+    positive_decoy.expect_unused();
+    let rejected = spawn_scripted_upstream(vec![UpstreamStep::Respond(OK_KEEPALIVE)]);
+    rejected.expect_unused();
+    let (first_port, positive_port, positive_decoy_port, rejected_port, rejected_rec) = (
+        first.port(),
+        positive.port(),
+        positive_decoy.port(),
+        rejected.port(),
+        rejected.rec().clone(),
+    );
+
+    RT.block_on(async {
+        let mut stream = TcpStream::connect(ports.h1_addr()).await.unwrap();
+        let mut pending = Vec::new();
+        let first_response = h1_request_response(
+            &mut stream,
+            &mut pending,
+            &format!(
+                "GET /first HTTP/1.1\r\nHost: t\r\nx-port: {first_port}\r\n\
+                 x-persist-connection-context: 1\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            first_response.starts_with("HTTP/1.1 200"),
+            "the first request must establish reusable connection context: {first_response}"
+        );
+
+        let positive_response = h1_request_response(
+            &mut stream,
+            &mut pending,
+            &format!(
+                "GET /reuse-hook-positive-control HTTP/1.1\r\nHost: t\r\n\
+                 x-port: {positive_decoy_port}\r\n\
+                 x-rewrite-upstream-port-on-reuse: {positive_port}\r\n\
+                 x-persist-connection-context: 1\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            positive_response.starts_with("HTTP/1.1 200"),
+            "the reuse-hook positive control must be served: {positive_response}"
+        );
+
+        let second_response = h1_request_response(
+            &mut stream,
+            &mut pending,
+            &format!(
+                "POST /invalid HTTP/1.1\r\nHost: t\r\nx-port: {rejected_port}\r\n\
+                 x-remove-transfer-encoding-on-reuse: 1\r\n\
+                 Transfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            second_response.starts_with("HTTP/1.1 501"),
+            "admission must run before the mutable connection-reuse hook: {second_response}"
+        );
+
+        let mut byte = [0u8; 1];
+        match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut byte)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            Ok(Ok(_)) => panic!("the rejected reused connection remained readable"),
+            Err(_) => panic!("the rejected reused connection did not close promptly"),
+        }
+
+        expect_ok(
+            rejected_rec
+                .expect_none(
+                    "a request whose transfer coding a reuse hook tried to hide reaching the origin",
+                    Duration::from_millis(300),
+                    |event| matches!(event, UpEvent::ConnAccepted { .. }),
+                )
+                .await,
+        );
+    });
+
+    assert_eq!(first.rec().connections(), 1, "{}", first.rec().dump());
+    assert_eq!(
+        positive.rec().connections(),
+        1,
+        "the persisted context must restore and run the reuse hook, which rewrites x-port:\n{}",
+        positive.rec().dump()
+    );
+    assert_eq!(
+        positive_decoy.rec().connections(),
+        0,
+        "without the reuse-hook rewrite the request would have reached this decoy:\n{}",
+        positive_decoy.rec().dump()
+    );
+    assert_eq!(
+        rejected_rec.connections(),
+        0,
+        "the reuse hook must not bypass admission:\n{}",
+        rejected_rec.dump()
+    );
+}
+
+fn plain_chunked_h1_request_remains_forwardable(up: Up) {
+    let combo = Combo { down: Down::H1, up };
+    let (port, rec, _upstream) = combo.spawn(&[Step::DrainThenOk200]);
+    let h2 = if up == Up::H2 { "x-h2: 1\r\n" } else { "" };
+
+    RT.block_on(async {
+        let request = format!(
+            "POST /valid HTTP/1.1\r\nHost: t\r\nx-port: {port}\r\n{h2}\
+             Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+        );
+        let (_stream, response) =
+            raw_h1_roundtrip(&combo.down_addr(), request.as_bytes(), b"HTTP/1.1 200").await;
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+    });
+
+    assert_eq!(rec.connections(), 1, "{}", rec.dump());
+    assert_eq!(
+        rec.count(|event| matches!(event, UpEvent::ReqHeaders { .. })),
+        1,
+        "{}",
+        rec.dump()
+    );
+    assert_eq!(
+        rec.body_bytes(),
+        5,
+        "a legal chunked request body must arrive intact:\n{}",
+        rec.dump()
+    );
+}
+
+#[test]
+fn plain_chunked_h1_request_reaches_h1_origin() {
+    plain_chunked_h1_request_remains_forwardable(Up::H1);
+}
+
+#[test]
+fn plain_chunked_h1_request_reaches_h2_origin() {
+    plain_chunked_h1_request_remains_forwardable(Up::H2);
+}
 
 #[test]
 fn h2_error_no_retry_after_header_sent_on_reused_conn() {

@@ -34,6 +34,26 @@ pub(crate) const KEEP_ALIVE: &str = "keep-alive";
 pub(crate) const PROXY_CONNECTION: &str = "proxy-connection";
 pub(crate) const HTTP2_SETTINGS: &str = "http2-settings";
 
+/// Whether an externally received HTTP/1 request uses transfer coding the proxy can forward
+/// without changing the payload semantics.
+///
+/// Pingora's HTTP/1 body reader removes chunk framing, but it does not decode transfer codings
+/// that precede `chunked`. The proxy's normal hop-by-hop sanitization then removes the complete
+/// `Transfer-Encoding` field. Accepting anything other than one `chunked` field would therefore
+/// forward coded bytes under different metadata.
+pub(crate) fn h1_transfer_encoding_is_forwardable(req: &RequestHeader) -> bool {
+    let mut values = req.headers.get_all(header::TRANSFER_ENCODING).iter();
+    let Some(value) = values.next() else {
+        return true;
+    };
+
+    values.next().is_none()
+        && value
+            .as_bytes()
+            .trim_ascii()
+            .eq_ignore_ascii_case(b"chunked")
+}
+
 /// Whether `byte` is a `tchar`, the character set of an HTTP `token` (RFC 9110 §5.6.2). Checked
 /// here because `HeaderName::from_bytes` may accept bytes outside the `token` set.
 fn is_tchar(byte: u8) -> bool {

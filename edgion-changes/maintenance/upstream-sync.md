@@ -22,6 +22,10 @@ The expected shared-main conflict surface is intentionally concentrated:
 - `pingora-proxy/src/proxy_{h1,h2,custom}.rs`: preserve upstream batch helpers,
   pending-task backpressure, warning suppression and finish-hit guards while
   carrying Edgion filter state through them.
+- `pingora-proxy/src/lib.rs`: preserve H1 transfer-coding admission before
+  `on_connection_reuse` and all routing phases. Its forced-close policy must be
+  applied after every mutable error hook and must directly veto returning a
+  reusable downstream session; keepalive metadata alone is not that veto.
 - `pingora-proxy/src/proxy_common.rs`: upstream hop-by-hop sanitization and the
   Edgion event/disposition state machines are independent and both required.
 

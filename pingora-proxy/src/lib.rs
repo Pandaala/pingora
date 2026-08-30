@@ -1266,6 +1266,12 @@ static BAD_GATEWAY: Lazy<ResponseHeader> = Lazy::new(|| {
     resp
 });
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DownstreamErrorReuse {
+    ApplicationControlled,
+    ForceClose,
+}
+
 impl<SV, C> HttpProxy<SV, C>
 where
     C: custom::Connector,
@@ -1494,7 +1500,7 @@ where
 
     async fn handle_error(
         &self,
-        mut session: Session,
+        session: Session,
         ctx: &mut <SV as ProxyHttp>::CTX,
         e: Box<Error>,
         context: &str,
@@ -1503,7 +1509,36 @@ where
         SV: ProxyHttp + Send + Sync + 'static,
         <SV as ProxyHttp>::CTX: Send + Sync,
     {
+        self.handle_error_with_downstream_reuse(
+            session,
+            ctx,
+            e,
+            context,
+            DownstreamErrorReuse::ApplicationControlled,
+        )
+        .await
+    }
+
+    async fn handle_error_with_downstream_reuse(
+        &self,
+        mut session: Session,
+        ctx: &mut <SV as ProxyHttp>::CTX,
+        e: Box<Error>,
+        context: &str,
+        downstream_reuse: DownstreamErrorReuse,
+    ) -> Option<ReusedHttpStream>
+    where
+        SV: ProxyHttp + Send + Sync + 'static,
+        <SV as ProxyHttp>::CTX: Send + Sync,
+    {
+        let force_close_downstream = downstream_reuse == DownstreamErrorReuse::ForceClose;
         let res = self.inner.fail_to_proxy(&mut session, &e, ctx).await;
+        if force_close_downstream {
+            // Admission has already decided that unread request bytes make reuse unsafe. A custom
+            // error renderer has mutable Session access and may change keepalive while writing its
+            // response, so re-assert the transport boundary after the hook returns.
+            session.set_keepalive(None);
+        }
         if !self.inner.suppress_error_log(&session, ctx, &e) {
             error!(
                 "{context} {}, status: {}, {}",
@@ -1516,8 +1551,16 @@ where
         self.cleanup_sub_req(&mut session);
 
         session.downstream_session.on_proxy_failure(e);
+        if force_close_downstream {
+            // Keep this as the final mutable write before reuse is evaluated. In particular,
+            // `logging` also receives `&mut Session` and may have changed keepalive after the
+            // renderer-level re-assertion above.
+            session.set_keepalive(None);
+        }
 
-        if res.can_reuse_downstream {
+        let can_reuse_downstream = res.can_reuse_downstream
+            && downstream_reuse == DownstreamErrorReuse::ApplicationControlled;
+        if can_reuse_downstream {
             let mut persistent_settings = HttpPersistentSettings::for_session(&session);
             if let Some(uc) = self.inner.persist_connection_context(&session, ctx) {
                 persistent_settings.set_user_context(uc);
@@ -1713,6 +1756,31 @@ where
         }
 
         let mut ctx = self.inner.new_ctx();
+
+        if session.downstream_session.as_http1().is_some()
+            && !proxy_common::h1_transfer_encoding_is_forwardable(session.req_header())
+        {
+            // The request body has not been consumed. Close the H1 connection even when a custom
+            // `fail_to_proxy` implementation would otherwise allow reuse, so unread coded bytes
+            // can never be interpreted as another request. This must also precede
+            // `on_connection_reuse`, whose mutable Session access could otherwise rewrite the
+            // external header before admission validates it.
+            session.set_keepalive(None);
+            let e = Error::explain(
+                HTTPStatus(501),
+                "unsupported HTTP/1 request Transfer-Encoding",
+            )
+            .into_down();
+            return self
+                .handle_error_with_downstream_reuse(
+                    session,
+                    &mut ctx,
+                    e,
+                    "Fail closed on unsupported request transfer coding:",
+                    DownstreamErrorReuse::ForceClose,
+                )
+                .await;
+        }
 
         // Deliver user context from the previous request on this reused connection
         if let Some(prev_ctx) = prev_user_ctx {

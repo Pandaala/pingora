@@ -26,6 +26,11 @@ The `status` inside each record is authoritative.
 
 ## Implemented or resolved conclusions
 
+- [Unsupported H1 request transfer coding](http1/h1-unsupported-request-transfer-coding-fail-closed.md):
+  generic framing errors close before proxy admission; among core-accepted
+  requests, `HttpProxy` accepts only a single `chunked` field and submits every
+  other form as `HTTPStatus(501)` while independently denying downstream reuse
+  before request filters, cache, or upstream selection.
 - [Read terminal poisoning](h2-grpc/h2-end-stream-observer-read-terminal-poison.md)
   (H2-002): never scan error-returned bytes; poison partial EOF.
 - [Persistent GOAWAY ceiling](h2-grpc/h2-goaway-persistent-ceiling-fail-closed.md)

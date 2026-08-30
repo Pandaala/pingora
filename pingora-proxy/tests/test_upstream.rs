@@ -800,37 +800,6 @@ async fn test_h1_upstream_rejects_101_when_filter_adds_upgrade_without_downstrea
 }
 
 #[tokio::test]
-async fn test_h1_upstream_normalizes_transfer_coding_to_chunked_when_sanitizing() {
-    init();
-    let (port, received) = capture_upstream_request(
-        b"0\r\n\r\n",
-        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
-    )
-    .await;
-
-    let req = format!(
-        concat!(
-            "POST / HTTP/1.1\r\n",
-            "Host: example.test\r\n",
-            "X-Port: {port}\r\n",
-            "Connection: Transfer-Encoding\r\n",
-            "Transfer-Encoding: gzip, chunked\r\n",
-            "\r\n",
-            "5\r\ncoded\r\n0\r\n\r\n",
-        ),
-        port = port,
-    );
-
-    assert_eq!(send_raw_request_to_test_proxy(req).await.status, 200);
-    let upstream = String::from_utf8(received.await.unwrap()).unwrap();
-    let upstream_lower = upstream.to_ascii_lowercase();
-    assert!(!upstream_lower.contains("\r\nconnection:"));
-    assert!(upstream_lower.contains("\r\ntransfer-encoding: chunked\r\n"));
-    assert!(!upstream_lower.contains("\r\ntransfer-encoding: gzip, chunked\r\n"));
-    assert!(upstream.ends_with("\r\n\r\n5\r\ncoded\r\n0\r\n\r\n"));
-}
-
-#[tokio::test]
 async fn test_h1_upstream_synthesizes_chunked_after_filter_removes_framing() {
     init();
     let (port, received) = capture_upstream_request(

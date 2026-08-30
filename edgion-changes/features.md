@@ -24,7 +24,7 @@ implementation.
 | --- | --- | --- | --- |
 | Inbound PROXY protocol | Strict v1/v2 parsing before TLS, explicit transport trust, preserved raw peer | core listeners, L4 parser, digest | [proxy-protocol.md](features/proxy-protocol.md) |
 | Replayable request body | Capture once, fail closed on partial/cancelled capture, bounded replay chunks | core body buffer and H1/H2 server sessions | [request-body-buffering.md](features/request-body-buffering.md) |
-| Request-body transport controls | Consistent events, dispositions, termination, trailers, retry gates, cleanup | proxy trait/common and pumps | [request-body-transport.md](features/request-body-transport.md) |
+| Request-body transport controls | H1 transfer-coding admission, consistent events, dispositions, termination, trailers, retry gates, cleanup | proxy entry, trait/common and pumps | [request-body-transport.md](features/request-body-transport.md) |
 | Response-body streaming controls | Async filter/sink, allocation-free defaults, bounded emitted bytes and chunk count, typed termination, terminal dispatch, cache/live ordering | trait, shared pipeline, sink, pumps, cache | [response-body-streaming.md](features/response-body-streaming.md) |
 | Response trailer lifecycle | Typed pre-trailer boundary, awaited application hook, H1 parsing/writing, planned framing capability, HTTP/1.0 downgrade | core H1, proxy trait and pumps | [response-trailers.md](features/response-trailers.md) |
 | H2 END_STREAM evidence and upload liveness | Combine decoded state, EOF, content length, and qualified wire evidence; never trust wire flag alone; bound non-progressing request writes and release abandoned reservations | H2 watcher, client/connector, proxy H2 | [h2-end-stream.md](features/h2-end-stream.md) |
@@ -57,6 +57,13 @@ implementation.
    resets the stream rather than manufacturing clean completion. Every
    successful upload abandonment cancels its outstanding capacity request
    before response delivery continues.
+10. H1 transfer-coding failures are terminal before routing: the generic H1
+    layer closes framing-invalid requests, and proxy admission accepts only an
+    absent `Transfer-Encoding` or one trimmed, case-insensitive `chunked`
+    field among requests that reach `HttpProxy`. Every other core-accepted form
+    is submitted to the normal `HTTPStatus(501)` error-rendering path and is
+    independently denied downstream reuse before application filters, cache,
+    upstream selection, buffering, or retry can observe it.
 
 ## Ownership boundary
 

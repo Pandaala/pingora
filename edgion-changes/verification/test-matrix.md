@@ -40,8 +40,8 @@ Expected feature coverage:
 | `pingora-core --lib` | body buffers, H1/H2 sessions, END_STREAM watch, listener and PROXY parser |
 | `pingora-core --lib --features boringssl` | complete TLS-backed core suite, including deterministic direct/high-level local source-bind classification and timeout-context separation |
 | `pingora-core --lib --features boringssl test_listen_tls_proxy_protocol` | explicit PROXY-before-TLS rejection stages, successful handshake and address preservation |
-| `pingora-proxy --lib` | 125 passed plus 1 ignored manual benchmark: disposition truth-table, H2 write-floor and abandoned-reservation cleanup, terminal-latch, object-compatible response hooks, shared response-pipeline parity, sink-budget, EOS-migration and retry-guard tests |
-| `test_request_body_seam` | 54 H1/H2 request-pump, framing, retry and termination scenarios |
+| `pingora-proxy --lib` | 126 passed plus 1 ignored manual benchmark: H1 transfer-coding admission, disposition truth-table, H2 write-floor and abandoned-reservation cleanup, terminal-latch, object-compatible response hooks, shared response-pipeline parity, sink-budget, EOS-migration and retry-guard tests |
+| `test_request_body_seam` | 60 H1/H2 request-pump, framing, retry, transfer-coding admission and termination scenarios |
 | `test_upstream_response_body_sink` | 57 response streaming/cache/custom scenarios |
 | `test_terminal_body_dispatch` | 26 self-contained terminal/trailer scenarios |
 | `test_h2_upstream_no_error_reset` | 8 self-contained H2 reset/completion scenarios |
@@ -83,7 +83,8 @@ not raise this workspace's Rust 1.85 MSRV.
 
 ## Validation snapshot
 
-Validated on 2026-08-29 against the working tree based on `4dd9ce2`:
+Validated on 2026-08-30 against the H1 transfer-coding fail-close working tree
+based on `2fbd195`:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo check -p pingora-core -p pingora-proxy`: passed.
@@ -96,23 +97,46 @@ Validated on 2026-08-29 against the working tree based on `4dd9ce2`:
   ignored; Linux arm64 container 781 passed / 18 ignored. Both direct L4 and
   high-level source-bind tests assert `InternalError -> BindError ->
   AddrInUse`; the no-total-timeout test uses a local plaintext listener instead
-  of relying on TEST-NET routing.
+  of relying on TEST-NET routing. During the 2026-08-30 H1 admission rerun,
+  launching this target concurrently with the connection-filter suite produced
+  one `test_connect_uds` reuse-assertion failure; the complete boringssl target
+  then passed in a dedicated serial rerun. Feature variants should not be run
+  concurrently when they share process-external socket fixtures.
 - `cargo test -p pingora-core --lib --features boringssl test_listen_tls_proxy_protocol`:
   2 passed.
-- `cargo test -p pingora-proxy --lib`: 125 passed, 1 ignored manual response
+- `cargo test -p pingora-proxy --lib`: 126 passed, 1 ignored manual response
   pipeline benchmark.
-- `test_request_body_seam`: 54 passed.
+- `test_request_body_seam`: 60 passed, including rejected H1-to-H1/H2
+  transfer-coding cases, their plain-chunked controls, and the reused-connection
+  hook-ordering control plus the sequential same-socket renderer/logger
+  force-close regression.
 - `test_upstream_response_body_sink`: 57 passed.
 - `test_terminal_body_dispatch`: 26 passed.
 - `test_h2_upstream_no_error_reset`: 8 passed.
 - `test_h2_upstream_stalled_after_response`: 4 passed.
-- `test_h2_upstream_cache_and_reuse`: 8 passed. Requires the `127.0.0.2`
-  loopback alias described above.
+- `test_h2_upstream_cache_and_reuse`: 8 passed on the full rerun. Its existing
+  flow-control reuse case failed once during the first concurrent target run,
+  then passed both in isolation and in the complete target rerun. The host had
+  the required `127.0.0.2` loopback alias.
+- `cargo clippy -p pingora-proxy --all-targets`: completed with only pre-existing
+  warnings in `pingora-core::ServerSession`, `response_pipeline.rs`,
+  `proxy_h2.rs`, and `test_upstream_response_body_sink.rs`; no changed H1
+  admission or seam-test line produced a warning. Adding `--deny warnings` is
+  currently blocked first by the baseline `large_enum_variant` warning in
+  `pingora-core/src/protocols/http/server.rs`.
+- `(cd ../Edgion && cargo test -p edgion-gateway --lib
+  pg_early_request_filter::tests -- --nocapture)`: 4 passed, covering normal
+  HTTP/1.1, exact-chunked plus content length, HTTP/1.0 default/explicit
+  keepalive, and shutdown. `cargo check -p edgion-gateway --lib` also passed.
+  `cargo clippy -p edgion-gateway --lib` completed with the repository's
+  existing warning baseline and no warning in the changed early-filter file.
+  This Edgion build resolved Pingora revision `57f6183c` at version `0.8.1`;
+  Cargo warned that the sibling `0.8.0` path patch was unused, so the two
+  repositories' verification claims remain separate.
 
-The four preceding terminal/H2 standalone targets were run in the project's
-Linux arm64 builder container with the repository mounted read-only because
-the macOS host did not have that alias. Linux treats all of `127.0.0.0/8` as
-loopback, so the same checked-in `pingora_conf.yaml` ran unchanged.
+All standalone targets in this snapshot ran on the macOS host. Its loopback
+configuration already contained `127.0.0.2` through `127.0.0.7`; no network or
+system configuration was changed for the run.
 
 The 2026-08-29 private-test-module extraction preserved the complete unit-test
 lists byte-for-byte after sorting:

@@ -29,6 +29,45 @@ fn request_with_headers(headers: &[(&str, &str)]) -> RequestHeader {
 }
 
 #[test]
+fn h1_transfer_encoding_forwardability_is_exactly_one_chunked_field() {
+    for (headers, expected) in [
+        (vec![], true),
+        (vec![("Transfer-Encoding", "chunked")], true),
+        (vec![("Transfer-Encoding", "CHUNKED")], true),
+        (vec![("Transfer-Encoding", " \tchunked\t ")], true),
+        (vec![("Transfer-Encoding", "gzip, chunked")], false),
+        (vec![("Transfer-Encoding", "GZip , CHUNKED")], false),
+        (vec![("Transfer-Encoding", "\tgzip,\tchunked ")], false),
+        (vec![("Transfer-Encoding", "deflate, chunked")], false),
+        (vec![("Transfer-Encoding", "unknown, chunked")], false),
+        (vec![("Transfer-Encoding", "chunked, chunked")], false),
+        (vec![("Transfer-Encoding", "chunked,")], false),
+        (vec![("Transfer-Encoding", "")], false),
+        (
+            vec![
+                ("Transfer-Encoding", "gzip"),
+                ("Transfer-Encoding", "chunked"),
+            ],
+            false,
+        ),
+        (
+            vec![
+                ("Transfer-Encoding", "chunked"),
+                ("Transfer-Encoding", "chunked"),
+            ],
+            false,
+        ),
+    ] {
+        let request = request_with_headers(&headers);
+        assert_eq!(
+            h1_transfer_encoding_is_forwardable(&request),
+            expected,
+            "unexpected result for {headers:?}"
+        );
+    }
+}
+
+#[test]
 fn h2_upstream_removes_connection_nominated_fields_by_default() {
     let mut request = request_with_headers(&[
         ("Connection", "X-Private-Hop, HTTP2-Settings"),
