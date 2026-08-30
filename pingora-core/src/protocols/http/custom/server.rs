@@ -141,6 +141,13 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     fn enable_retry_buffering(&mut self);
 
+    /// Whether this custom downstream implements the native retry buffer
+    /// methods. The default is fail-closed so optional custom sessions never
+    /// reach placeholder implementations that panic.
+    fn retry_buffering_supported(&self) -> bool {
+        false
+    }
+
     fn retry_buffer_truncated(&self) -> bool;
 
     fn get_retry_buffer(&self) -> Option<Bytes>;
@@ -304,6 +311,10 @@ impl Session for () {
 
     fn enable_retry_buffering(&mut self) {
         unreachable!("server session: enable_retry_bufferings")
+    }
+
+    fn retry_buffering_supported(&self) -> bool {
+        false
     }
 
     fn retry_buffer_truncated(&self) -> bool {

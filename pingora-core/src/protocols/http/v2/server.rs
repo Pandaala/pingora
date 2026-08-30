@@ -370,6 +370,9 @@ pub struct HttpSession {
     // session and must fail closed instead of silently forwarding a bodyless
     // request.
     early_body_buffer_released: bool,
+    /// Prevent request-body source changes after the proxy freezes its
+    /// request-scoped relay plan.
+    request_body_configuration_frozen: bool,
     // Whether actual request trailer fields were received. Set once the
     // request body reader reaches EOF and its trailers are polled.
     request_trailers_present: bool,
@@ -638,6 +641,7 @@ impl HttpSession {
             early_body_capture_poisoned: false,
             early_body_buffer_discarded: false,
             early_body_buffer_released: false,
+            request_body_configuration_frozen: false,
             request_trailers_present: false,
             request_headers_end_stream,
             request_body_eof: request_headers_end_stream,
@@ -1377,6 +1381,12 @@ impl HttpSession {
     /// body has already started being read (would capture only the remainder) and
     /// for CONNECT requests, whose "body" is a bidirectional tunnel stream.
     pub fn set_request_body_buffer(&mut self, buffer: Box<dyn RequestBodyBuffer>) -> Result<()> {
+        if self.request_body_configuration_frozen {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                "request body configuration is frozen for upstream proxying",
+            );
+        }
         if self.early_body_buffer.is_some() {
             return Error::e_explain(
                 ErrorType::InternalError,
@@ -1426,6 +1436,12 @@ impl HttpSession {
         &mut self,
         buffer: Box<dyn RequestBodyBuffer>,
     ) -> Result<()> {
+        if self.request_body_configuration_frozen {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                "request body configuration is frozen for upstream proxying",
+            );
+        }
         if self.early_body_buffer.is_some() {
             return Error::e_explain(
                 ErrorType::InternalError,
@@ -1470,6 +1486,19 @@ impl HttpSession {
 
     pub fn request_body_buffer_registered(&self) -> bool {
         self.early_body_buffer.is_some()
+    }
+
+    pub(crate) fn freeze_request_body_configuration(&mut self) {
+        self.request_body_configuration_frozen = true;
+    }
+
+    pub(crate) fn request_body_buffer_replay_available(&self) -> bool {
+        self.early_body_buffer.as_ref().is_some_and(|buffer| {
+            !self.early_body_capture_poisoned
+                && !self.early_body_buffer_discarded
+                && !self.early_body_buffer_released
+                && (buffer.is_ready_or_replay_done() || buffer.is_replaying())
+        })
     }
 
     /// Whether a registered request body buffer is currently replaying, i.e.

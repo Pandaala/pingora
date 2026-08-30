@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::request_relay::{RequestRelayOutcome, RequestRelayProtocol};
 use crate::response_pipeline::{ResponsePipelineState, ResponseProtocol};
 use futures::StreamExt;
 use pingora_core::{
@@ -128,7 +129,7 @@ where
         // connector owns framing), so it cannot honor a non-ordinary
         // disposition. Fail closed instead of silently proxying with the
         // wrong contract -- same rationale as the terminate path below.
-        let body_disposition = self.inner.upstream_request_body_disposition(session, ctx);
+        let body_disposition = session.frozen_request_relay_plan().requested.disposition;
         if body_disposition != UpstreamRequestBodyDisposition::Ordinary {
             return (
                 false,
@@ -159,9 +160,7 @@ where
 
         let (tx, rx) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
 
-        if self.inner.request_retry_allowed(session, ctx) {
-            session.as_mut().enable_retry_buffering();
-        }
+        session.enable_request_relay_retry_buffer();
 
         // Custom message logic
 
@@ -497,7 +496,7 @@ where
         let mut poll_downstream_body_or_idle = true;
 
         // retry, send buffer if it exists
-        if let Some(buffer) = session.as_mut().get_retry_buffer() {
+        if let Some(buffer) = session.request_relay_retry_buffer() {
             self.send_body_to_custom(
                 session,
                 Some(buffer),
@@ -901,8 +900,8 @@ where
     async fn send_body_to_custom(
         &self,
         session: &mut Session,
-        mut data: Option<Bytes>,
-        mut event: RequestBodyEvent,
+        data: Option<Bytes>,
+        event: RequestBodyEvent,
         client_body: &mut Box<dyn BodyWrite>,
         ctx: &mut SV::CTX,
         request_body_error: &mut Option<Box<Error>>,
@@ -911,25 +910,24 @@ where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
-        // `data == None` IS the end of the downstream body, whatever the caller
-        // computed from `is_body_done()`. Mirrors `proxy_h1::send_body_to_pipe`
-        // and `proxy_h2::send_body_to2`.
-        //
-        // Load-bearing here rather than defensive: this pump's downstream is a
-        // `SessionCustom`, whose `is_body_done()` is IMPLEMENTED BY THE USER
-        // (`protocols/http/custom/server.rs`). An implementation that reports
-        // `false` after its reader reached EOF would otherwise invoke the
-        // application hooks with `(None, end_of_stream = false)` -- violating
-        // their documented contract -- never deliver the single `(None, true)`
-        // event, and return `Ok(false)` forever, so the duplex loop would spin
-        // on an already-finished read side at 100% CPU.
-        if data.is_none() && event == RequestBodyEvent::Data {
-            event = RequestBodyEvent::Complete;
-        }
-        let end_of_body = event.is_terminal();
-
-        self.filter_custom_request_body(session, &mut data, event, ctx)
-            .await?;
+        let prepared = match self
+            .request_relay_event(RequestRelayProtocol::Custom, session, data, event, ctx)
+            .await?
+        {
+            RequestRelayOutcome::Continue(prepared) => prepared,
+            RequestRelayOutcome::Terminate(_) => {
+                // Keep the pump-side safety boundary too: a future relay
+                // capability change must fail this data-plane request rather
+                // than turn an application decision into a process panic.
+                return Error::e_explain(
+                    InternalError,
+                    "request-body terminate is not supported on custom connector sessions",
+                );
+            }
+        };
+        let end_of_body = prepared.is_terminal();
+        let data = prepared.body;
+        let event = prepared.event;
 
         // Abandonment is terminal for application/module state, but it is not
         // a clean request EOS at the custom transport. In particular, calling
@@ -962,11 +960,11 @@ where
                     *request_body_error = Some(writer_error);
                 }
                 if event == RequestBodyEvent::Data {
-                    let mut abandoned_body = None;
                     if let Err(abandon_error) = self
-                        .filter_custom_request_body(
+                        .request_relay_event(
+                            RequestRelayProtocol::Custom,
                             session,
-                            &mut abandoned_body,
+                            None,
                             RequestBodyEvent::Abandoned,
                             ctx,
                         )
@@ -998,40 +996,6 @@ where
         }
 
         Ok(end_of_body)
-    }
-
-    async fn filter_custom_request_body(
-        &self,
-        session: &mut Session,
-        data: &mut Option<Bytes>,
-        event: RequestBodyEvent,
-        ctx: &mut SV::CTX,
-    ) -> Result<()>
-    where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
-    {
-        session
-            .downstream_modules_ctx
-            .request_body_filter(data, event)
-            .await?;
-
-        if self
-            .inner
-            .request_body_filter_action(session, data, event, ctx)
-            .await?
-            == RequestBodyAction::Terminate
-        {
-            // The custom pump has its own join structure and implements no
-            // terminate propagation; fail closed instead of diverging
-            // silently.
-            return Error::e_explain(
-                InternalError,
-                "request-body terminate is not supported on custom connector sessions",
-            );
-        }
-
-        Ok(())
     }
 }
 

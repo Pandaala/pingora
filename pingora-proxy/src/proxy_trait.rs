@@ -20,6 +20,7 @@ use pingora_cache::{
 };
 use proxy_cache::range_filter::{self};
 use std::any::Any;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 /// Typed lifecycle events for the upstream response body.
@@ -119,7 +120,7 @@ pub enum UpstreamRequestBodyDisposition {
     ///
     /// A request with no body at all is unaffected: it is coerced back to
     /// [`Self::Ordinary`] before the pump runs (see
-    /// [`ProxyHttp::upstream_request_body_disposition`]) and proxies normally.
+    /// [`ProxyHttp::request_relay_plan`]) and proxies normally.
     /// An application that is not certain whether a body will arrive must
     /// select [`Self::Ordinary`] (or [`Self::Streamed`]) instead; an
     /// application that wants to DROP a body it knows about must remove it in
@@ -128,6 +129,99 @@ pub enum UpstreamRequestBodyDisposition {
     /// The body is streamed and its final length is not known when headers
     /// are sent.
     Streamed,
+}
+
+/// Whether the request body has a request-stable replay contract.
+///
+/// This is structural policy, frozen once before the upstream retry loop. It
+/// does not decide whether a particular error is retryable; applications keep
+/// making that dynamic decision through [`ProxyHttp::fail_to_connect`] and
+/// [`ProxyHttp::error_while_proxy`] by updating `Error::retry`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RequestReplayPolicy {
+    /// The proxy may retain or rewind a body source for another attempt.
+    #[default]
+    Replayable,
+    /// The request must not make another upstream attempt.
+    Never,
+}
+
+/// Request-scoped body relay policy.
+///
+/// The application selects semantic intent only. Pingora derives the actual
+/// source (live downstream, registered replay, or native retry buffer) and
+/// resolves wire framing separately for every upstream attempt after
+/// `upstream_request_filter` has run.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RequestRelayPlan {
+    /// Requested upstream body framing.
+    pub disposition: UpstreamRequestBodyDisposition,
+    /// Structural replay policy for the whole request.
+    pub replay: RequestReplayPolicy,
+}
+
+impl RequestRelayPlan {
+    /// The ordinary pass-through plan used by the default proxy.
+    pub const fn ordinary() -> Self {
+        Self {
+            disposition: UpstreamRequestBodyDisposition::Ordinary,
+            replay: RequestReplayPolicy::Replayable,
+        }
+    }
+
+    /// A streamed body has request-stable non-replayable semantics.
+    pub const fn streamed() -> Self {
+        Self {
+            disposition: UpstreamRequestBodyDisposition::Streamed,
+            replay: RequestReplayPolicy::Never,
+        }
+    }
+}
+
+/// Canonical one-based identity assigned by Pingora to an upstream attempt.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RequestAttemptId(NonZeroUsize);
+
+impl RequestAttemptId {
+    pub(crate) fn new(value: usize) -> Self {
+        Self(NonZeroUsize::new(value).expect("request attempt ids are one-based"))
+    }
+
+    /// Return the one-based attempt number.
+    pub const fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
+/// Runtime state of the replay backing selected by a frozen relay plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestRelayRetryState {
+    /// The request plan structurally forbids another attempt.
+    Disabled,
+    /// The downstream session cannot retain a native replay prefix.
+    Unsupported,
+    /// The live downstream body remains the source; no native capture has
+    /// started yet.
+    LiveUnread,
+    /// Native capture is enabled and remains usable as a replay prefix.
+    NativeCapturing,
+    /// Native capture exceeded its bounded capacity.
+    NativeTruncated,
+    /// A registered application replay source can be rewound.
+    RegisteredReplay,
+    /// A registered source exists but is poisoned, discarded, released, or
+    /// otherwise not rewindable.
+    RegisteredUnavailable,
+}
+
+impl RequestRelayRetryState {
+    /// Whether the proxy may start another attempt from this body state.
+    pub const fn can_start_next_attempt(self) -> bool {
+        matches!(
+            self,
+            Self::LiveUnread | Self::NativeCapturing | Self::RegisteredReplay
+        )
+    }
 }
 
 /// The interface to control the HTTP proxy
@@ -328,27 +422,29 @@ pub trait ProxyHttp {
         Ok(RequestBodyAction::Continue)
     }
 
-    /// Select the upstream request-body framing contract.
+    /// Select the request-scoped body relay contract.
     ///
-    /// Queried once per upstream attempt, before the upstream request
-    /// headers are written. Sync on purpose: `ProxyHttp` is an
-    /// `#[async_trait]`, so async methods are boxed per call while sync
-    /// defaults monomorphize and inline away.
+    /// Queried exactly once after [`Self::proxy_upstream_filter`] accepts an
+    /// upstream proxy and before the retry loop starts. Applications must have
+    /// installed every body processor and registered every replay source before
+    /// this point. The returned plan is frozen for all upstream attempts.
     ///
-    /// Several request shapes override the returned value. On each of them a
-    /// non-`Ordinary` disposition is logged at debug level and coerced back to
-    /// [`UpstreamRequestBodyDisposition::Ordinary`]:
-    /// - An upgrade request (`Upgrade:` header) or a CONNECT request: the
-    ///   framing is fixed by the tunnel protocol. The check looks at the union
-    ///   of the downstream request and the (already filtered) upstream
-    ///   request, so synthesizing a tunnel in
-    ///   [`Self::upstream_request_filter`] is covered too.
+    /// Several request shapes cannot honor arbitrary non-ordinary framing:
+    /// - A [`UpstreamRequestBodyDisposition::Streamed`] plan on an upgrade or
+    ///   CONNECT request fails closed before the upstream header is written.
+    ///   The framing is fixed by the tunnel protocol, while keeping an already
+    ///   installed body processor alive under ordinary framing could mutate
+    ///   tunnel bytes unsafely. The check uses the union of the downstream and
+    ///   already-filtered upstream request, so a tunnel synthesized in
+    ///   [`Self::upstream_request_filter`] is covered too. `Bodyless` retains
+    ///   the compatibility behavior of coercing to `Ordinary` for a tunnel.
     /// - A request with no body at all: re-framing it (e.g. as
     ///   `Transfer-Encoding: chunked`) would put a body terminator on a pooled
     ///   upstream connection that the origin may ignore, which desynchronises
     ///   every later request on it.
-    /// - An upstream request still versioned below HTTP/1.1, which has no
-    ///   chunked framing.
+    /// - A `Streamed` upstream request still versioned below HTTP/1.1 fails
+    ///   closed because that protocol has no chunked framing. `Bodyless`
+    ///   retains the compatibility behavior of coercing to `Ordinary`.
     ///
     /// On custom-connector sessions the connector owns framing, so a
     /// non-`Ordinary` disposition fails the request closed with an
@@ -356,42 +452,8 @@ pub trait ProxyHttp {
     /// [`UpstreamRequestBodyDisposition::Bodyless`] for a request that then
     /// does carry a downstream body fails closed the same way; see that
     /// variant's documentation.
-    fn upstream_request_body_disposition(
-        &self,
-        _session: &Session,
-        _ctx: &Self::CTX,
-    ) -> UpstreamRequestBodyDisposition {
-        UpstreamRequestBodyDisposition::Ordinary
-    }
-
-    /// Whether this request may make another upstream proxy attempt.
-    ///
-    /// Queried live at every retry decision point and never cached, so an
-    /// application may flip from `true` to `false` mid-request. The
-    /// application must keep the predicate monotonic (once `false`, never
-    /// `true` again). Returning `false` also suppresses native request-body
-    /// retry buffering.
-    ///
-    /// Sampling points, in order:
-    /// 1. before the upstream request body is pumped, to decide whether to
-    ///    enable native retry buffering;
-    /// 2. after [`Self::error_while_proxy`] returns (and after
-    ///    [`Self::fail_to_connect`] on the connect path), so a predicate the
-    ///    application flips from inside those hooks is honored for that very
-    ///    error;
-    /// 3. once more in the retry loop, alongside the error's own retry
-    ///    classification.
-    ///
-    /// Interaction with `Session::retry_buffer_truncated()`: returning `false`
-    /// skips the retry-buffer allocation entirely, so nothing is ever
-    /// buffered and nothing can be reported as truncated —
-    /// `retry_buffer_truncated()` stays `false` ("nothing was truncated")
-    /// even though the request body is not replayable at all. An application
-    /// that overrides [`Self::error_while_proxy`] and keys its retry decision
-    /// on that flag must therefore consult this predicate as well; the flag
-    /// alone cannot distinguish "fully buffered" from "never buffered".
-    fn request_retry_allowed(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
-        true
+    fn request_relay_plan(&self, _session: &Session, _ctx: &Self::CTX) -> RequestRelayPlan {
+        RequestRelayPlan::ordinary()
     }
 
     /// This filter decides if the request is cacheable and what cache backend to use
@@ -971,9 +1033,12 @@ pub trait ProxyHttp {
         client_reused: bool,
     ) -> Box<Error> {
         let mut e = e.more_context(format!("Peer: {}", peer));
-        // only reused client connections where retry buffer is not truncated
-        e.retry
-            .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
+        // Only reused client connections whose frozen body policy and live
+        // backing state can start another attempt. This also avoids calling
+        // optional custom-session retry-buffer methods when unsupported.
+        e.retry.decide_reuse(
+            client_reused && session.request_relay_retry_state().can_start_next_attempt(),
+        );
         e
     }
 
@@ -1147,20 +1212,13 @@ mod tests {
     }
 
     #[test]
-    fn disposition_defaults_to_ordinary() {
+    fn relay_plan_defaults_to_ordinary_replayable() {
         let io = tokio_test::io::Builder::new().build();
         let session = Session::new_h1(Box::new(io));
         assert_eq!(
-            DefaultsOnly.upstream_request_body_disposition(&session, &()),
-            UpstreamRequestBodyDisposition::Ordinary
+            DefaultsOnly.request_relay_plan(&session, &()),
+            RequestRelayPlan::ordinary()
         );
-    }
-
-    #[test]
-    fn retry_allowed_defaults_to_true() {
-        let io = tokio_test::io::Builder::new().build();
-        let session = Session::new_h1(Box::new(io));
-        assert!(DefaultsOnly.request_retry_allowed(&session, &()));
     }
 
     #[test]

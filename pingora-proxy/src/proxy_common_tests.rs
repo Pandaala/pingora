@@ -164,6 +164,18 @@ fn safe_disposition_truth_table() {
     }
 }
 
+#[test]
+fn streamed_protocol_conflict_excludes_only_tunnel_and_legacy_framing() {
+    assert!(!facts(false, false, false, false).streamed_protocol_conflict());
+    assert!(facts(true, false, false, false).streamed_protocol_conflict());
+    assert!(facts(false, true, false, false).streamed_protocol_conflict());
+    assert!(facts(false, false, false, true).streamed_protocol_conflict());
+    assert!(
+        !facts(false, false, true, false).streamed_protocol_conflict(),
+        "a strictly bodyless request keeps the existing benign Ordinary coercion"
+    );
+}
+
 /// The tunnel facts come from the UNION of both sides, because the
 /// rewrite the disposition drives targets the upstream request while the
 /// downstream request is what the client actually sent.

@@ -1,5 +1,9 @@
 # Request-body transport and bidirectional pumps
 
+For the request-scoped plan, source/backing separation, shared event sequence,
+and cross-repository ownership surrounding this contract, see the canonical
+[body relay architecture](../architecture/body-relay.md#request-lane).
+
 ## HTTP/1 transfer-coding admission
 
 H1 transfer-coding is validated in two layers. Before `HttpProxy` exists, the
@@ -77,8 +81,12 @@ upstream revisit trigger are recorded in
   or can no longer consume it.
 
 Modules and application hooks see the same event classification. Every
-request gets at most one terminal event, including bodyless requests and
-upstreams that stop receiving mid-upload.
+live downstream delivery sequence gets at most one terminal event, including
+bodyless requests and upstreams that stop receiving mid-upload. A retry can
+replay a separate `Data`/`Complete` sequence through the same application hook;
+that replay completion does not change the original downstream completion
+cause. The request-trailer hook has a different lifetime and remains at most
+once across all attempts for one downstream request.
 
 `RequestBodyAction::Terminate` stops the request as an application-selected
 outcome. It bypasses retry classification and generic `fail_to_proxy` response
@@ -86,8 +94,10 @@ generation because the application owns the downstream response.
 
 ## Upstream framing
 
-`UpstreamRequestBodyDisposition` controls framing after application request
-header filtering:
+`ProxyHttp::request_relay_plan` selects one request-scoped
+`RequestRelayPlan` after `proxy_upstream_filter` accepts upstream proxying and
+before the retry loop starts. The plan is frozen exactly once and combines an
+`UpstreamRequestBodyDisposition` with `RequestReplayPolicy`:
 
 - `Ordinary`: preserve normal inference.
 - `Bodyless`: remove H1 body framing or close the H2 request stream. Real body
@@ -95,13 +105,47 @@ header filtering:
 - `Streamed`: the final size is unknown; H1 uses chunked framing and H2 keeps
   the stream open.
 
-Unsafe combinations are coerced to `Ordinary`, including upgrades, CONNECT,
-truly bodyless requests and HTTP versions that cannot represent the selected
-framing.
+Strictly bodyless requests keep the benign coercion to `Ordinary`. `Bodyless`
+also keeps the compatibility coercion for upgrade/CONNECT and pre-HTTP/1.1
+requests. A frozen `Streamed` plan instead fails closed before writing an
+upstream header when either side is upgrade/CONNECT or the final H1 request is
+below HTTP/1.1: an installed length-changing processor must not remain active
+under ordinary or tunnel framing after an attempt-local rewrite.
+
+The application never selects the body source. Pingora derives live downstream
+versus registered replay when the plan freezes, then locks H1/H2 request-body
+configuration so an attempt-local `upstream_request_filter` cannot replace the
+source. Effective framing remains per attempt and is resolved only after that
+filter and registered replay activation. A `Streamed` plan must select
+`RequestReplayPolicy::Never`; contradictory plans fail closed.
+
+`RequestRelayRetryState` combines the frozen structural policy with live core
+facts and distinguishes live-unread, native capture, native truncation,
+registered replay, registered-unavailable, disabled, and unsupported states.
+Only this state controls native-buffer allocation and the structural retry
+gate. A particular error remains dynamic: `fail_to_connect`,
+`error_while_proxy`, deadlines, retry budgets and response commit update or
+constrain `Error::retry` independently. Pingora also assigns a canonical
+one-based `RequestAttemptId` before every call to `upstream_peer`; Edgion uses
+it to reset retry-visible body observers instead of its product-specific
+backend/AI counter. Connect failures consult the relay gate before consuming an
+ordinary retry budget or advancing AI successor selection, while still
+settling the failed current AI predispatch reservation.
 
 ## Pump rules
 
 - H1 and H2 pumps read downstream uploads and upstream responses concurrently.
+- `pingora-proxy/src/request_relay.rs` owns the shared per-event semantic
+  sequence: source EOF normalization, the capability-gated request-trailer
+  hook, downstream modules, and the application body-action hook. It returns
+  the same `Bytes` owner and typed action to the pump without performing I/O.
+  H1/H2/custom keep their existing capability differences: custom does not
+  dispatch the trailer hook and request-body termination remains fail-closed.
+- Pipe/capacity reservation, empty-output suppression, post-filter `Bodyless`
+  validation, task/frame construction, timeouts, reset, retry, early-response
+  cleanup, and connection reuse remain in the protocol pumps. In particular,
+  the H1 pump still acquires its permit before awaiting the relay, so the
+  extraction does not weaken backpressure.
 - The main branch's batch processing and downstream proxy-task backpressure
   remain authoritative; Edgion filtering state is passed through the shared
   batch helpers rather than duplicating inline loops.
@@ -121,14 +165,29 @@ framing.
 - H1 downstream connections with unread body state are not reused. H2 keeps
   the connection and ends only the affected stream.
 - A final response already committed downstream disables retries even when an
-  error would otherwise be retryable. `request_retry_allowed` is an additional
-  application gate for retry buffering and attempts.
+  error would otherwise be retryable. The frozen replay policy and current
+  backing readiness are applied at the same final retry gate, and a veto is
+  reflected on the final error handed to logging and `fail_to_proxy`.
+- A custom downstream advertises native retry-buffer capability explicitly.
+  Unsupported sessions never enter optional placeholder methods; connect or
+  header failures may still retry while the live source is unread, but an
+  attempt that reaches body pumping becomes structurally non-retryable.
 
 ## Tests
 
 `pingora-proxy/tests/test_request_body_seam.rs` is the primary matrix. It
 covers H1 and H2 downstream/upstream combinations, framing, retry, GOAWAY,
 termination, bodyless contract violations and connection reuse.
+
+`pingora-proxy/src/request_relay_tests.rs` directly characterizes the shared
+semantic seam across H1/H2/custom: `Data(None)` normalization, `Abandoned`,
+module-before-application ordering and mutation visibility, zero-copy `Bytes`
+handoff, typed versus fail-closed termination, custom trailer capability,
+trailer ordering/latching, hook error, cancellation before latch commit,
+single-freeze/source locking, replay-state derivation, streamed-plan
+validation, canonical attempt identity, and unsupported custom buffering.
+Its ignored release microbenchmark compares the extracted Data-event path with
+the exact former inline sequence in the same binary and allocation counter.
 
 Its H1 transfer-coding cases send a real gzip member under
 `gzip, chunked`, assert a 501 and downstream close, and prove via independent

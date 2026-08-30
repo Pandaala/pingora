@@ -17,35 +17,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use pingora_core::{server::configuration::ServerConf, upstreams::peer::HttpPeer};
 use pingora_error::{Error, ErrorType::InternalError};
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::AsyncWriteExt;
-
-struct CountingAllocator;
-
-static COUNT_PIPELINE_ALLOCATIONS: AtomicBool = AtomicBool::new(false);
-static PIPELINE_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-
-#[global_allocator]
-static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNT_PIPELINE_ALLOCATIONS.load(Ordering::Relaxed) {
-            PIPELINE_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
-        // SAFETY: forward the caller-provided layout unchanged.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: `ptr` and `layout` came from the matching allocation.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
 
 struct ParityProxy;
 struct PipelineBenchProxy;
@@ -403,8 +378,7 @@ async fn benchmark_response_task_pipeline() {
     }
     let elapsed = started.elapsed();
 
-    PIPELINE_ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNT_PIPELINE_ALLOCATIONS.store(true, Ordering::Relaxed);
+    crate::test_allocator::start_counting();
     for _ in 0..ITERATIONS {
         state.sink.reset_batch();
         out.clear();
@@ -423,8 +397,7 @@ async fn benchmark_response_task_pipeline() {
             .unwrap();
         black_box(out.len());
     }
-    COUNT_PIPELINE_ALLOCATIONS.store(false, Ordering::Relaxed);
-    let allocations = PIPELINE_ALLOCATIONS.load(Ordering::Relaxed);
+    let allocations = crate::test_allocator::stop_counting();
 
     println!(
         "response_task_pipeline: {:.2} ns/task, {:.4} allocations/task",

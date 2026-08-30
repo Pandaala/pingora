@@ -3,9 +3,16 @@
 ## Status and baseline
 
 Architecture assessment completed on 2026-08-30. The recommendation is an
-accepted design direction, not an implemented contract. The actionable work is
-tracked by
+accepted design direction. Its first behavior-preserving request-event
+extraction, request-scoped relay plan, and Edgion response-processor ownership
+are now implemented; bounded head commit is not. The canonical current flow,
+ownership, and invariant matrix is
+[`architecture/body-relay.md`](../architecture/body-relay.md). The remaining actionable work is tracked by
 [`pending-issues/body-relay-refactor.md`](../pending-issues/body-relay-refactor.md).
+
+The “Current architecture” sections below preserve the assessment-time
+inventory and migration rationale. Where they differ from the canonical current
+record, the canonical current record governs.
 
 The source snapshot inspected was:
 
@@ -18,6 +25,14 @@ The source snapshot inspected was:
 
 Revalidate the consumer before implementation. Neither a dirty sibling checkout
 nor a local patch proves what is deployed or eventually locked.
+
+The first extraction was implemented and validated in a Pingora worktree based
+on `82ab02b50cd65204d47c7213c9b93fa74299c94c`. Cross-repository validation was
+repeated after the Edgion checkout advanced to
+`af83f684249186a25d2edecabab51baa76d60edf`:
+its local Cargo patch selected the sibling Pingora worktree, while its committed
+lock baseline had selected `c50f93c0bf7adee4b1ed10a0696810968f042858`.
+These are development and provenance facts, not a deployed-revision claim.
 
 ## Decision
 
@@ -128,10 +143,9 @@ Important current properties:
    Streamed handlers make retry unavailable and select streamed upstream
    framing; full capture makes replay possible and may retain a mutated length
    for retry framing.
-5. Mode consequences are distributed across Edgion context latches,
-   `Session` buffer registration, `request_retry_allowed`,
-   `upstream_request_body_disposition`, and `upstream_request_filter` framing
-   repair.
+5. Mode consequences now converge in a frozen `RequestRelayPlan`; core derives
+   and locks the source, while `upstream_request_filter` still owns legitimate
+   per-attempt framing repair for a mutated registered body.
 6. Each H1/H2/custom pump independently performs its variant of the common
    semantic sequence: terminal normalization, request trailer dispatch where
    supported, downstream modules, application body action, bodyless validation,
@@ -164,9 +178,11 @@ This side is closer to the target:
    EOS, Body EOS, Trailer, and Done; failures do not manufacture clean EOS.
 4. Entity-cache admission happens before downstream-only transformation and
    shares the same emitted-byte ordering.
-5. Edgion layers a second processor model over the hook: AI, semantic guard,
-   ordinary stream processors, read-only bandwidth filters, a separate response
-   terminal owner, framing reservations, and `RawWindow` generations.
+5. Edgion freezes AI, semantic guard, ordinary stream processors, and trailer
+   companions into one request-local driver after final response-header
+   processing. Separate body/trailer execution leases own callback cancellation;
+   read-only filters, terminal arbitration, framing reservations, and
+   `RawWindow` policy remain outside that ownership primitive.
 6. Edgion's `RawWindow` is a sound bounded-retention primitive. It retains
    original slices under independent byte/handle/metadata/event limits and
    requires every generation to resolve as release, replace, or discard.
@@ -237,12 +253,14 @@ uses `HttpTask` plus booleans; Edgion adds `StreamingResponseEvent`,
 but the overlap has no common vocabulary for output order, retention, delay,
 and terminal ownership.
 
-### 4. Cancellation ownership leaks into application code
+### 4. Cancellation ownership leaked into application code (resolved)
 
 Edgion temporarily moves processor sets out of the request context across
 await points, then adds `release_inflight` and restore logic to survive
-cancellation. This is careful code, but it demonstrates that the driver and
-processor ownership boundary is too indirect.
+cancellation. Phase 3 replaced the two body/trailer run-set protocols with one
+request-local driver and typed execution leases. Processor instances no longer
+move through empty context slots for each async body/trailer callback, while
+the context retains a durable handle for logging.
 
 ### 5. Header/body decisions are not first-class
 
@@ -281,7 +299,8 @@ policy itself.
 
 - coordination of the endpoint-provided source: live downstream or completed
   replay where the selected upstream transport supports it;
-- one normalized request terminal event: complete or abandoned;
+- one normalized terminal event per body delivery sequence: complete or
+  abandoned, without suppressing a retry attempt's replayed completion;
 - ordered downstream modules and application processors;
 - request trailer callback at most once;
 - bodyless/streamed framing-contract validation;
@@ -310,10 +329,15 @@ is:
 
 ```rust,ignore
 struct RequestRelayPlan {
-    source: RequestSourcePolicy,     // Live or CaptureReplay
     processors: RequestProcessorSet,
     framing: RequestFramingPolicy,
     retry: RequestRetryPolicy,
+}
+
+struct DerivedRequestRelayState {
+    source: RequestSource,           // core fact: Live or RegisteredReplay
+    backing: ReplayBackingState,
+    attempt: RequestAttemptId,
 }
 
 struct ResponseRelayPlan {
@@ -323,9 +347,11 @@ struct ResponseRelayPlan {
 }
 ```
 
-The exact public API should be designed with the first extraction. The
-important property is that retry and framing consequences are derived from the
-plan, not independently declared by several callbacks.
+The implemented public plan deliberately contains only application intent;
+source, live backing readiness and attempt identity are derived from core facts
+and cannot be declared by Edgion. The important property is that retry and
+framing consequences converge on this frozen intent plus derived runtime
+state, rather than being independently declared by several callbacks.
 
 ### Pass-through fast path
 
@@ -490,19 +516,28 @@ stable tests and measurements.
 
 1. **Freeze behavior and vocabulary.** Add request/response flow tables and
    characterization cases. No API change.
-2. **Extract `RequestRelay`.** Consolidate the common request event processing
-   now duplicated by H1/H2/custom `send_body` helpers. Keep protocol writes and
-   outcomes outside it.
+2. **Extract `RequestRelay` (implemented).** Consolidate the common request
+   event processing formerly duplicated by H1/H2/custom `send_body` helpers.
+   Protocol writes, empty-output suppression, `Bodyless` validation, retry,
+   and transport outcomes remain outside it.
 3. **Rename/evolve the response seed.** Treat `ResponsePipelineState` and
    `response_task_pipeline` as the initial `ResponseRelay`; avoid a mechanical
    rename unless it clarifies the new module boundary.
-4. **Add an explicit relay plan.** Derive request retry/framing and response
-   framing reservations from one request-scoped plan. Because Edgion is
-   pre-release, update both repositories together and remove obsolete hook
-   plumbing rather than keeping a permanent compatibility facade.
-5. **Move processor ownership into the driver.** Remove application-side
-   `mem::take`/restore cancellation choreography where the relay can own the
-   processor set directly for the exchange lifetime.
+4. **Add an explicit relay plan (implemented).** Edgion chose request-scoped
+   policy and closes body-affecting APIs after global/Gateway/route request
+   plugins; backendRef plugins may read an existing snapshot but cannot change
+   body policy. Pingora freezes application intent before the retry loop,
+   derives and locks the source, retains per-attempt effective framing, and
+   combines structural replay policy with live backing readiness at the final
+   retry gate. The two obsolete independent hooks were removed without a
+   compatibility facade.
+5. **Move processor ownership into the driver (implemented in Edgion).** The
+   final response freezes one request-local driver after response plugins and
+   framing repair. Body and trailer leases distinguish normal return from
+   callback cancellation, and logging retains the durable handle. The driver
+   intentionally remains Edgion-owned: moving it into Pingora now would require
+   unrelated pump outcome plumbing because downstream writes and logging occur
+   outside `ResponsePipelineState`.
 6. **Add bounded response-head commit.** Implement only with independent hard
    limits, deterministic failure policy, cache tests, and H1/H2/custom behavior
    defined explicitly.

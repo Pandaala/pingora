@@ -581,6 +581,35 @@ impl DispositionFacts {
             upstream_below_http11: false,
         }
     }
+
+    fn streamed_protocol_conflict(self) -> bool {
+        self.is_upgrade_req || self.is_connect || self.upstream_below_http11
+    }
+}
+
+pub(crate) const STREAMED_PROTOCOL_CONFLICT: &str =
+    "the frozen streamed request relay plan conflicts with the final upstream protocol shape";
+
+/// Reject an attempt-local protocol rewrite that invalidates a frozen streamed
+/// relay plan. Bodyless requests remain eligible for the existing benign
+/// coercion to `Ordinary`; tunnel and pre-HTTP/1.1 shapes cannot safely keep a
+/// previously installed length-changing body processor alive under ordinary
+/// framing.
+pub(crate) fn validate_streamed_upstream_disposition(
+    disposition: UpstreamRequestBodyDisposition,
+    session: &mut Session,
+    upstream_request: &RequestHeader,
+    upstream_below_http11: bool,
+) -> Result<()> {
+    if disposition != UpstreamRequestBodyDisposition::Streamed {
+        return Ok(());
+    }
+    let mut facts = DispositionFacts::collect(session, upstream_request);
+    facts.upstream_below_http11 = upstream_below_http11;
+    if facts.streamed_protocol_conflict() {
+        return Error::e_explain(InternalError, STREAMED_PROTOCOL_CONFLICT);
+    }
+    Ok(())
 }
 
 /// Coerce a non-`Ordinary` disposition back to `Ordinary` on requests whose
@@ -627,7 +656,7 @@ pub(crate) fn safe_disposition(
     // it is not an application-contract violation and one client could
     // otherwise emit a WARN line per request.
     debug!(
-        "upstream_request_body_disposition returned {disposition:?} for {reason}; \
+        "request_relay_plan selected {disposition:?} for {reason}; \
          coercing to Ordinary"
     );
     UpstreamRequestBodyDisposition::Ordinary

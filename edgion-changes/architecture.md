@@ -59,6 +59,11 @@ targets. Small tests that directly exercise one private detail remain inline.
 
 ## Request and response flow
 
+The current request/response semantic station, including request plan freeze,
+retry backing, shared event/task ordering, Edgion processor ownership, and the
+remaining response-head barrier, is specified in
+[the body relay architecture](architecture/body-relay.md).
+
 ```text
 Server
   -> listening Service / accept

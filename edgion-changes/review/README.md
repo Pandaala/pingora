@@ -81,6 +81,10 @@ The `status` inside each record is authoritative.
 - [Shared response-task pipeline](response-task-pipeline-consolidation.md): H1,
   H2, and custom share hook/cache/terminal/sink semantics while retaining
   explicit protocol framing and upgrade policy.
+- [Response processor driver ownership](response-processor-driver-ownership.md):
+  final response processors remain Edgion-owned in one request-local driver;
+  body/trailer execution leases distinguish callback cancellation from normal
+  pump errors while logging retains durable finalization access.
 - [Private protocol test extraction](test-module-extraction.md): twelve large
   H1/H2/proxy suites moved to behavior-grouped sibling modules without changing
   test identities, visibility, ignored coverage, or Cargo target topology.

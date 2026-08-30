@@ -869,7 +869,7 @@ fn a_completed_downstream_body_is_never_reported_as_abandoned() {
 }
 
 #[test]
-fn retry_predicate_gates_reused_connection_retry() {
+fn relay_plan_gates_reused_connection_retry() {
     let ports = init();
     // Upstream: request 1 succeeds (pools the connection); request 2 closes
     // without a response (retryable, pre-commit); request 3 would be the
@@ -984,6 +984,45 @@ fn streamed_does_not_reframe_a_bodyless_request() {
         "nothing may follow the headers of a bodyless request (a chunked \
          terminator here is a smuggling primitive on a pooled connection): {:?}",
         String::from_utf8_lossy(&bytes[header_end + 4..])
+    );
+}
+
+/// A request-scoped Streamed plan cannot be silently downgraded after an
+/// attempt-local hook turns the final upstream request into a tunnel. The body
+/// processor set is already frozen, so the only safe outcome is to fail before
+/// any upstream request header is committed.
+#[test]
+fn streamed_fails_before_write_when_upstream_filter_synthesizes_connect() {
+    let ports = init();
+    let upstream = spawn_scripted_h2_upstream(vec![H2UpstreamStep::Ok200]);
+    upstream.expect_unused();
+    let (port, rec) = (upstream.port(), upstream.rec().clone());
+
+    RT.block_on(async {
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: t\r\nx-port: {port}\r\n\
+             x-h2: 1\r\nx-disposition: streamed\r\n\
+             x-synthesize-connect: 1\r\nContent-Length: 1\r\n\r\nx"
+        );
+        let (_stream, collected) =
+            raw_h1_roundtrip(&ports.h1_addr(), request.as_bytes(), b"HTTP/1.1 500").await;
+        assert!(String::from_utf8_lossy(&collected).starts_with("HTTP/1.1 500"));
+
+        expect_ok(
+            rec.expect_none(
+                "a Streamed request whose final shape became CONNECT",
+                Duration::from_millis(300),
+                |event| matches!(event, UpEvent::ReqHeaders { .. }),
+            )
+            .await,
+        );
+    });
+
+    assert_eq!(
+        rec.count(|event| matches!(event, UpEvent::ReqHeaders { .. })),
+        0,
+        "the conflict must fail before committing an upstream request:\n{}",
+        rec.dump()
     );
 }
 
@@ -1217,6 +1256,10 @@ fn trailer_hook_fires_at_most_once_across_retries() {
             text.contains("x-trailer-hook-calls: 1"),
             "request_trailer_filter must fire exactly once across retries: {text}"
         );
+        assert!(
+            text.contains("x-relay-plan-calls: 1"),
+            "request relay plan must be built exactly once across retries: {text}"
+        );
     });
 
     // prime + failed attempt + retry. This upstream is private to this test,
@@ -1377,14 +1420,14 @@ fn legacy_request_body_filter_is_delegated_through_the_h1_pump() {
     });
 }
 
-/// Retry predicate, consumption point 1: the NATIVE RETRY BUFFER.
+/// Frozen replay policy consumption point 1: the NATIVE RETRY BUFFER.
 ///
-/// `request_retry_allowed() == false` must also stop the pumps from buffering
+/// `RequestReplayPolicy::Never` must also stop the pumps from buffering
 /// the request body for a replay that can never happen -- an unbounded-ish
 /// per-request memory cost paid for nothing. The retry loop's own check cannot
 /// catch a regression here: it only decides whether to re-dial.
 #[test]
-fn retry_predicate_gates_the_request_body_retry_buffer() {
+fn relay_plan_gates_the_request_body_retry_buffer() {
     let ports = init();
     let upstream = spawn_scripted_upstream(vec![
         UpstreamStep::Respond(OK_KEEPALIVE),
@@ -1415,7 +1458,7 @@ fn retry_predicate_gates_the_request_body_retry_buffer() {
             "with retries allowed the request body must be buffered for replay"
         );
 
-        // The predicate says no: nothing may be buffered.
+        // The frozen plan says no: nothing may be buffered.
         let res = client
             .post(format!("http://{}/", ports.h1_addr()))
             .header("x-port", port.to_string())
@@ -1433,17 +1476,17 @@ fn retry_predicate_gates_the_request_body_retry_buffer() {
     });
 }
 
-/// Retry predicate, consumption point 2: the error handed BACK from
+/// Frozen replay policy consumption point 2: the error handed BACK from
 /// `error_while_proxy`.
 ///
 /// The upstream closes a REUSED connection without responding, which
-/// `error_while_proxy` decides is retryable. With the predicate saying no, the
+/// `error_while_proxy` decides is retryable. With the frozen plan saying no, the
 /// error the application finally receives must say so too -- otherwise
 /// `fail_to_proxy`/`logging` are told the request was retryable when the proxy
 /// had already ruled that out. The retry loop's own check cannot catch a
 /// regression here: it refuses the retry either way and never touches the error.
 #[test]
-fn retry_predicate_forces_the_error_from_error_while_proxy() {
+fn relay_plan_forces_the_error_from_error_while_proxy() {
     let ports = init();
     let upstream = spawn_scripted_upstream(vec![
         UpstreamStep::Respond(OK_KEEPALIVE),
@@ -1514,19 +1557,19 @@ fn retry_predicate_forces_the_error_from_error_while_proxy() {
     );
 }
 
-/// Retry predicate, consumption point 3: the error handed back from
+/// Frozen replay policy consumption point 3: the error handed back from
 /// `fail_to_connect`.
 ///
 /// The application's `fail_to_connect` marks the connect failure retryable --
 /// the hook's documented purpose, and the only way any connect error becomes
 /// retryable at all (`connectors::l4` resolves every fresh-dial connect error to
-/// `Decided(false)`). With the retry predicate saying no, the error the
+/// `Decided(false)`). With the frozen plan saying no, the error the
 /// application finally receives must be marked non-retryable again.
 ///
 /// No connect-failure test existed at all, so this also pins that a request
 /// whose upstream cannot be dialled ends as a 502 rather than, say, a hang.
 #[test]
-fn retry_predicate_forces_the_error_from_fail_to_connect() {
+fn relay_plan_forces_the_error_from_fail_to_connect() {
     let ports = init();
     // A port that was bound and released: nothing is listening on it.
     let dead_port = reserve_port();

@@ -1,5 +1,9 @@
 # Response trailer lifecycle
 
+For the relationship between Pingora's typed terminal/trailer sequence and
+Edgion's trailer execution lease, see the canonical
+[body relay architecture](../architecture/body-relay.md#7-trailer-execution-lease).
+
 ## Public API
 
 `pingora-proxy` exports `UpstreamResponseBodyEvent` from the crate root and

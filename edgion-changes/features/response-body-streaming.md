@@ -1,5 +1,9 @@
 # Response-body streaming filters
 
+For the shared task pipeline, cache ordering, Edgion request-local processor
+driver, execution leases, and logging boundary surrounding this API, see the
+canonical [body relay architecture](../architecture/body-relay.md#response-lane).
+
 ## API contract
 
 `ProxyHttp::upstream_response_body_filter` is asynchronous. Its additive typed

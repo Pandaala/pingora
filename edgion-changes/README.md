@@ -8,7 +8,7 @@ here, then open only the smallest subtree relevant to the task.
 
 | Task | Read first | Then read |
 | --- | --- | --- |
-| Understand the workspace or trace a request | [architecture.md](architecture.md) | Only the source paths named for that flow |
+| Understand the workspace or trace a request | [architecture.md](architecture.md) | For body flow and ownership, [body relay architecture](architecture/body-relay.md); otherwise only the named source paths |
 | Review or change a fork feature | [features.md](features.md) | The matching file under [features/](features/) |
 | Investigate unfinished work | [pending-issues/README.md](pending-issues/README.md) | The one issue and its linked review record |
 | Perform code review | [review/README.md](review/README.md) | Matching protocol/category records; then `../Edgion` when required |
@@ -18,6 +18,7 @@ here, then open only the smallest subtree relevant to the task.
 ## Directory contract
 
 - `architecture.md`: crates, data flow, cross-repository seams, and review path.
+- `architecture/`: detailed canonical designs for cross-cutting implemented architecture.
 - `features.md`: authoritative fork feature inventory and commit provenance.
 - `features/`: behavioral contracts that must survive upstream sync.
 - `maintenance/`: upstream synchronization policy and conflict hot spots.

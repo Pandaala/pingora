@@ -18,6 +18,7 @@ use futures::StreamExt;
 use super::*;
 use crate::proxy_cache::ServeFromCache;
 use crate::proxy_common::*;
+use crate::request_relay::{RequestRelayOutcome, RequestRelayProtocol};
 use crate::response_pipeline::{ResponsePipelineState, ResponseProtocol};
 use http::{header::CONTENT_LENGTH, Method, StatusCode};
 use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
@@ -665,10 +666,13 @@ where
         // `DownstreamStateMachine::new` and the bodyless prelude in
         // `bidirection_down_to_up`), so the client's real end of stream is still
         // read and still produces exactly one application terminal event.
-        let disposition = self.inner.upstream_request_body_disposition(session, ctx);
+        let disposition = session.frozen_request_relay_plan().requested.disposition;
         let body_empty_declared = session.as_mut().is_body_empty();
         // The H2 pump always sends HTTP/2 upstream, so there is no below-1.1
         // case here (unlike the H1 pump).
+        if let Err(e) = validate_streamed_upstream_disposition(disposition, session, &req, false) {
+            return (false, Some(e));
+        }
         let body_disposition = safe_upstream_disposition(disposition, session, &req, false);
         let body_empty = upstream_framing_body_empty(body_disposition, body_empty_declared);
         apply_upstream_body_disposition(&mut req, body_disposition);
@@ -763,9 +767,7 @@ where
 
         let (tx, rx) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
 
-        if self.inner.request_retry_allowed(session, ctx) {
-            session.as_mut().enable_retry_buffering();
-        }
+        session.enable_request_relay_retry_buffer();
 
         // Shared signal so the upstream half can distinguish an expected task-pipe
         // closure (the downstream half finished and dropped rx) from an unexpected one.
@@ -1149,7 +1151,7 @@ where
         // things there.
         let mut upstream_stopped_receiving = false;
 
-        let buffer = session.as_mut().get_retry_buffer();
+        let buffer = session.request_relay_retry_buffer();
         // Native retry-buffer path. Registered app buffers are replayed through
         // `read_body_or_idle()` below, one bounded chunk at a time.
         //
@@ -1772,8 +1774,8 @@ where
     async fn send_body_to2(
         &self,
         session: &mut Session,
-        mut data: Option<Bytes>,
-        mut event: RequestBodyEvent,
+        data: Option<Bytes>,
+        event: RequestBodyEvent,
         client_body: &mut h2::SendStream<bytes::Bytes>,
         ctx: &mut SV::CTX,
         body_write: &UpstreamBodyWrite,
@@ -1782,69 +1784,20 @@ where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
-        // `data == None` IS the end of the downstream body, whatever the caller
-        // computed from `is_body_done()`. Mirrors the H1 pump's
-        // `send_body_to_pipe`, and it is load-bearing rather than cosmetic:
-        // without it a `None` read paired with `is_body_done() == false` would
-        // invoke the application hooks with `(None, end_of_stream = false)` --
-        // violating their documented contract -- never deliver the single
-        // `(None, true)` event, and, with `stream_closed` set, keep returning
-        // `Complete(false)` so the duplex loop below would spin on an
-        // already-finished read side at 100% CPU.
-        //
-        // The two facts cannot disagree on an H1 or H2 downstream any more (a
-        // `None` read latches the end-of-stream fact in both session types), but
-        // they CAN on a `SessionCustom` downstream, whose `is_body_done()` is
-        // implemented by the user -- and this pump serves an H1/H2/custom
-        // downstream depending only on which UPSTREAM protocol was selected.
-        if data.is_none() && event == RequestBodyEvent::Data {
-            event = RequestBodyEvent::Complete;
-        }
-        let end_of_body = event.is_terminal();
-
-        if event.is_complete()
-            && data.is_none()
-            && !session.request_trailer_filter_fired
-            && session
-                .downstream_session
-                .request_trailers_present()
-                .unwrap_or(false)
+        let prepared = match self
+            .request_relay_event(RequestRelayProtocol::H2, session, data, event, ctx)
+            .await?
         {
-            let action = self.inner.request_trailer_filter(session, ctx).await?;
-            // At most once per downstream request: a retry attempt replays the
-            // same EOF (`data == None`) while the trailer fact stays true, and
-            // the hook's contract is a single invocation.
-            //
-            // Latched only AFTER the hook returns: the pinned downstream
-            // future can be dropped mid-hook (the `select!` upstream-error
-            // arm) and the request then retried, and latching first would
-            // suppress the hook forever -- zero completed invocations for a
-            // trailer-bearing request.
-            session.request_trailer_filter_fired = true;
-            if action == RequestBodyAction::Terminate {
-                warn_terminate_without_response(session, "request_trailer_filter");
+            RequestRelayOutcome::Continue(prepared) => prepared,
+            RequestRelayOutcome::Terminate(origin) => {
+                warn_terminate_without_response(session, origin.hook_name());
                 return Ok(UpstreamBodyOutcome::Downstream(
                     DownstreamRequestOutcome::Terminate,
                 ));
             }
-        }
-
-        session
-            .downstream_modules_ctx
-            .request_body_filter(&mut data, event)
-            .await?;
-
-        if self
-            .inner
-            .request_body_filter_action(session, &mut data, event, ctx)
-            .await?
-            == RequestBodyAction::Terminate
-        {
-            warn_terminate_without_response(session, "request_body_filter_action");
-            return Ok(UpstreamBodyOutcome::Downstream(
-                DownstreamRequestOutcome::Terminate,
-            ));
-        }
+        };
+        let end_of_body = prepared.is_terminal();
+        let data = prepared.body;
 
         /* it is normal to get 0 bytes because of multi-chunk parsing or request_body_filter.
          * Although there is no harm writing empty byte to h2, unlike h1, we ignore it

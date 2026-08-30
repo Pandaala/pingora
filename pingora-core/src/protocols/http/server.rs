@@ -741,6 +741,14 @@ impl Session {
         }
     }
 
+    /// Whether this downstream can provide Pingora's native retry buffer.
+    pub fn retry_buffering_supported(&self) -> bool {
+        match self {
+            Self::H1(_) | Self::H2(_) | Self::Subrequest(_) => true,
+            Self::Custom(s) => s.retry_buffering_supported(),
+        }
+    }
+
     pub fn get_retry_buffer(&self) -> Option<Bytes> {
         match self {
             Self::H1(s) => s.get_retry_buffer(),
@@ -787,6 +795,25 @@ impl Session {
         match self {
             Self::H1(s) => s.request_body_buffer_registered(),
             Self::H2(s) => s.request_body_buffer_registered(),
+            Self::Subrequest(_) | Self::Custom(_) => false,
+        }
+    }
+
+    /// Freeze the application-configured request-body source for the rest of
+    /// this request. H1/H2 reject any later buffer registration.
+    pub fn freeze_request_body_configuration(&mut self) {
+        match self {
+            Self::H1(s) => s.freeze_request_body_configuration(),
+            Self::H2(s) => s.freeze_request_body_configuration(),
+            Self::Subrequest(_) | Self::Custom(_) => {}
+        }
+    }
+
+    /// Whether a registered replay source can currently be rewound.
+    pub fn request_body_buffer_replay_available(&self) -> bool {
+        match self {
+            Self::H1(s) => s.request_body_buffer_replay_available(),
+            Self::H2(s) => s.request_body_buffer_replay_available(),
             Self::Subrequest(_) | Self::Custom(_) => false,
         }
     }

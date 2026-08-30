@@ -211,16 +211,20 @@ mod proxy_h1;
 mod proxy_h2;
 mod proxy_purge;
 mod proxy_trait;
+mod request_relay;
 mod response_body_sink;
 mod response_pipeline;
 pub mod subrequest;
+#[cfg(test)]
+mod test_allocator;
 
 use subrequest::{BodyMode, Ctx as SubrequestCtx};
 
 pub use proxy_cache::range_filter::{range_header_filter, MultiRangeInfo, RangeType};
 pub use proxy_purge::PurgeStatus;
 pub use proxy_trait::{
-    FailToProxy, ProxyHttp, ProxyWarnLogContext, RequestBodyAction, UpstreamRequestBodyDisposition,
+    FailToProxy, ProxyHttp, ProxyWarnLogContext, RequestAttemptId, RequestBodyAction,
+    RequestRelayPlan, RequestRelayRetryState, RequestReplayPolicy, UpstreamRequestBodyDisposition,
     UpstreamResponseBodyEvent,
 };
 pub use response_body_sink::{
@@ -229,7 +233,8 @@ pub use response_body_sink::{
 
 pub mod prelude {
     pub use crate::{
-        http_proxy, http_proxy_service, ProxyHttp, ProxyWarnLogContext, RequestBodyAction, Session,
+        http_proxy, http_proxy_service, ProxyHttp, ProxyWarnLogContext, RequestBodyAction,
+        RequestRelayPlan, RequestRelayRetryState, RequestReplayPolicy, Session,
         UpstreamRequestBodyDisposition, UpstreamResponseBodyEvent,
     };
 }
@@ -509,29 +514,15 @@ where
                         (server_reused, error)
                     }
                 };
-                let error = match error {
-                    Some(e) => {
-                        let mut e =
-                            self.inner
-                                .error_while_proxy(&peer, session, e, ctx, client_reused);
-                        // Sampled AFTER `error_while_proxy` returns, so an
-                        // application that flips the predicate from inside
-                        // that hook is honored for this very error.
-                        if !self.inner.request_retry_allowed(session, ctx) {
-                            e.retry = false.into();
-                        }
-                        Some(e)
-                    }
-                    None => None,
-                };
+                let error = error.map(|e| {
+                    self.inner
+                        .error_while_proxy(&peer, session, e, ctx, client_reused)
+                });
                 (server_reused, error)
             }
             Err(mut e) => {
                 e.as_up();
-                let mut new_err = self.inner.fail_to_connect(session, &peer, ctx, e);
-                if !self.inner.request_retry_allowed(session, ctx) {
-                    new_err.retry = false.into();
-                }
+                let new_err = self.inner.fail_to_connect(session, &peer, ctx, e);
                 (false, Some(new_err.into_up()))
             }
         }
@@ -719,6 +710,13 @@ pub struct Session {
     /// also has `data == None` while the trailer fact stays true) would
     /// re-fire the hook.
     pub(crate) request_trailer_filter_fired: bool,
+    /// Request-scoped relay policy and core-derived source, frozen before the
+    /// upstream retry loop.
+    frozen_request_relay_plan: Option<request_relay::FrozenRequestRelayPlan>,
+    /// Canonical identity of the current upstream attempt.
+    request_attempt_id: Option<RequestAttemptId>,
+    /// Whether native retry capture has started for the live source.
+    native_retry_buffer_state: request_relay::NativeRetryBufferState,
     /// Number of response header tasks whose downstream module filtering was
     /// completed early so a same-batch trailer hook can query planned framing.
     prepared_response_headers: usize,
@@ -750,8 +748,107 @@ impl Session {
             downstream_task_seen_upgraded: false,
             upstream_write_pending_time: Duration::ZERO,
             request_trailer_filter_fired: false,
+            frozen_request_relay_plan: None,
+            request_attempt_id: None,
+            native_retry_buffer_state: request_relay::NativeRetryBufferState::NotStarted,
             prepared_response_headers: 0,
             shutdown_flag,
+        }
+    }
+
+    fn freeze_request_relay_plan(&mut self, requested: RequestRelayPlan) -> Result<()> {
+        if self.frozen_request_relay_plan.is_some() {
+            return Error::e_explain(
+                InternalError,
+                "request relay plan was frozen more than once",
+            );
+        }
+        if requested.disposition == UpstreamRequestBodyDisposition::Streamed
+            && requested.replay != RequestReplayPolicy::Never
+        {
+            return Error::e_explain(
+                InternalError,
+                "a streamed request relay plan must disable replay",
+            );
+        }
+        let registered = self.downstream_session.request_body_buffer_registered();
+        self.downstream_session.freeze_request_body_configuration();
+        self.frozen_request_relay_plan = Some(request_relay::FrozenRequestRelayPlan::derive(
+            requested, registered,
+        ));
+        Ok(())
+    }
+
+    fn frozen_request_relay_plan(&self) -> request_relay::FrozenRequestRelayPlan {
+        self.frozen_request_relay_plan
+            .expect("request relay plan must be frozen before an upstream attempt")
+    }
+
+    /// Return the request-scoped relay policy once it has been frozen.
+    pub fn request_relay_plan(&self) -> Option<RequestRelayPlan> {
+        self.frozen_request_relay_plan.map(|plan| plan.requested)
+    }
+
+    /// Return the current canonical upstream attempt identity.
+    pub fn request_attempt_id(&self) -> Option<RequestAttemptId> {
+        self.request_attempt_id
+    }
+
+    fn begin_request_relay_attempt(&mut self, attempt: usize) {
+        self.request_attempt_id = Some(RequestAttemptId::new(attempt));
+    }
+
+    fn enable_request_relay_retry_buffer(&mut self) {
+        let plan = self.frozen_request_relay_plan();
+        if !plan.enables_native_retry_buffer()
+            || self.native_retry_buffer_state != request_relay::NativeRetryBufferState::NotStarted
+        {
+            return;
+        }
+        if self.downstream_session.retry_buffering_supported() {
+            self.downstream_session.enable_retry_buffering();
+            self.native_retry_buffer_state = request_relay::NativeRetryBufferState::Enabled;
+        } else {
+            self.native_retry_buffer_state = request_relay::NativeRetryBufferState::Unsupported;
+        }
+    }
+
+    fn request_relay_retry_buffer(&self) -> Option<Bytes> {
+        (self.native_retry_buffer_state == request_relay::NativeRetryBufferState::Enabled)
+            .then(|| self.downstream_session.get_retry_buffer())
+            .flatten()
+    }
+
+    /// Return the current body backing state used by the retry gate.
+    pub fn request_relay_retry_state(&self) -> RequestRelayRetryState {
+        let Some(plan) = self.frozen_request_relay_plan else {
+            return RequestRelayRetryState::Disabled;
+        };
+        if plan.requested.replay == RequestReplayPolicy::Never {
+            return RequestRelayRetryState::Disabled;
+        }
+        if plan.source == request_relay::RequestRelaySource::RegisteredReplay {
+            return if self
+                .downstream_session
+                .request_body_buffer_replay_available()
+            {
+                RequestRelayRetryState::RegisteredReplay
+            } else {
+                RequestRelayRetryState::RegisteredUnavailable
+            };
+        }
+        match self.native_retry_buffer_state {
+            request_relay::NativeRetryBufferState::NotStarted => RequestRelayRetryState::LiveUnread,
+            request_relay::NativeRetryBufferState::Unsupported => {
+                RequestRelayRetryState::Unsupported
+            }
+            request_relay::NativeRetryBufferState::Enabled => {
+                if self.downstream_session.retry_buffer_truncated() {
+                    RequestRelayRetryState::NativeTruncated
+                } else {
+                    RequestRelayRetryState::NativeCapturing
+                }
+            }
         }
     }
 
@@ -1403,6 +1500,16 @@ where
             }
         }
 
+        // Body policy is request-scoped. Freeze it exactly once after every
+        // pre-upstream request hook has completed, but before any attempt can
+        // select a peer or mutate attempt-local headers.
+        let relay_plan = self.inner.request_relay_plan(&session, &ctx);
+        if let Err(e) = session.freeze_request_relay_plan(relay_plan) {
+            return self
+                .handle_error(session, &mut ctx, e, "Error freezing request relay plan:")
+                .await;
+        }
+
         let mut retries: usize = 0;
 
         let mut server_reuse = false;
@@ -1410,6 +1517,7 @@ where
 
         while retries < self.max_retries {
             retries += 1;
+            session.begin_request_relay_attempt(retries);
 
             let (reuse, e) = self.proxy_to_upstream(&mut session, &mut ctx).await;
             server_reuse = reuse;
@@ -1419,7 +1527,13 @@ where
                     if final_response_committed(session.response_written()) {
                         error.retry = false.into();
                     }
-                    let retry = error.retry() && self.inner.request_retry_allowed(&session, &ctx);
+                    if !session.request_relay_retry_state().can_start_next_attempt() {
+                        // Preserve the final error's observable classification:
+                        // fail_to_proxy/logging must not see a retryable error
+                        // after the relay backing vetoed the retry.
+                        error.retry = false.into();
+                    }
+                    let retry = error.retry();
                     // only log error that will be retried here, the final error will be logged below
                     if retry
                         && !self.inner.suppress_proxy_warn_log(

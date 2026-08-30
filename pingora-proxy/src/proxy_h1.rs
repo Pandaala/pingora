@@ -18,6 +18,7 @@ use futures::StreamExt;
 use super::*;
 use crate::proxy_cache::ServeFromCache;
 use crate::proxy_common::*;
+use crate::request_relay::{RequestRelayOutcome, RequestRelayProtocol};
 use crate::response_pipeline::{ResponsePipelineState, ResponseProtocol};
 use pingora_core::protocols::http::{
     custom::CUSTOM_MESSAGE_QUEUE_SIZE, v1::common::is_upgrade_req as is_h1_upgrade_req,
@@ -148,10 +149,18 @@ where
         // Facts are collected inside `safe_upstream_disposition`, and only
         // when `disposition` is non-`Ordinary` -- see its doc comment for why
         // that is sound.
-        let disposition = self.inner.upstream_request_body_disposition(session, ctx);
+        let disposition = session.frozen_request_relay_plan().requested.disposition;
         // Only the H1 pump can end up sending a request below HTTP/1.1, which
         // has no chunked framing at all.
         let upstream_below_http11 = matches!(req.version, Version::HTTP_09 | Version::HTTP_10);
+        if let Err(e) = validate_streamed_upstream_disposition(
+            disposition,
+            session,
+            &req,
+            upstream_below_http11,
+        ) {
+            return (false, true, Some(e));
+        }
         let body_disposition =
             safe_upstream_disposition(disposition, session, &req, upstream_below_http11);
         if let Err(e) = apply_upstream_body_disposition(&mut req, body_disposition) {
@@ -191,9 +200,7 @@ where
         let (tx_upstream, rx_upstream) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
         let (tx_downstream, rx_downstream) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
 
-        if self.inner.request_retry_allowed(session, ctx) {
-            session.as_mut().enable_retry_buffering();
-        }
+        session.enable_request_relay_retry_buffer();
 
         // Shared signal so the upstream half can distinguish an expected task-pipe
         // closure (the downstream half finished and dropped rx) from an unexpected one.
@@ -614,7 +621,7 @@ where
 
         let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
 
-        let buffer = session.as_ref().get_retry_buffer();
+        let buffer = session.request_relay_retry_buffer();
         // Native retry-buffer path. Registered app buffers are replayed through
         // `read_body_or_idle()` below, one bounded chunk at a time.
         //
@@ -1119,8 +1126,8 @@ where
     async fn send_body_to_pipe(
         &self,
         session: &mut Session,
-        mut data: Option<Bytes>,
-        mut event: RequestBodyEvent,
+        data: Option<Bytes>,
+        event: RequestBodyEvent,
         tx: Option<mpsc::Permit<'_, HttpTask>>,
         ctx: &mut SV::CTX,
         body_disposition: UpstreamRequestBodyDisposition,
@@ -1129,65 +1136,18 @@ where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
     {
-        // None: end of body
-        // this var is to signal if downstream finish sending the body, which shouldn't be
-        // affected by the request_body_filter
-        if data.is_none() && event == RequestBodyEvent::Data {
-            event = RequestBodyEvent::Complete;
-        }
-        let end_of_body = event.is_terminal();
-
-        if event.is_complete()
-            && data.is_none()
-            && !session.request_trailer_filter_fired
-            && session
-                .downstream_session
-                .request_trailers_present()
-                .unwrap_or(false)
+        let prepared = match self
+            .request_relay_event(RequestRelayProtocol::H1, session, data, event, ctx)
+            .await?
         {
-            let action = self.inner.request_trailer_filter(session, ctx).await?;
-            // At most once per downstream request: a retry attempt replays the
-            // same EOF (`data == None`) while the trailer fact stays true, and
-            // the hook's contract is a single invocation.
-            //
-            // Latched only AFTER the hook returns: the pinned downstream
-            // future can be dropped mid-hook (the `select!` upstream-error
-            // arm) and the request then retried, and latching first would
-            // suppress the hook forever -- zero completed invocations for a
-            // trailer-bearing request.
-            //
-            // Consequence: the `?` above propagates an `Err` before this line,
-            // so the latch is set only on the `Ok` path. If the hook returns a
-            // *retryable* error, the retried attempt re-invokes it. The "at
-            // most once per downstream request" guarantee therefore holds only
-            // for a hook that either succeeds or fails non-retryably; a
-            // side-effecting hook that errors retryably may run again on the
-            // retry. This is intentional -- latching before `Err` would skip
-            // the filter on the retried upstream request, breaking retry
-            // correctness.
-            session.request_trailer_filter_fired = true;
-            if action == RequestBodyAction::Terminate {
-                warn_terminate_without_response(session, "request_trailer_filter");
+            RequestRelayOutcome::Continue(prepared) => prepared,
+            RequestRelayOutcome::Terminate(origin) => {
+                warn_terminate_without_response(session, origin.hook_name());
                 return Ok(DownstreamRequestOutcome::Terminate);
             }
-        }
-
-        session
-            .downstream_modules_ctx
-            .request_body_filter(&mut data, event)
-            .await?;
-
-        // TODO: request body filter to have info about upgraded status?
-        // (can also check session.was_upgraded())
-        if self
-            .inner
-            .request_body_filter_action(session, &mut data, event, ctx)
-            .await?
-            == RequestBodyAction::Terminate
-        {
-            warn_terminate_without_response(session, "request_body_filter_action");
-            return Ok(DownstreamRequestOutcome::Terminate);
-        }
+        };
+        let end_of_body = prepared.is_terminal();
+        let data = prepared.body;
 
         // the flag to signal to upstream
         let upstream_end_of_body = end_of_body || data.is_none();

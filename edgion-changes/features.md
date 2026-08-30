@@ -29,11 +29,16 @@ implementation.
 | Response trailer lifecycle | Typed pre-trailer boundary, awaited application hook, H1 parsing/writing, planned framing capability, HTTP/1.0 downgrade | core H1, proxy trait and pumps | [response-trailers.md](features/response-trailers.md) |
 | H2 END_STREAM evidence and upload liveness | Combine decoded state, EOF, content length, and qualified wire evidence; never trust wire flag alone; bound non-progressing request writes and release abandoned reservations | H2 watcher, client/connector, proxy H2 | [h2-end-stream.md](features/h2-end-stream.md) |
 
+The cross-cutting composition and ownership of request and response body
+features is canonicalized in [the body relay architecture](architecture/body-relay.md).
+
 ## Cross-feature invariants
 
-1. A downstream request-body terminal event is delivered at most once as
-   `Complete` or `Abandoned`; H1, H2, and custom upstream pumps all stop an
-   unfinished upload with `Abandoned` after the response completes.
+1. Each downstream request-body delivery sequence ends at most once as
+   `Complete` or `Abandoned`; a retry may replay a new `Data`/`Complete`
+   sequence through the application hook, while the request-trailer hook stays
+   at most once across attempts. H1, H2, and custom upstream pumps all stop an
+   unfinished live upload with `Abandoned` after the response completes.
 2. A fork-owned `RequestBodyBuffer` capture that is partial, cancelled,
    drained, or poisoned is never replayed as a complete request body. This
    guarantee does not cover upstream's alpha subrequest `SavedBody` API: its
@@ -68,6 +73,19 @@ implementation.
     is submitted to the normal `HTTPStatus(501)` error-rendering path and is
     independently denied downstream reuse before application filters, cache,
     upstream selection, buffering, or retry can observe it.
+11. Request-body relay policy is frozen once before the upstream retry loop.
+    The application selects framing intent and structural replayability; core
+    derives and locks the source, while effective wire framing and backing
+    readiness remain per-attempt/runtime facts. Edgion freezes body-affecting
+    capability after global/Gateway/route request plugins: backendRef plugins
+    may read an existing snapshot but cannot initiate capture, mutate it, or
+    install streamed processors.
+12. Edgion freezes writable response processors once after the final response
+    plugin onion and framing repair. One request-local driver owns AI, semantic,
+    ordinary body, and trailer processor instances; body/trailer execution
+    leases distinguish normal callback return from cancellation, while logging
+    retains a durable finalization handle. Empty processor sets allocate no
+    driver, and Pingora's protocol/cache pipeline remains unchanged.
 
 ## Ownership boundary
 

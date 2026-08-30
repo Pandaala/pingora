@@ -159,6 +159,10 @@ pub struct HttpSession {
     /// session and must fail closed instead of silently forwarding a bodyless
     /// request.
     early_body_buffer_released: bool,
+    /// Once set, application hooks may no longer replace the request body
+    /// source. The proxy freezes this immediately before entering its retry
+    /// loop so every attempt observes the same source contract.
+    request_body_configuration_frozen: bool,
     /// Whether this session is an upgraded session. This flag is calculated when sending the
     /// response header to the client.
     upgraded: bool,
@@ -247,6 +251,7 @@ impl HttpSession {
             early_body_capture_poisoned: false,
             early_body_buffer_discarded: false,
             early_body_buffer_released: false,
+            request_body_configuration_frozen: false,
             upgraded: false,
             digest,
             min_send_rate: None,
@@ -485,6 +490,7 @@ impl HttpSession {
                         self.early_body_buffer_released = false;
                         self.early_body_buffer_discarded = false;
                         self.early_body_capture_poisoned = false;
+                        self.request_body_configuration_frozen = false;
                         self.body_bytes_read = 0;
                         self.read_deadline = None;
                         self.respect_keepalive();
@@ -1526,6 +1532,12 @@ impl HttpSession {
     /// `enable_retry_buffering()` is not affected: it runs after the app has
     /// drained the body, and replayed chunks bypass the retry-buffer tee.)
     pub fn set_request_body_buffer(&mut self, buffer: Box<dyn RequestBodyBuffer>) -> Result<()> {
+        if self.request_body_configuration_frozen {
+            return Error::e_explain(
+                InternalError,
+                "request body configuration is frozen for upstream proxying",
+            );
+        }
         if self.early_body_buffer.is_some() {
             return Error::e_explain(InternalError, "request body buffer is already registered");
         }
@@ -1565,6 +1577,12 @@ impl HttpSession {
         &mut self,
         buffer: Box<dyn RequestBodyBuffer>,
     ) -> Result<()> {
+        if self.request_body_configuration_frozen {
+            return Error::e_explain(
+                InternalError,
+                "request body configuration is frozen for upstream proxying",
+            );
+        }
         if self.early_body_buffer.is_some() {
             return Error::e_explain(InternalError, "request body buffer is already registered");
         }
@@ -1596,6 +1614,19 @@ impl HttpSession {
 
     pub fn request_body_buffer_registered(&self) -> bool {
         self.early_body_buffer.is_some()
+    }
+
+    pub(crate) fn freeze_request_body_configuration(&mut self) {
+        self.request_body_configuration_frozen = true;
+    }
+
+    pub(crate) fn request_body_buffer_replay_available(&self) -> bool {
+        self.early_body_buffer.as_ref().is_some_and(|buffer| {
+            !self.early_body_capture_poisoned
+                && !self.early_body_buffer_discarded
+                && !self.early_body_buffer_released
+                && (buffer.is_ready_or_replay_done() || buffer.is_replaying())
+        })
     }
 
     /// Whether a registered request body buffer is currently replaying, i.e.

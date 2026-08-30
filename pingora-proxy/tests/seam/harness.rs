@@ -9,7 +9,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use h2::Reason;
-use http::Response;
+use http::{Method, Response};
 use log::error;
 use once_cell::sync::Lazy;
 use pingora_cache::lock::{CacheKeyLockImpl, CacheLock};
@@ -91,7 +91,7 @@ pub struct CompletionRecord {
     ///
     /// This is the ONLY observable for the two forcing points that sit next to
     /// `error_while_proxy` and `fail_to_connect`: the retry LOOP would refuse
-    /// the retry anyway (it re-checks the predicate), so the loop's own
+    /// the retry anyway (it checks the frozen plan), so the loop's own
     /// behaviour cannot tell those two lines apart from the loop's check. What
     /// the application sees on the error it is handed can.
     pub retry_flag: i8,
@@ -300,6 +300,8 @@ pub struct SeamCtx {
     /// `x-trailer-hook-calls`; the hook's contract is at most one call per
     /// downstream request, including across retry attempts.
     trailer_hook_calls: usize,
+    /// Request relay plans are frozen once, before all upstream attempts.
+    relay_plan_calls: AtomicUsize,
 }
 
 pub struct SeamProxy {}
@@ -440,14 +442,39 @@ impl ProxyHttp for SeamProxy {
         Ok(peer)
     }
 
-    fn request_retry_allowed(&self, session: &Session, _ctx: &Self::CTX) -> bool {
-        session.req_header().headers.get("x-no-retry").is_none()
+    fn request_relay_plan(
+        &self,
+        session: &Session,
+        ctx: &Self::CTX,
+    ) -> pingora_proxy::RequestRelayPlan {
+        ctx.relay_plan_calls.fetch_add(1, Ordering::Relaxed);
+        use pingora_proxy::UpstreamRequestBodyDisposition as D;
+        let disposition = match session
+            .req_header()
+            .headers
+            .get("x-disposition")
+            .and_then(|v| v.to_str().ok())
+        {
+            Some("streamed") => D::Streamed,
+            Some("bodyless") => D::Bodyless,
+            _ => D::Ordinary,
+        };
+        pingora_proxy::RequestRelayPlan {
+            disposition,
+            replay: if session.req_header().headers.get("x-no-retry").is_some()
+                || disposition == D::Streamed
+            {
+                pingora_proxy::RequestReplayPolicy::Never
+            } else {
+                pingora_proxy::RequestReplayPolicy::Replayable
+            },
+        }
     }
 
     /// Marking a connect failure retryable is this hook's documented purpose.
     /// Without it no reachable connect error is retryable at all (`l4.rs`
     /// resolves them all to `Decided(false)` for a fresh dial), so the guard
-    /// that forces the retry predicate onto this error would have nothing to
+    /// that forces the frozen replay policy onto this error would have nothing to
     /// act on and could not be tested.
     fn fail_to_connect(
         &self,
@@ -467,24 +494,6 @@ impl ProxyHttp for SeamProxy {
         e
     }
 
-    fn upstream_request_body_disposition(
-        &self,
-        session: &pingora_proxy::Session,
-        _ctx: &Self::CTX,
-    ) -> pingora_proxy::UpstreamRequestBodyDisposition {
-        use pingora_proxy::UpstreamRequestBodyDisposition as D;
-        match session
-            .req_header()
-            .headers
-            .get("x-disposition")
-            .and_then(|v| v.to_str().ok())
-        {
-            Some("streamed") => D::Streamed,
-            Some("bodyless") => D::Bodyless,
-            _ => D::Ordinary,
-        }
-    }
-
     async fn upstream_request_filter(
         &self,
         session: &mut Session,
@@ -501,6 +510,14 @@ impl ProxyHttp for SeamProxy {
             // request stream to be closed by an empty DATA frame carrying
             // END_STREAM, never by END_STREAM on HEADERS.
             upstream_request.set_send_end_stream(false);
+        }
+        if session
+            .req_header()
+            .headers
+            .get("x-synthesize-connect")
+            .is_some()
+        {
+            upstream_request.set_method(Method::CONNECT);
         }
         Ok(())
     }
@@ -592,9 +609,13 @@ impl ProxyHttp for SeamProxy {
         upstream_response.insert_header("x-body-bytes", ctx.body_bytes_seen.to_string())?;
         upstream_response
             .insert_header("x-trailer-hook-calls", ctx.trailer_hook_calls.to_string())?;
+        upstream_response.insert_header(
+            "x-relay-plan-calls",
+            ctx.relay_plan_calls.load(Ordering::Relaxed).to_string(),
+        )?;
         // Whether the native retry buffer holds this request's body, i.e.
         // whether `enable_retry_buffering()` ran. This is the observable for the
-        // retry predicate's FIRST consumption point, which the retry loop's own
+        // frozen replay policy's FIRST consumption point, which the retry loop's own
         // check masks entirely.
         let buffered = usize::from(session.as_mut().get_retry_buffer().is_some());
         upstream_response.insert_header("x-retry-buffer", buffered.to_string())?;
