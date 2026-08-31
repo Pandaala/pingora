@@ -387,9 +387,11 @@ pub trait ProxyHttp {
     /// before a trailer-free synthetic request-body EOF could be delivered.
     /// Pingora does not expose or forward the trailer fields.
     ///
-    /// It fires AT MOST ONCE per downstream request, on the attempt that
-    /// observes the transport EOF. Retry attempts replay the same EOF and do
-    /// not re-fire it.
+    /// A successful dispatch is claimed at most once per downstream request.
+    /// The claim is committed only after the awaited hook succeeds, so a
+    /// retryable error or cancellation may let a later attempt invoke the hook
+    /// again. Once claimed, replaying the EOF on a retry does not invoke it
+    /// again.
     ///
     /// It never fires on custom-connector sessions: the trailer-presence fact
     /// is `None` there.
