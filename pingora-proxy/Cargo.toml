@@ -54,9 +54,6 @@ pingora-load-balancing = { version = "0.8.0", path = "../pingora-load-balancing"
 pingora-prometheus = { version = "0.8.0", path = "../pingora-prometheus" }
 prometheus = "0"
 futures-util = "0.3"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-serde_yaml = "0.9"
 
 [target.'cfg(unix)'.dev-dependencies]
 hyperlocal = "0.9"
