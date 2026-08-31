@@ -13,6 +13,9 @@
 // limitations under the License.
 
 use super::*;
+use crate::pump_termination::{
+    join_bidirectional_pumps, DownstreamRequestOutcome, DuplexPumpOutcome,
+};
 use crate::request_relay::{
     safe_disposition, safe_upstream_disposition, violates_bodyless_contract, DispositionFacts,
 };

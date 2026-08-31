@@ -27,7 +27,7 @@ use pingora_error::{
 use pingora_http::RequestHeader;
 use std::time::Duration;
 
-use crate::proxy_common::{warn_terminate_without_response, DownstreamRequestOutcome};
+use crate::pump_termination::{warn_terminate_without_response, DownstreamRequestOutcome};
 use crate::request_relay::{
     bodyless_contract_violation, violates_bodyless_contract, RequestRelayOutcome,
     RequestRelayProtocol,

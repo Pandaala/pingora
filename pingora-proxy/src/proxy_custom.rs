@@ -27,9 +27,9 @@ use pingora_core::{
 };
 use proxy_cache::ServeFromCache;
 use proxy_common::{
-    no_downstream_body_to_read, release_cache_on_terminate, DownstreamRequestOutcome,
-    DownstreamStateMachine, PipeState, ResponseStateMachine,
+    no_downstream_body_to_read, DownstreamStateMachine, PipeState, ResponseStateMachine,
 };
+use pump_termination::{release_cache_on_terminate, DownstreamRequestOutcome};
 use tokio::sync::oneshot;
 
 use super::*;

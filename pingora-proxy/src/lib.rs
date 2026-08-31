@@ -216,6 +216,7 @@ mod proxy_h1;
 mod proxy_h2;
 mod proxy_purge;
 mod proxy_trait;
+mod pump_termination;
 mod request_relay;
 mod response_body_sink;
 mod response_head_barrier;

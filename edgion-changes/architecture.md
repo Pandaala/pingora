@@ -58,8 +58,10 @@ targets. Small tests that directly exercise one private detail remain inline.
   normalization, privately owned by the response pipeline module.
 - `request_relay.rs`: shared request disposition and bodyless-contract policy,
   plus the protocol-neutral per-event relay sequence.
-- `proxy_common.rs`: hop-by-hop header sanitation and the remaining shared
-  completion, retry, and reuse decisions.
+- `pump_termination.rs`: typed duplex outcomes, biased pump joining, and shared
+  termination diagnostics and cleanup.
+- `proxy_common.rs`: hop-by-hop header sanitation, pump state machines, and
+  custom-reader restoration.
 - `proxy_cache.rs`: cache lookup/fill/hit interleaved with body processing.
 - `response_body_sink.rs`: fork response-body emission/termination and
   callback-local held-head decision surface.
@@ -139,8 +141,8 @@ consumer tree.
 2. Read the diff and public contract.
 3. For consumer-visible seams, inspect Edgion's use and selected revision.
 4. Locate the lifecycle phase in `pingora-proxy/src/lib.rs`.
-5. Read `request_relay.rs`, `proxy_common.rs`, each reachable pump, and cache
-   path.
+5. Read `request_relay.rs`, `pump_termination.rs`, `proxy_common.rs`, each
+   reachable pump, and cache path.
 6. Descend through the core session to concrete protocol/connector/listener.
 7. Select tests from [the verification matrix](verification/test-matrix.md).
 

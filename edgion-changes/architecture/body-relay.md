@@ -222,6 +222,11 @@ same typed termination cleanup contract as H1/H2.
 
 ### 6. Request termination and cleanup
 
+`pingora-proxy/src/pump_termination.rs` owns the protocol-neutral typed duplex
+outcomes, biased join policy, and shared termination diagnostics and cleanup.
+The H1/H2/custom pumps still own protocol I/O, sibling cancellation effects,
+stream or connection cleanup, cache finalization, and reuse decisions.
+
 - Natural downstream completion produces one `Complete` event per delivery
   sequence.
 - An early upstream response stops an unfinished live upload and delivers
@@ -633,6 +638,7 @@ Pingora:
 - `pingora-proxy/src/response_terminal.rs`
 - `pingora-proxy/src/response_body_sink.rs`
 - `pingora-proxy/src/proxy_cache.rs`
+- `pingora-proxy/src/pump_termination.rs`
 - `pingora-proxy/src/proxy_common.rs`
 - `pingora-core/src/protocols/http/body_buffer.rs`
 

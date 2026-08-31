@@ -18,6 +18,12 @@ use futures::StreamExt;
 use super::*;
 use crate::proxy_cache::ServeFromCache;
 use crate::proxy_common::*;
+use crate::pump_termination::{
+    downstream_body_read_is_futile, finish_terminated_response, join_bidirectional_pumps,
+    release_cache_on_terminate, warn_response_body_terminate_content_length_leak,
+    warn_response_body_terminate_without_response, warn_terminate_without_response,
+    DownstreamRequestOutcome, DuplexPumpOutcome,
+};
 use crate::request_relay::{
     bodyless_contract_violation, safe_upstream_disposition, validate_streamed_upstream_disposition,
     violates_bodyless_contract, RequestRelayOutcome, RequestRelayProtocol,

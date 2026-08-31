@@ -36,9 +36,12 @@ The expected shared-main conflict surface is intentionally concentrated:
 - `pingora-proxy/src/request_relay.rs`: preserve request disposition validation,
   safe coercion, the bodyless application contract, and per-event relay
   semantics as one protocol-neutral policy station.
-- `pingora-proxy/src/proxy_common.rs`: preserve upstream hop-by-hop sanitation
-  and the remaining completion, retry, and reuse state independently from the
-  relay policy.
+- `pingora-proxy/src/pump_termination.rs`: preserve typed duplex outcomes, the
+  biased join and error priority, and shared termination diagnostics and
+  cleanup as one capability.
+- `pingora-proxy/src/proxy_common.rs`: preserve upstream hop-by-hop sanitation,
+  pump state machines, and custom-reader restoration independently from relay
+  and termination policy.
 
 ## Resolution rules
 

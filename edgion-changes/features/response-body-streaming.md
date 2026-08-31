@@ -77,7 +77,8 @@ length.
 - `pingora-proxy/src/response_body_sink.rs`: bounded output state.
 - `pingora-proxy/src/response_terminal.rs`: terminal latch and empty-trailer
   normalization.
-- `pingora-proxy/src/proxy_common.rs`: shared pump outcomes.
+- `pingora-proxy/src/pump_termination.rs`: shared pump outcomes and termination
+  diagnostics and cleanup.
 - `pingora-proxy/src/proxy_cache.rs`: EOS migration and synthetic cache marker.
 - `proxy_h1.rs`, `proxy_h2.rs`, `proxy_custom.rs`: protocol pumps.
 - `proxy_trait.rs`: allocation-free object-safe defaults and compatible async
