@@ -28,6 +28,7 @@ use pingora_error::{
     Result,
 };
 use pingora_http::RequestHeader;
+use std::future::Future;
 
 const MAX_CONNECTION_NOMINATIONS: usize = 10;
 pub(crate) const KEEP_ALIVE: &str = "keep-alive";
@@ -996,14 +997,109 @@ pub(crate) fn restore_custom_message_reader(
 pub(crate) enum DownstreamRequestOutcome {
     /// Normal completion; the bool is downstream connection reusability.
     Complete(bool),
-    /// The downstream response completed successfully, but the upstream
-    /// response source failed after that terminal boundary. The bool is the
-    /// downstream connection reusability; the upstream connection must not
-    /// be reused.
+    /// The downstream response completed successfully after the selected
+    /// origin became unusable or irrelevant (for example, a source failure
+    /// after the terminal boundary or a bounded local replacement). The bool
+    /// is downstream connection reusability; the upstream connection/stream
+    /// must not be reused.
     CompleteWithoutUpstreamReuse(bool),
     /// Application termination: proxying of this request stops here. The
     /// application has already finished the downstream response.
     Terminate,
+}
+
+/// Result of joining the two halves of a bidirectional proxy pump.
+///
+/// `OriginAbandoned` intentionally carries no upstream result: the sibling
+/// future is dropped as soon as a complete replacement response makes the
+/// selected origin irrelevant. Keeping this distinction here prevents both
+/// the H1 and H2 transports from accidentally waiting for origin EOS before
+/// performing their protocol-specific non-reuse/reset cleanup.
+pub(crate) enum DuplexPumpOutcome<T> {
+    ApplicationTerminate {
+        /// Present only when the upstream half had already completed before
+        /// the downstream application selected termination.
+        upstream: Option<T>,
+    },
+    Complete {
+        downstream_can_reuse: bool,
+        upstream: T,
+    },
+    OriginAbandoned {
+        downstream_can_reuse: bool,
+    },
+    Failed(BError),
+}
+
+/// Join request/downstream processing with the upstream response reader.
+///
+/// Normal downstream completion still waits for the upstream half so request
+/// writes and response reads settle naturally. Application termination and a
+/// replacement response instead stop immediately and drop the sibling future.
+pub(crate) async fn join_bidirectional_pumps<D, U, T>(
+    downstream: D,
+    upstream: U,
+) -> DuplexPumpOutcome<T>
+where
+    D: Future<Output = Result<DownstreamRequestOutcome>>,
+    U: Future<Output = Result<T>>,
+{
+    tokio::pin!(downstream);
+    tokio::pin!(upstream);
+
+    tokio::select! {
+        // If application termination or origin abandonment and an upstream
+        // error become ready in the same poll, the typed downstream outcome
+        // wins. It already owns the final downstream response semantics.
+        biased;
+
+        downstream_result = &mut downstream => {
+            match downstream_result {
+                Ok(DownstreamRequestOutcome::Terminate) => {
+                    DuplexPumpOutcome::ApplicationTerminate { upstream: None }
+                }
+                Ok(DownstreamRequestOutcome::Complete(downstream_can_reuse)) => {
+                    match upstream.await {
+                        Ok(upstream) => DuplexPumpOutcome::Complete {
+                            downstream_can_reuse,
+                            upstream,
+                        },
+                        Err(error) => DuplexPumpOutcome::Failed(error),
+                    }
+                }
+                Ok(DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(
+                    downstream_can_reuse,
+                )) => DuplexPumpOutcome::OriginAbandoned {
+                    downstream_can_reuse,
+                },
+                Err(error) => DuplexPumpOutcome::Failed(error),
+            }
+        }
+        upstream_result = &mut upstream => {
+            match upstream_result {
+                Ok(upstream) => match downstream.await {
+                    Ok(DownstreamRequestOutcome::Terminate) => {
+                        DuplexPumpOutcome::ApplicationTerminate {
+                            upstream: Some(upstream),
+                        }
+                    }
+                    Ok(DownstreamRequestOutcome::Complete(downstream_can_reuse)) => {
+                        DuplexPumpOutcome::Complete {
+                            downstream_can_reuse,
+                            upstream,
+                        }
+                    }
+                    Ok(DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(
+                        downstream_can_reuse,
+                    )) => DuplexPumpOutcome::OriginAbandoned {
+                        downstream_can_reuse,
+                    },
+                    Err(error) => DuplexPumpOutcome::Failed(error),
+                },
+                Err(error) => DuplexPumpOutcome::Failed(error),
+            }
+        }
+    }
 }
 
 #[cfg(test)]

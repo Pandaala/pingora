@@ -469,6 +469,18 @@ pub trait ProxyHttp {
         Ok(())
     }
 
+    /// Whether this request may select a response-head Hold after cache lookup.
+    ///
+    /// The cache layer checks this request-stage fact after
+    /// [`Self::request_cache_filter`] and before cache-key generation or
+    /// lookup. A true value disables cache lookup and admission for the
+    /// request, because Hold and entity caching are mutually exclusive in the
+    /// initial response-head barrier contract. The default preserves existing
+    /// cache behavior.
+    fn response_head_may_hold(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
+        false
+    }
+
     /// This callback generates the cache key.
     ///
     /// This callback is called only when cache is enabled for this request.
@@ -723,9 +735,10 @@ pub trait ProxyHttp {
     /// informational responses do not call it.
     ///
     /// The default [`ResponseHeadCommitPlan::Immediate`] preserves existing
-    /// behavior without allocating. The bounded Hold shape is intentionally
-    /// dormant until deadline polling and protocol cleanup are complete; this
-    /// delivery slice exposes no public Hold constructor.
+    /// behavior without allocating. Applications may construct a bounded Hold
+    /// for supported ordinary final origin responses. Unsupported cache,
+    /// custom, upgrade, or tunnel shapes reach the typed boundary hook and
+    /// never degrade silently to Immediate.
     fn response_head_commit_plan(
         &self,
         _session: &Session,

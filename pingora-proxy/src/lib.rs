@@ -107,12 +107,17 @@ fn reconcile_terminal_response_tasks(
             _ => None,
         })
         .sum::<usize>();
+    let has_followup = tasks.len() > start + 1;
     let HttpTask::Header(header, eos) = &mut tasks[start] else {
         unreachable!("located task must be a response header")
     };
-    *eos = false;
+    *eos = !has_followup;
 
     reconcile_content_length(header, body_len);
+    if !has_followup {
+        header.remove_header(&http::header::TRANSFER_ENCODING);
+        return Ok(());
+    }
     if header.headers.get(http::header::CONTENT_LENGTH).is_none()
         && header
             .headers

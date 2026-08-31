@@ -469,6 +469,23 @@ async fn get(port: u16, retain: bool) -> reqwest::Result<reqwest::Response> {
     req.send().await
 }
 
+async fn get_with_head_hold(
+    client: &reqwest::Client,
+    port: u16,
+    use_h2_upstream: bool,
+    decision: &str,
+) -> reqwest::Result<reqwest::Response> {
+    let mut request = client
+        .get("http://127.0.0.1:6147/terminal-body")
+        .header("x-port", port.to_string())
+        .header("x-response-head-hold", decision)
+        .timeout(Duration::from_secs(10));
+    if use_h2_upstream {
+        request = request.header("x-h2", "true");
+    }
+    request.send().await
+}
+
 /// `get(port, true)` plus an `x-eos-probe` id, so the harness also counts the
 /// terminal dispatch out of band (`take_eos_dispatches`).
 async fn get_probed(port: u16, probe: &str) -> reqwest::Result<reqwest::Response> {
@@ -547,6 +564,84 @@ async fn h2_upstream_rejects_the_next_chunk_after_the_limit() {
     assert!(
         error.starts_with("InternalError|") && error.contains(&expected),
         "H2 overflow failed for the wrong reason: {error}"
+    );
+}
+
+#[tokio::test]
+async fn response_head_hold_releases_or_replaces_on_h1_and_h2_upstream_pumps() {
+    init_without_mock_origin();
+    let client = reqwest::Client::new();
+
+    let h1_release_origin = spawn_h1_chunked_origin(false).await;
+    let response = get_with_head_hold(&client, h1_release_origin, false, "release")
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), "alphabeta");
+
+    let h1_replace_origin = spawn_h1_chunked_origin(false).await;
+    let response = get_with_head_hold(&client, h1_replace_origin, false, "replace")
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.headers()["x-response-head-replacement"], "true");
+    assert_eq!(response.text().await.unwrap(), "blocked");
+
+    let h2_release_origin = spawn_origin(Termination::EndStreamOnLastData).await;
+    let response = get_with_head_hold(&client, h2_release_origin, true, "release")
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.text().await.unwrap(), whole_body());
+
+    let h2_replace_origin = spawn_origin(Termination::EndStreamOnLastData).await;
+    let response = get_with_head_hold(&client, h2_replace_origin, true, "replace")
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.headers()["x-response-head-replacement"], "true");
+    assert_eq!(response.text().await.unwrap(), "blocked");
+}
+
+#[tokio::test]
+async fn response_head_replacement_drops_h1_reuse_but_preserves_the_h2_connection() {
+    init_without_mock_origin();
+    let client = reqwest::Client::new();
+
+    let (h1_port, h1_connections, h1_requests) = spawn_reusable_h1_trailered_origin().await;
+    let replaced = get_with_head_hold(&client, h1_port, false, "replace")
+        .await
+        .unwrap();
+    assert_eq!(replaced.status(), StatusCode::FORBIDDEN);
+    assert_eq!(replaced.text().await.unwrap(), "blocked");
+    let released = get_with_head_hold(&client, h1_port, false, "release")
+        .await
+        .unwrap();
+    assert_eq!(released.status(), StatusCode::OK);
+    assert_eq!(released.text().await.unwrap(), whole_body());
+    assert_eq!(h1_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        h1_connections.load(Ordering::SeqCst),
+        2,
+        "a replaced H1 origin response must not return its connection to the pool"
+    );
+
+    let (h2_port, h2_connections, h2_requests) = spawn_reusable_trailered_origin().await;
+    let replaced = get_with_head_hold(&client, h2_port, true, "replace")
+        .await
+        .unwrap();
+    assert_eq!(replaced.status(), StatusCode::FORBIDDEN);
+    assert_eq!(replaced.text().await.unwrap(), "blocked");
+    let released = get_with_head_hold(&client, h2_port, true, "release")
+        .await
+        .unwrap();
+    assert_eq!(released.status(), StatusCode::OK);
+    assert_eq!(released.text().await.unwrap(), whole_body());
+    assert_eq!(h2_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        h2_connections.load(Ordering::SeqCst),
+        1,
+        "replacement must cancel only the H2 stream, not the shared connection"
     );
 }
 

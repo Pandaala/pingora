@@ -49,19 +49,22 @@ targets. Small tests that directly exercise one private detail remain inline.
   upstream selection/retry, errors, and pump dispatch.
 - `proxy_h1.rs`, `proxy_h2.rs`, `proxy_custom.rs`: protocol-specific duplex
   request/response pumps, transport cancellation, framing, and reuse outcomes.
-- `response_pipeline.rs`: shared response-task semantic stages: upstream and
-  terminal hooks, cache admission, downstream transforms, sink drain, and
-  prepared task batches. `ResponseProtocol` keeps the H1/H2/custom wire and
-  upgrade differences explicit without dynamic dispatch.
+- `response_pipeline.rs`: shared response-task semantic stages: optional
+  bounded final-head commit barrier, upstream and terminal hooks, cache
+  admission, downstream transforms, sink drain, and prepared task batches.
+  `ResponseProtocol` keeps the H1/H2/custom wire and upgrade differences
+  explicit without dynamic dispatch.
 - `proxy_common.rs`: shared event, completion, retry, and reuse decisions.
 - `proxy_cache.rs`: cache lookup/fill/hit interleaved with body processing.
-- `response_body_sink.rs`: fork response-body emission/termination surface.
+- `response_body_sink.rs`: fork response-body emission/termination and
+  callback-local held-head decision surface.
+- `response_head_barrier.rs`: bounded retained-task/accounting/deadline state.
 
 ## Request and response flow
 
 The current request/response semantic station, including request plan freeze,
 retry backing, shared event/task ordering, Edgion processor ownership, and the
-remaining response-head barrier, is specified in
+bounded response-head barrier, is specified in
 [the body relay architecture](architecture/body-relay.md).
 
 ```text

@@ -67,6 +67,78 @@ fn h1_transfer_encoding_forwardability_is_exactly_one_chunked_field() {
     }
 }
 
+#[tokio::test]
+async fn origin_abandonment_drops_a_pending_upstream_pump_immediately() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let dropped = Arc::new(AtomicBool::new(false));
+    let upstream_probe = DropProbe(dropped.clone());
+    let upstream = async move {
+        let _probe = upstream_probe;
+        std::future::pending::<Result<()>>().await
+    };
+
+    let outcome = tokio::time::timeout(
+        Duration::from_millis(100),
+        join_bidirectional_pumps(
+            async { Ok(DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(true)) },
+            upstream,
+        ),
+    )
+    .await
+    .expect("origin abandonment must not wait for upstream EOS");
+
+    assert!(matches!(
+        outcome,
+        DuplexPumpOutcome::OriginAbandoned {
+            downstream_can_reuse: true
+        }
+    ));
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "the pending upstream sibling must be dropped before the join returns"
+    );
+}
+
+#[tokio::test]
+async fn normal_completion_still_awaits_the_upstream_pump() {
+    use std::time::{Duration, Instant};
+
+    let started = Instant::now();
+    let outcome = join_bidirectional_pumps(
+        async { Ok(DownstreamRequestOutcome::Complete(false)) },
+        async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(7usize)
+        },
+    )
+    .await;
+
+    assert!(matches!(
+        outcome,
+        DuplexPumpOutcome::Complete {
+            downstream_can_reuse: false,
+            upstream: 7
+        }
+    ));
+    assert!(
+        started.elapsed() >= Duration::from_millis(15),
+        "normal completion must preserve the sibling-settlement contract"
+    );
+}
+
 #[test]
 fn h2_upstream_removes_connection_nominated_fields_by_default() {
     let mut request = request_with_headers(&[

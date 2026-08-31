@@ -27,14 +27,15 @@ implementation.
 | Request-body transport controls | H1 transfer-coding admission, consistent events, dispositions, termination, trailers, retry gates, cleanup | proxy entry, trait/common and pumps | [request-body-transport.md](features/request-body-transport.md) |
 | Response-body streaming controls | Async filter/sink, allocation-free defaults, bounded emitted bytes and chunk count, typed termination, terminal dispatch, cache/live ordering | trait, shared pipeline, sink, pumps, cache | [response-body-streaming.md](features/response-body-streaming.md) |
 | Response trailer lifecycle | Typed pre-trailer boundary, awaited application hook, H1 parsing/writing, planned framing capability, HTTP/1.0 downgrade | core H1, proxy trait and pumps | [response-trailers.md](features/response-trailers.md) |
+| Bounded response-head commit barrier | Default-Immediate final-head plan; opt-in hard-bounded Hold with Release/Replace/Fail, cache bypass, absolute deadline, writer claim, and protocol-safe origin abandonment | proxy trait, shared response pipeline/sink, H1/H2 pumps, cache; Edgion Guardrail claimant | [response-head-commit-barrier.md](features/response-head-commit-barrier.md) |
 | H2 END_STREAM evidence and upload liveness | Combine decoded state, EOF, content length, and qualified wire evidence; never trust wire flag alone; bound non-progressing request writes and release abandoned reservations | H2 watcher, client/connector, proxy H2 | [h2-end-stream.md](features/h2-end-stream.md) |
 
 The cross-cutting composition and ownership of request and response body
 features is canonicalized in [the body relay architecture](architecture/body-relay.md).
-The bounded response-head commit barrier is still an uncommitted Phase 4
-implementation and is therefore not yet part of this current feature inventory;
-its accepted contract and live progress are tracked in
-[the Phase 4 pending record](pending-issues/response-head-commit-barrier.md).
+The bounded response-head commit barrier is implemented in the current local
+worktree and remains default-Immediate unless an application explicitly opts
+in. Its closure history and exact verification snapshot are tracked in
+[the Phase 4 record](pending-issues/response-head-commit-barrier.md).
 
 ## Cross-feature invariants
 
@@ -90,6 +91,12 @@ its accepted contract and live progress are tracked in
     leases distinguish normal callback return from cancellation, while logging
     retains a durable finalization handle. Empty processor sets allocate no
     driver, and Pingora's protocol/cache pipeline remains unchanged.
+13. A possible response-head Hold is declared before cache key generation or
+    lookup, while actual Hold activation waits for an installed claimant and
+    the final post-onion response. Every Hold resolves before header
+    preparation exactly once as Release, Replace, or Fail; H1 origin
+    abandonment forbids reuse, H2 abandons only the affected stream, and the
+    default Immediate path remains allocation-free.
 
 ## Ownership boundary
 

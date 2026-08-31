@@ -51,6 +51,14 @@ pub struct ResponseBodySink {
     remaining_chunks: usize,
     terminate: bool,
     head_control: ResponseHeadControl,
+    head_work: Option<ResponseHeadWorkBudget>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResponseHeadWorkBudget {
+    remaining: u64,
+    used: u64,
+    exhausted: bool,
 }
 
 #[derive(Debug)]
@@ -82,6 +90,7 @@ impl ResponseBodySink {
             remaining_chunks: RESPONSE_BODY_EMIT_CHUNK_BUDGET,
             terminate: false,
             head_control: ResponseHeadControl::Disarmed,
+            head_work: None,
         }
     }
 
@@ -105,6 +114,45 @@ impl ResponseBodySink {
     /// callback-local decision.
     pub fn response_head_is_held(&self) -> bool {
         !matches!(self.head_control, ResponseHeadControl::Disarmed)
+    }
+
+    /// Whether the active Hold has a staged callback decision waiting for the
+    /// response pipeline to consume it.
+    ///
+    /// Product processor drivers can use this after their full callback chain
+    /// returns to avoid translating a precommit Replace/Fail into the legacy
+    /// post-commit stream-termination path.
+    pub fn response_head_decision_pending(&self) -> bool {
+        matches!(
+            self.head_control,
+            ResponseHeadControl::Release
+                | ResponseHeadControl::Replace(_)
+                | ResponseHeadControl::Fail(_)
+        )
+    }
+
+    /// Reserve units from the response-head Hold work budget before performing
+    /// bounded synchronous or external work. Reservations survive pump batch
+    /// resets and are aggregated into the final content-free usage report.
+    pub fn reserve_response_head_work(&mut self, units: u64) -> Result<()> {
+        let Some(work) = self.head_work.as_mut() else {
+            return Error::e_explain(InternalError, "response head work requested outside Hold");
+        };
+        if units > work.remaining {
+            work.exhausted = true;
+            return Error::e_explain(
+                InternalError,
+                format!(
+                    "response head work budget exhausted: {units} units requested, {} remaining",
+                    work.remaining
+                ),
+            );
+        }
+        work.remaining -= units;
+        work.used = work.used.checked_add(units).ok_or_else(|| {
+            Error::explain(InternalError, "response head work accounting overflow")
+        })?;
+        Ok(())
     }
 
     /// Replace the held origin prefix with one complete bounded response.
@@ -141,12 +189,33 @@ impl ResponseBodySink {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn arm_response_head_release(&mut self) -> bool {
+        self.arm_response_head_release_with_work_limit(u64::MAX)
+    }
+
+    pub(crate) fn arm_response_head_release_with_work_limit(
+        &mut self,
+        max_work_units: u64,
+    ) -> bool {
         if !matches!(self.head_control, ResponseHeadControl::Disarmed) {
             return false;
         }
         self.head_control = ResponseHeadControl::Armed;
+        self.head_work = Some(ResponseHeadWorkBudget {
+            remaining: max_work_units,
+            used: 0,
+            exhausted: false,
+        });
         true
+    }
+
+    pub(crate) fn response_head_work_units(&self) -> Option<u64> {
+        self.head_work.map(|work| work.used)
+    }
+
+    pub(crate) fn response_head_work_limit_exceeded(&self) -> bool {
+        self.head_work.is_some_and(|work| work.exhausted)
     }
 
     pub(crate) fn take_response_head_decision(&mut self) -> Option<ResponseHeadDecision> {
@@ -166,6 +235,7 @@ impl ResponseBodySink {
 
     pub(crate) fn disarm_response_head_release(&mut self) {
         self.head_control = ResponseHeadControl::Disarmed;
+        self.head_work = None;
     }
 
     /// Queue an additional chunk to be written downstream after the current
@@ -358,6 +428,59 @@ mod tests {
             fail.take_response_head_decision(),
             Some(ResponseHeadDecision::Fail(error)) if error.to_string().contains("decision failure")
         ));
+    }
+
+    #[test]
+    fn only_staged_head_decisions_are_reported_as_pending() {
+        let mut sink = ResponseBodySink::new();
+        assert!(!sink.response_head_decision_pending());
+
+        assert!(sink.arm_response_head_release());
+        assert!(sink.response_head_is_held());
+        assert!(!sink.response_head_decision_pending());
+
+        assert!(sink.release_response_head());
+        assert!(sink.response_head_decision_pending());
+        assert!(matches!(
+            sink.take_response_head_decision(),
+            Some(ResponseHeadDecision::Release)
+        ));
+        assert!(!sink.response_head_decision_pending());
+
+        assert!(sink.arm_response_head_release());
+        sink.replace_response_head(ResponseHeadReplacement::new(
+            Box::new(pingora_http::ResponseHeader::build(403, None).unwrap()),
+            Vec::new(),
+        ))
+        .unwrap();
+        assert!(sink.response_head_decision_pending());
+        assert!(matches!(
+            sink.take_response_head_decision(),
+            Some(ResponseHeadDecision::Replace(_))
+        ));
+
+        assert!(sink.arm_response_head_release());
+        sink.fail_response_head(Error::explain(InternalError, "decision failure"))
+            .unwrap();
+        assert!(sink.response_head_decision_pending());
+        assert!(matches!(
+            sink.take_response_head_decision(),
+            Some(ResponseHeadDecision::Fail(_))
+        ));
+    }
+
+    #[test]
+    fn pending_release_keeps_charging_the_hold_work_budget() {
+        let mut sink = ResponseBodySink::new();
+        assert!(sink.arm_response_head_release_with_work_limit(2));
+        sink.reserve_response_head_work(1).unwrap();
+        assert!(sink.release_response_head());
+
+        sink.reserve_response_head_work(1).unwrap();
+        assert_eq!(sink.response_head_work_units(), Some(2));
+        assert!(sink.reserve_response_head_work(1).is_err());
+        assert!(sink.response_head_work_limit_exceeded());
+        assert!(sink.response_head_decision_pending());
     }
 
     #[test]

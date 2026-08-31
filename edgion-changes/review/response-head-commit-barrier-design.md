@@ -13,9 +13,11 @@ The reviewed baseline is:
 - Edgion `af83f684249186a25d2edecabab51baa76d60edf` plus its uncommitted
   Phase 2/3 consumer worktree.
 
-The current implemented Phase 1-3 architecture remains canonical in
-[`architecture/body-relay.md`](../architecture/body-relay.md). Nothing in this
-record may be described there as implemented until executable evidence exists.
+At design acceptance, the implemented Phase 1-3 architecture remained
+canonical in [`architecture/body-relay.md`](../architecture/body-relay.md), and
+nothing in this proposal could be promoted before executable evidence existed.
+Phase 4 has since passed that gate; the current contract is now owned by
+[`features/response-head-commit-barrier.md`](../features/response-head-commit-barrier.md).
 
 ## Problem
 

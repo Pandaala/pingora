@@ -40,10 +40,10 @@ Expected feature coverage:
 | `pingora-core --lib` | body buffers, H1/H2 sessions, END_STREAM watch, listener and PROXY parser |
 | `pingora-core --lib --features boringssl` | complete TLS-backed core suite, including deterministic direct/high-level local source-bind classification and timeout-context separation |
 | `pingora-core --lib --features boringssl test_listen_tls_proxy_protocol` | explicit PROXY-before-TLS rejection stages, successful handshake and address preservation |
-| `pingora-proxy --lib` | 126 passed plus 1 ignored manual benchmark: H1 transfer-coding admission, disposition truth-table, H2 write-floor and abandoned-reservation cleanup, terminal-latch, object-compatible response hooks, shared response-pipeline parity, sink-budget, EOS-migration and retry-guard tests |
-| `test_request_body_seam` | 60 H1/H2 request-pump, framing, retry, transfer-coding admission and termination scenarios |
+| `pingora-proxy --lib` | 194 passed plus 2 ignored manual benchmarks in the Phase 4 snapshot: request relay, response-head barrier/pipeline, H1/H2 lifecycle, cache hooks, sink decisions/budgets, terminal latch, EOS migration, and retry guards |
+| `test_request_body_seam` | 61 H1/H2 request-pump, framing, retry, transfer-coding admission and termination scenarios |
 | `test_upstream_response_body_sink` | 57 response streaming/cache/custom scenarios |
-| `test_terminal_body_dispatch` | 26 self-contained terminal/trailer scenarios |
+| `test_terminal_body_dispatch` | 28 self-contained terminal/trailer and real H1/H2 response-head Hold scenarios |
 | `test_h2_upstream_no_error_reset` | 8 self-contained H2 reset/completion scenarios |
 | `test_h2_upstream_stalled_after_response` | 4 H2 request-body stall, configured-deadline, default-floor and END_STREAM discrimination scenarios |
 | `test_h2_upstream_cache_and_reuse` | 8 H2 cache-admission, upstream-connection-reuse, stalled-write cleanup and peer-window-handshake scenarios |
@@ -82,6 +82,50 @@ audits should record a pre-change hash if byte-for-byte restoration matters.
 not raise this workspace's Rust 1.85 MSRV.
 
 ## Validation snapshot
+
+Validated on 2026-08-31 for the uncommitted Phase 4 response-head barrier
+working trees based on Pingora `48f603e9` and Edgion `af83f684`:
+
+- `cargo fmt --all -- --check`: passed in both repositories.
+- `cargo check -p pingora-core -p pingora-proxy`: passed.
+- `cargo check -p edgion-gateway -p edgion-resources`: passed with Edgion's
+  local path patch selecting this Pingora checkout.
+- `cargo test -p pingora-proxy --lib`: 194 passed, 2 ignored manual
+  benchmarks. This includes typed boundaries, every hard limit, cross-batch
+  retention, absolute timeout/cancellation, source/application failures,
+  Release/Replace/Fail, direct cache defense, pre-key cache bypass, prompt
+  origin abandonment, and pending-decision/work accounting.
+- `test_request_body_seam`: 61 passed.
+- `test_upstream_response_body_sink`: 57 passed.
+- `test_terminal_body_dispatch`: 28 passed. Two Phase 4 cases exercise real
+  H1 and H2 upstream pumps for Release and complete 403 Replace; replacement
+  forces two H1 origin connections while two H2 requests use one shared
+  connection.
+- `test_h2_upstream_no_error_reset`: 8 passed.
+- `test_h2_upstream_stalled_after_response`: 4 passed.
+- `test_h2_upstream_cache_and_reuse`: 8 passed with the required host loopback
+  alias already present.
+- `cargo test -p edgion-gateway --lib`: 3308 passed, 2 ignored. Focused
+  Guardrail coverage includes pending Release upgrade to Replace/Fail,
+  continued precommit work charging, non-Hold same-callback Pass then Reject,
+  cancellation cleanup, and the final response-head hooks.
+- `cargo test -p edgion-resources --lib`: 1680 passed, including Guardrail
+  defaults, bounds, schema, and `holdFirstWindow + failOpen` rejection.
+- Manual Immediate-path release benchmark:
+  `response_task_pipeline: 53.54 ns/task, 0.0000 allocations/task` for 100,000
+  iterations on the Apple arm64 host. This matches the pre-Phase-4 shared
+  pipeline's approximately 54 ns / 0 allocation result; wall time remains
+  review evidence rather than a pass/fail contract.
+- `cargo clippy -p pingora-proxy --all-targets`: passed with only the existing
+  core large-enum, H2 test redundant-async-block, and response-sink test
+  identical-branch warnings; no Phase 4 production or test line warns.
+- `cargo clippy -p edgion-gateway --lib`: passed with the repository's existing
+  warning baseline; no changed Guardrail/head-commit line warns.
+- `git diff --check`: passed in both repositories.
+
+The Phase 4 run did not repeat feature-gated `pingora-core` suites because the
+barrier changes only `pingora-proxy` and its sibling consumer. Their most recent
+complete evidence remains the 2026-08-30 snapshot below.
 
 Validated on 2026-08-30 against the H1 transfer-coding fail-close working tree
 based on `2fbd195`:

@@ -47,7 +47,8 @@ use pingora_core::utils::tls::CertKey;
 use pingora_error::{Error, ErrorSource, ErrorType::*, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{
-    FailToProxy, ProxyHttp, ProxyWarnLogContext, ResponseBodySink, Session,
+    FailToProxy, ProxyHttp, ProxyWarnLogContext, ResponseBodySink, ResponseHeadCommitPlan,
+    ResponseHeadHoldLimits, ResponseHeadReplacement, ResponseHeadSource, Session,
     UpstreamResponseBodyEvent, RESPONSE_BODY_EMIT_CHUNK_BUDGET,
 };
 use std::collections::{HashMap, HashSet};
@@ -73,6 +74,7 @@ pub struct CTX {
     withheld_body: Vec<u8>,
     terminal_before_trailers_seen: bool,
     emitted_chunk_limit: bool,
+    response_head_decided: bool,
 }
 
 // Common logic for both ProxyHttp(s) types
@@ -425,6 +427,27 @@ impl ProxyHttp for ExampleProxyHttp {
         response_filter_common(session, upstream_response, ctx)
     }
 
+    fn response_head_commit_plan(
+        &self,
+        session: &Session,
+        _source: ResponseHeadSource,
+        _response: &ResponseHeader,
+        _ctx: &Self::CTX,
+    ) -> Result<ResponseHeadCommitPlan> {
+        if session.get_header_bytes("x-response-head-hold").is_empty() {
+            return Ok(ResponseHeadCommitPlan::Immediate);
+        }
+        Ok(ResponseHeadCommitPlan::hold(ResponseHeadHoldLimits::new(
+            64 * 1024,
+            64 * 1024,
+            64,
+            128,
+            64 * 1024,
+            128,
+            Duration::from_secs(2),
+        )))
+    }
+
     async fn request_body_filter(
         &self,
         session: &mut Session,
@@ -488,6 +511,26 @@ impl ProxyHttp for ExampleProxyHttp {
         sink: &mut ResponseBodySink,
         ctx: &mut Self::CTX,
     ) -> Result<Option<Duration>> {
+        if !ctx.response_head_decided {
+            match session.get_header_bytes("x-response-head-hold") {
+                b"release" => {
+                    assert!(sink.release_response_head());
+                    ctx.response_head_decided = true;
+                }
+                b"replace" => {
+                    let mut replacement = ResponseHeader::build(403, Some(3))?;
+                    replacement.insert_header("content-type", "text/plain")?;
+                    replacement.insert_header("content-length", "7")?;
+                    replacement.insert_header("x-response-head-replacement", "true")?;
+                    sink.replace_response_head(ResponseHeadReplacement::new(
+                        Box::new(replacement),
+                        vec![Bytes::from_static(b"blocked")],
+                    ))?;
+                    ctx.response_head_decided = true;
+                }
+                _ => {}
+            }
+        }
         if end_of_stream {
             record_eos_dispatch(session);
         }

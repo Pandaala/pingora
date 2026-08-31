@@ -14,11 +14,10 @@
 
 //! Bounded retention for a response head and its semantic body prefix.
 //!
-//! This module initially exposes only the dormant public shape of response-head
-//! planning. [`ResponseHeadCommitPlan::Immediate`] is the sole plan that an
-//! external application can construct. The hold constructor remains
-//! crate-private and test-only until deadline polling and protocol cleanup are
-//! integrated by a later delivery slice.
+//! Applications select the allocation-free [`ResponseHeadCommitPlan::Immediate`]
+//! fast path or explicitly opt into a [`ResponseHeadCommitPlan::Hold`] with
+//! independent hard limits. The H1/H2 response pumps enforce those limits and
+//! the single absolute deadline before writer handoff.
 
 use bytes::Bytes;
 use pingora_core::protocols::http::HttpTask;
@@ -43,65 +42,146 @@ pub enum ResponseHeadSource {
 
 /// Request-local policy for committing the final downstream response head.
 ///
-/// The initial delivery slice intentionally provides no public way to construct
-/// [`Self::Hold`]. It is present so the internal state machine can be tested
-/// without prematurely publishing a hold contract that lacks deadline polling.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ResponseHeadCommitPlan {
     /// Preserve the existing behavior: retain no response tasks in this layer.
     Immediate,
     /// Retain a bounded response prefix until its processor requests release.
-    #[doc(hidden)]
     Hold(ResponseHeadHoldPlan),
+}
+
+impl ResponseHeadCommitPlan {
+    /// Construct an explicitly bounded Hold plan.
+    ///
+    /// Hold is supported only for ordinary final origin responses on the H1/H2
+    /// pumps. Unsupported cache, custom, upgrade, and tunnel combinations are
+    /// reported through the typed boundary hook rather than degrading to
+    /// Immediate.
+    pub fn hold(limits: ResponseHeadHoldLimits) -> Self {
+        Self::Hold(ResponseHeadHoldPlan::new(limits))
+    }
 }
 
 /// Independent limits for response-prefix retention.
 ///
-/// Fields and construction are deliberately private in the initial dormant
-/// delivery slice. Their accounting model is nevertheless executable here so
-/// later protocol integration does not need to redesign retained state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResponseHeadHoldLimits {
-    max_retained_bytes: usize,
+    max_input_bytes: usize,
+    max_output_bytes: usize,
     max_nonempty_chunks: usize,
     max_events: usize,
     max_metadata_bytes: usize,
+    max_work_units: u64,
     timeout: Duration,
 }
 
 impl ResponseHeadHoldLimits {
+    /// Define independent hard limits for one response-head Hold.
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        max_input_bytes: usize,
+        max_output_bytes: usize,
+        max_nonempty_chunks: usize,
+        max_events: usize,
+        max_metadata_bytes: usize,
+        max_work_units: u64,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            max_input_bytes,
+            max_output_bytes,
+            max_nonempty_chunks,
+            max_events,
+            max_metadata_bytes,
+            max_work_units,
+            timeout,
+        }
+    }
+
+    pub const fn max_input_bytes(self) -> usize {
+        self.max_input_bytes
+    }
+
+    pub const fn max_output_bytes(self) -> usize {
+        self.max_output_bytes
+    }
+
+    pub const fn max_nonempty_chunks(self) -> usize {
+        self.max_nonempty_chunks
+    }
+
+    pub const fn max_events(self) -> usize {
+        self.max_events
+    }
+
+    pub const fn max_metadata_bytes(self) -> usize {
+        self.max_metadata_bytes
+    }
+
+    pub const fn max_work_units(self) -> u64 {
+        self.max_work_units
+    }
+
+    pub const fn timeout(self) -> Duration {
+        self.timeout
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_test(
-        max_retained_bytes: usize,
+        max_output_bytes: usize,
         max_nonempty_chunks: usize,
         max_events: usize,
         max_metadata_bytes: usize,
         timeout: Duration,
     ) -> Self {
         Self {
-            max_retained_bytes,
+            max_input_bytes: max_output_bytes,
+            max_output_bytes,
             max_nonempty_chunks,
             max_events,
             max_metadata_bytes,
+            max_work_units: max_events as u64,
+            timeout,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_full_for_test(
+        max_input_bytes: usize,
+        max_output_bytes: usize,
+        max_nonempty_chunks: usize,
+        max_events: usize,
+        max_metadata_bytes: usize,
+        max_work_units: u64,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            max_input_bytes,
+            max_output_bytes,
+            max_nonempty_chunks,
+            max_events,
+            max_metadata_bytes,
+            max_work_units,
             timeout,
         }
     }
 }
 
-/// A dormant bounded-hold plan.
-///
-/// No public constructor is provided until the remaining deadline and cleanup
-/// contract is implemented.
+/// A bounded Hold plan carried by [`ResponseHeadCommitPlan::Hold`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResponseHeadHoldPlan {
     limits: ResponseHeadHoldLimits,
 }
 
 impl ResponseHeadHoldPlan {
+    pub const fn new(limits: ResponseHeadHoldLimits) -> Self {
+        Self { limits }
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_test(limits: ResponseHeadHoldLimits) -> Self {
-        Self { limits }
+        Self::new(limits)
     }
 }
 
@@ -283,6 +363,17 @@ pub(crate) enum ResponseHeadBarrierOutput {
     Held,
 }
 
+/// A Hold failure that still retains the semantic reason required by the
+/// application boundary mapper. Source errors are kept separate because they
+/// must bypass that mapper and preserve their original error object.
+#[derive(Debug)]
+pub(crate) enum ResponseHeadBarrierFailure {
+    Boundary(ResponseHeadBoundary),
+    Source(pingora_error::BError),
+}
+
+pub(crate) type ResponseHeadBarrierResult<T> = std::result::Result<T, ResponseHeadBarrierFailure>;
+
 /// Response-scoped head retention state.
 pub(crate) struct ResponseHeadBarrier {
     state: ResponseHeadBarrierState,
@@ -292,13 +383,14 @@ enum ResponseHeadBarrierState {
     AwaitingFinalHead,
     Immediate,
     Holding(Box<HeldResponseHead>),
-    Released,
-    Replaced,
+    Released(Option<ResponseHeadUsage>),
+    Replaced(Option<ResponseHeadUsage>),
     Aborted,
 }
 
 struct HeldResponseHead {
     limits: ResponseHeadHoldLimits,
+    activated_at: Instant,
     deadline: Instant,
     usage: ResponseHeadRetentionUsage,
     tasks: Vec<HttpTask>,
@@ -306,10 +398,12 @@ struct HeldResponseHead {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ResponseHeadRetentionUsage {
-    retained_bytes: usize,
+    input_bytes: usize,
+    output_bytes: usize,
     nonempty_chunks: usize,
     events: usize,
     metadata_bytes: usize,
+    work_units: u64,
 }
 
 impl Default for ResponseHeadBarrier {
@@ -333,17 +427,18 @@ impl ResponseHeadBarrier {
         self.state = match plan {
             ResponseHeadCommitPlan::Immediate => ResponseHeadBarrierState::Immediate,
             ResponseHeadCommitPlan::Hold(plan) => {
-                let deadline =
-                    Instant::now()
-                        .checked_add(plan.limits.timeout)
-                        .ok_or_else(|| {
-                            Error::explain(
-                                InternalError,
-                                "response head barrier deadline exceeds the monotonic clock range",
-                            )
-                        })?;
+                let activated_at = Instant::now();
+                let deadline = activated_at
+                    .checked_add(plan.limits.timeout)
+                    .ok_or_else(|| {
+                        Error::explain(
+                            InternalError,
+                            "response head barrier deadline exceeds the monotonic clock range",
+                        )
+                    })?;
                 ResponseHeadBarrierState::Holding(Box::new(HeldResponseHead {
                     limits: plan.limits,
+                    activated_at,
                     deadline,
                     usage: ResponseHeadRetentionUsage::default(),
                     tasks: Vec::new(),
@@ -370,11 +465,61 @@ impl ResponseHeadBarrier {
         }
     }
 
+    pub(crate) fn work_limit(&self) -> Option<u64> {
+        match &self.state {
+            ResponseHeadBarrierState::Holding(held) => Some(held.limits.max_work_units()),
+            _ => None,
+        }
+    }
+
+    /// Charge source bytes before writable mutation. Header/trailer metadata is
+    /// deliberately output accounting; the input budget is body bytes only.
+    pub(crate) fn observe_input(&mut self, task: &HttpTask) -> ResponseHeadBarrierResult<()> {
+        let ResponseHeadBarrierState::Holding(held) = &mut self.state else {
+            return Ok(());
+        };
+        let bytes = match task {
+            HttpTask::Body(Some(body), _) | HttpTask::UpgradedBody(Some(body), _) => body.len(),
+            _ => 0,
+        };
+        held.usage.input_bytes = held.usage.input_bytes.checked_add(bytes).ok_or(
+            ResponseHeadBarrierFailure::Boundary(ResponseHeadBoundary::InputLimit),
+        )?;
+        if held.usage.input_bytes > held.limits.max_input_bytes {
+            return Err(ResponseHeadBarrierFailure::Boundary(
+                ResponseHeadBoundary::InputLimit,
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_work_usage(&mut self, work_units: u64) -> ResponseHeadBarrierResult<()> {
+        let ResponseHeadBarrierState::Holding(held) = &mut self.state else {
+            return Ok(());
+        };
+        held.usage.work_units = work_units;
+        if work_units > held.limits.max_work_units {
+            return Err(ResponseHeadBarrierFailure::Boundary(
+                ResponseHeadBoundary::WorkLimit,
+            ));
+        }
+        Ok(())
+    }
+
     /// Abort a currently held prefix after the protocol pump's idle timer
     /// fires. Dropping the Holding state releases every retained task.
+    pub(crate) fn claim_boundary(&mut self) -> Option<ResponseHeadUsage> {
+        let state = std::mem::replace(&mut self.state, ResponseHeadBarrierState::Aborted);
+        let ResponseHeadBarrierState::Holding(held) = state else {
+            self.state = state;
+            return None;
+        };
+        Some(held.public_usage())
+    }
+
+    #[cfg(test)]
     pub(crate) fn timeout(&mut self) -> pingora_error::BError {
-        let was_holding = matches!(self.state, ResponseHeadBarrierState::Holding(_));
-        self.state = ResponseHeadBarrierState::Aborted;
+        let was_holding = self.claim_boundary().is_some();
         Error::explain(
             InternalError,
             if was_holding {
@@ -397,11 +542,10 @@ impl ResponseHeadBarrier {
         start: usize,
         release_requested: bool,
         clean_terminal: bool,
-    ) -> Result<ResponseHeadBarrierOutput> {
+    ) -> ResponseHeadBarrierResult<ResponseHeadBarrierOutput> {
         if start > tasks.len() {
-            return Err(Error::explain(
-                InternalError,
-                "response head barrier task range starts past the output batch",
+            return Err(ResponseHeadBarrierFailure::Boundary(
+                ResponseHeadBoundary::ApplicationFail,
             ));
         }
 
@@ -411,13 +555,12 @@ impl ResponseHeadBarrier {
             return match self.state {
                 ResponseHeadBarrierState::AwaitingFinalHead
                 | ResponseHeadBarrierState::Immediate
-                | ResponseHeadBarrierState::Released
-                | ResponseHeadBarrierState::Replaced => {
+                | ResponseHeadBarrierState::Released(_)
+                | ResponseHeadBarrierState::Replaced(_) => {
                     Ok(ResponseHeadBarrierOutput::PrepareFrom(start))
                 }
-                ResponseHeadBarrierState::Aborted => Err(Error::explain(
-                    InternalError,
-                    "response head barrier used after abort",
+                ResponseHeadBarrierState::Aborted => Err(ResponseHeadBarrierFailure::Boundary(
+                    ResponseHeadBoundary::ApplicationFail,
                 )),
                 ResponseHeadBarrierState::Holding(_) => unreachable!(),
             };
@@ -430,7 +573,8 @@ impl ResponseHeadBarrier {
             let current = tasks.split_off(start);
             for task in current {
                 if let HttpTask::Failed(error) = task {
-                    return Err(error);
+                    self.state = ResponseHeadBarrierState::Holding(held);
+                    return Err(ResponseHeadBarrierFailure::Source(error));
                 }
             }
             unreachable!("the failed task observed above must still be present")
@@ -438,29 +582,45 @@ impl ResponseHeadBarrier {
 
         if Instant::now() >= held.deadline {
             tasks.truncate(start);
-            return Err(Error::explain(
-                InternalError,
-                "response head barrier absolute deadline exceeded",
+            self.state = ResponseHeadBarrierState::Holding(held);
+            return Err(ResponseHeadBarrierFailure::Boundary(
+                ResponseHeadBoundary::Timeout,
             ));
         }
 
-        let candidate = ResponseHeadRetentionUsage::for_tasks(&tasks[start..])?;
-        let combined = held.usage.checked_add(candidate)?;
-        combined.ensure_fits(held.limits)?;
+        let candidate = match ResponseHeadRetentionUsage::for_tasks(&tasks[start..]) {
+            Ok(candidate) => candidate,
+            Err(failure) => {
+                self.state = ResponseHeadBarrierState::Holding(held);
+                return Err(failure);
+            }
+        };
+        let combined = match held.usage.checked_add(candidate) {
+            Ok(combined) => combined,
+            Err(failure) => {
+                self.state = ResponseHeadBarrierState::Holding(held);
+                return Err(failure);
+            }
+        };
+        if let Err(failure) = combined.ensure_fits(held.limits) {
+            self.state = ResponseHeadBarrierState::Holding(held);
+            return Err(failure);
+        }
 
         if release_requested {
             let current = tasks.split_off(start);
             held.tasks.extend(current);
+            let usage = held.public_usage_with(combined);
             tasks.extend(held.tasks);
-            self.state = ResponseHeadBarrierState::Released;
+            self.state = ResponseHeadBarrierState::Released(Some(usage));
             return Ok(ResponseHeadBarrierOutput::PrepareFrom(start));
         }
 
         if clean_terminal {
             tasks.truncate(start);
-            return Err(Error::explain(
-                InternalError,
-                "response source completed before the held response head was released",
+            self.state = ResponseHeadBarrierState::Holding(held);
+            return Err(ResponseHeadBarrierFailure::Boundary(
+                ResponseHeadBoundary::CleanTerminalWithoutDecision,
             ));
         }
 
@@ -478,29 +638,52 @@ impl ResponseHeadBarrier {
         tasks: &mut Vec<HttpTask>,
         start: usize,
         replacement: ResponseHeadReplacement,
-    ) -> Result<ResponseHeadBarrierOutput> {
+    ) -> ResponseHeadBarrierResult<ResponseHeadBarrierOutput> {
+        self.replace_inner(tasks, start, replacement, true)
+    }
+
+    pub(crate) fn replace_after_boundary(
+        &mut self,
+        tasks: &mut Vec<HttpTask>,
+        start: usize,
+        replacement: ResponseHeadReplacement,
+    ) -> ResponseHeadBarrierResult<ResponseHeadBarrierOutput> {
+        self.replace_inner(tasks, start, replacement, false)
+    }
+
+    fn replace_inner(
+        &mut self,
+        tasks: &mut Vec<HttpTask>,
+        start: usize,
+        replacement: ResponseHeadReplacement,
+        enforce_deadline: bool,
+    ) -> ResponseHeadBarrierResult<ResponseHeadBarrierOutput> {
         if start > tasks.len() {
-            return Err(Error::explain(
-                InternalError,
-                "response head replacement range starts past the output batch",
+            return Err(ResponseHeadBarrierFailure::Boundary(
+                ResponseHeadBoundary::ApplicationFail,
             ));
         }
         let state = std::mem::replace(&mut self.state, ResponseHeadBarrierState::Aborted);
         let ResponseHeadBarrierState::Holding(held) = state else {
-            return Err(Error::explain(
-                InternalError,
-                "response head replacement requested outside Hold",
+            return Err(ResponseHeadBarrierFailure::Boundary(
+                ResponseHeadBoundary::ApplicationFail,
             ));
         };
-        if Instant::now() >= held.deadline {
+        if enforce_deadline && Instant::now() >= held.deadline {
             tasks.truncate(start);
-            return Err(Error::explain(
-                InternalError,
-                "response head barrier absolute deadline exceeded",
+            self.state = ResponseHeadBarrierState::Holding(held);
+            return Err(ResponseHeadBarrierFailure::Boundary(
+                ResponseHeadBoundary::Timeout,
             ));
         }
 
         let (header, body) = replacement.into_parts();
+        if header.status.is_informational() {
+            self.state = ResponseHeadBarrierState::Holding(held);
+            return Err(ResponseHeadBarrierFailure::Boundary(
+                ResponseHeadBoundary::Unsupported,
+            ));
+        }
         let mut replacement_tasks = Vec::with_capacity(body.len().saturating_add(1));
         let body_is_empty = body.is_empty();
         replacement_tasks.push(HttpTask::Header(header, body_is_empty));
@@ -508,13 +691,43 @@ impl ResponseHeadBarrier {
         for (index, chunk) in body.into_iter().enumerate() {
             replacement_tasks.push(HttpTask::Body(Some(chunk), index == last));
         }
-        let replacement_usage = ResponseHeadRetentionUsage::for_tasks(&replacement_tasks)?;
-        replacement_usage.ensure_fits(held.limits)?;
+        let replacement_usage = match ResponseHeadRetentionUsage::for_tasks(&replacement_tasks) {
+            Ok(usage) => usage,
+            Err(failure) => {
+                self.state = ResponseHeadBarrierState::Holding(held);
+                return Err(failure);
+            }
+        };
+        if let Err(failure) = replacement_usage.ensure_fits(held.limits) {
+            self.state = ResponseHeadBarrierState::Holding(held);
+            return Err(failure);
+        }
 
         tasks.truncate(start);
         tasks.extend(replacement_tasks);
-        self.state = ResponseHeadBarrierState::Replaced;
+        let mut held = held;
+        held.usage.output_bytes = replacement_usage.output_bytes;
+        held.usage.nonempty_chunks = replacement_usage.nonempty_chunks;
+        held.usage.events = replacement_usage.events;
+        held.usage.metadata_bytes = replacement_usage.metadata_bytes;
+        let usage = held.public_usage();
+        self.state = ResponseHeadBarrierState::Replaced(Some(usage));
         Ok(ResponseHeadBarrierOutput::PrepareReplacementFrom(start))
+    }
+
+    pub(crate) fn boundary_usage(&self) -> Option<ResponseHeadUsage> {
+        match &self.state {
+            ResponseHeadBarrierState::Holding(held) => Some(held.public_usage()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn take_resolved_usage(&mut self) -> Option<ResponseHeadUsage> {
+        match &mut self.state {
+            ResponseHeadBarrierState::Released(usage)
+            | ResponseHeadBarrierState::Replaced(usage) => usage.take(),
+            _ => None,
+        }
     }
 
     /// Abort and drop any retained prefix before propagating an application
@@ -533,15 +746,16 @@ impl ResponseHeadBarrier {
 }
 
 impl ResponseHeadRetentionUsage {
-    fn for_tasks(tasks: &[HttpTask]) -> Result<Self> {
+    fn for_tasks(tasks: &[HttpTask]) -> ResponseHeadBarrierResult<Self> {
         let mut usage = Self::default();
         for task in tasks {
-            usage.events = usage.events.checked_add(1).ok_or_else(|| {
-                Error::explain(
-                    InternalError,
-                    "response head barrier event accounting overflow",
-                )
-            })?;
+            usage.events =
+                usage
+                    .events
+                    .checked_add(1)
+                    .ok_or(ResponseHeadBarrierFailure::Boundary(
+                        ResponseHeadBoundary::EventLimit,
+                    ))?;
 
             match task {
                 HttpTask::Header(header, _) => {
@@ -552,23 +766,13 @@ impl ResponseHeadRetentionUsage {
                     )?;
                 }
                 HttpTask::Body(Some(body), _) | HttpTask::UpgradedBody(Some(body), _) => {
-                    usage.retained_bytes = usage
-                        .retained_bytes
-                        .checked_add(body.len())
-                        .ok_or_else(|| {
-                            Error::explain(
-                                InternalError,
-                                "response head barrier byte accounting overflow",
-                            )
-                        })?;
+                    usage.output_bytes = usage.output_bytes.checked_add(body.len()).ok_or(
+                        ResponseHeadBarrierFailure::Boundary(ResponseHeadBoundary::OutputLimit),
+                    )?;
                     if !body.is_empty() {
-                        usage.nonempty_chunks =
-                            usage.nonempty_chunks.checked_add(1).ok_or_else(|| {
-                                Error::explain(
-                                    InternalError,
-                                    "response head barrier chunk accounting overflow",
-                                )
-                            })?;
+                        usage.nonempty_chunks = usage.nonempty_chunks.checked_add(1).ok_or(
+                            ResponseHeadBarrierFailure::Boundary(ResponseHeadBoundary::ChunkLimit),
+                        )?;
                     }
                 }
                 HttpTask::Body(None, _) | HttpTask::UpgradedBody(None, _) | HttpTask::Done => {}
@@ -584,16 +788,14 @@ impl ResponseHeadRetentionUsage {
                         .metadata_bytes
                         .checked_add(TRAILER_METADATA_BASE_COST)
                         .ok_or_else(|| {
-                            Error::explain(
-                                InternalError,
-                                "response head barrier metadata accounting overflow",
+                            ResponseHeadBarrierFailure::Boundary(
+                                ResponseHeadBoundary::MetadataLimit,
                             )
                         })?;
                 }
                 HttpTask::Failed(_) => {
-                    return Err(Error::explain(
-                        InternalError,
-                        "response head barrier cannot retain a failed task",
+                    return Err(ResponseHeadBarrierFailure::Boundary(
+                        ResponseHeadBoundary::SourceFailed,
                     ));
                 }
             }
@@ -601,92 +803,93 @@ impl ResponseHeadRetentionUsage {
         Ok(usage)
     }
 
-    fn checked_add(self, other: Self) -> Result<Self> {
+    fn checked_add(self, other: Self) -> ResponseHeadBarrierResult<Self> {
         Ok(Self {
-            retained_bytes: self
-                .retained_bytes
-                .checked_add(other.retained_bytes)
-                .ok_or_else(|| {
-                    Error::explain(
-                        InternalError,
-                        "response head barrier byte accounting overflow",
-                    )
-                })?,
+            input_bytes: self.input_bytes,
+            output_bytes: self.output_bytes.checked_add(other.output_bytes).ok_or(
+                ResponseHeadBarrierFailure::Boundary(ResponseHeadBoundary::OutputLimit),
+            )?,
             nonempty_chunks: self
                 .nonempty_chunks
                 .checked_add(other.nonempty_chunks)
-                .ok_or_else(|| {
-                    Error::explain(
-                        InternalError,
-                        "response head barrier chunk accounting overflow",
-                    )
-                })?,
-            events: self.events.checked_add(other.events).ok_or_else(|| {
-                Error::explain(
-                    InternalError,
-                    "response head barrier event accounting overflow",
-                )
-            })?,
+                .ok_or(ResponseHeadBarrierFailure::Boundary(
+                    ResponseHeadBoundary::ChunkLimit,
+                ))?,
+            events: self.events.checked_add(other.events).ok_or(
+                ResponseHeadBarrierFailure::Boundary(ResponseHeadBoundary::EventLimit),
+            )?,
             metadata_bytes: self
                 .metadata_bytes
                 .checked_add(other.metadata_bytes)
-                .ok_or_else(|| {
-                    Error::explain(
-                        InternalError,
-                        "response head barrier metadata accounting overflow",
-                    )
-                })?,
+                .ok_or(ResponseHeadBarrierFailure::Boundary(
+                    ResponseHeadBoundary::MetadataLimit,
+                ))?,
+            work_units: self.work_units,
         })
     }
 
-    fn ensure_fits(self, limits: ResponseHeadHoldLimits) -> Result<()> {
-        let exceeded = if self.retained_bytes > limits.max_retained_bytes {
-            Some("byte")
+    fn ensure_fits(self, limits: ResponseHeadHoldLimits) -> ResponseHeadBarrierResult<()> {
+        let exceeded = if self.output_bytes > limits.max_output_bytes {
+            Some(ResponseHeadBoundary::OutputLimit)
         } else if self.nonempty_chunks > limits.max_nonempty_chunks {
-            Some("chunk")
+            Some(ResponseHeadBoundary::ChunkLimit)
         } else if self.events > limits.max_events {
-            Some("event")
+            Some(ResponseHeadBoundary::EventLimit)
         } else if self.metadata_bytes > limits.max_metadata_bytes {
-            Some("metadata")
+            Some(ResponseHeadBoundary::MetadataLimit)
         } else {
             None
         };
 
-        if let Some(dimension) = exceeded {
-            return Err(Error::explain(
-                InternalError,
-                format!("response head barrier {dimension} retention limit exceeded"),
-            ));
+        if let Some(boundary) = exceeded {
+            return Err(ResponseHeadBarrierFailure::Boundary(boundary));
         }
         Ok(())
     }
 }
 
-fn checked_metadata_add(current: usize, base: usize, headers: &http::HeaderMap) -> Result<usize> {
-    let mut total = current.checked_add(base).ok_or_else(|| {
-        Error::explain(
-            InternalError,
-            "response head barrier metadata accounting overflow",
+impl HeldResponseHead {
+    fn public_usage(&self) -> ResponseHeadUsage {
+        self.public_usage_with(self.usage)
+    }
+
+    fn public_usage_with(&self, usage: ResponseHeadRetentionUsage) -> ResponseHeadUsage {
+        ResponseHeadUsage::new(
+            usage.input_bytes,
+            usage.output_bytes,
+            usage.nonempty_chunks,
+            usage.events,
+            usage.metadata_bytes,
+            usage.work_units,
+            self.activated_at.elapsed(),
         )
-    })?;
+    }
+}
+
+fn checked_metadata_add(
+    current: usize,
+    base: usize,
+    headers: &http::HeaderMap,
+) -> ResponseHeadBarrierResult<usize> {
+    let mut total = current
+        .checked_add(base)
+        .ok_or(ResponseHeadBarrierFailure::Boundary(
+            ResponseHeadBoundary::MetadataLimit,
+        ))?;
     for (name, value) in headers {
         let field = name
             .as_str()
             .len()
             .checked_add(value.as_bytes().len())
             .and_then(|size| size.checked_add(HEADER_FIELD_METADATA_OVERHEAD))
-            .ok_or_else(|| {
-                Error::explain(
-                    InternalError,
-                    "response head barrier metadata accounting overflow",
-                )
-            })?;
-        total = total.checked_add(field).ok_or_else(|| {
-            Error::explain(
-                InternalError,
-                "response head barrier metadata accounting overflow",
-            )
-        })?;
+            .ok_or(ResponseHeadBarrierFailure::Boundary(
+                ResponseHeadBoundary::MetadataLimit,
+            ))?;
+        total = total
+            .checked_add(field)
+            .ok_or(ResponseHeadBarrierFailure::Boundary(
+                ResponseHeadBoundary::MetadataLimit,
+            ))?;
     }
     Ok(total)
 }
@@ -746,6 +949,27 @@ mod tests {
         let (header, body) = replacement.into_parts();
         assert_eq!(header.status.as_u16(), 403);
         assert_eq!(body, vec![Bytes::from_static(b"denied")]);
+    }
+
+    #[test]
+    fn informational_replacement_is_not_a_complete_local_response() {
+        let mut barrier = ResponseHeadBarrier::default();
+        barrier
+            .select(hold(limits(32, 4, 4, HEAD_METADATA_BASE_COST)))
+            .unwrap();
+        let replacement = ResponseHeadReplacement::new(
+            Box::new(ResponseHeader::build(101, None).unwrap()),
+            Vec::new(),
+        );
+        let mut tasks = Vec::new();
+        assert!(matches!(
+            barrier.replace(&mut tasks, 0, replacement),
+            Err(ResponseHeadBarrierFailure::Boundary(
+                ResponseHeadBoundary::Unsupported
+            ))
+        ));
+        assert!(barrier.is_holding());
+        assert!(tasks.is_empty());
     }
 
     #[test]
@@ -816,10 +1040,10 @@ mod tests {
         assert_eq!(
             usage,
             ResponseHeadRetentionUsage {
-                retained_bytes: 3,
+                output_bytes: 3,
                 nonempty_chunks: 1,
                 events: 1,
-                metadata_bytes: 0,
+                ..ResponseHeadRetentionUsage::default()
             }
         );
     }
@@ -829,7 +1053,7 @@ mod tests {
         let usage =
             ResponseHeadRetentionUsage::for_tasks(&[HttpTask::Body(Some(Bytes::new()), false)])
                 .unwrap();
-        assert_eq!(usage.retained_bytes, 0);
+        assert_eq!(usage.output_bytes, 0);
         assert_eq!(usage.nonempty_chunks, 0);
         assert_eq!(usage.events, 1);
     }
@@ -865,11 +1089,11 @@ mod tests {
     #[test]
     fn checked_usage_addition_rejects_overflow() {
         let left = ResponseHeadRetentionUsage {
-            retained_bytes: usize::MAX,
+            output_bytes: usize::MAX,
             ..ResponseHeadRetentionUsage::default()
         };
         let right = ResponseHeadRetentionUsage {
-            retained_bytes: 1,
+            output_bytes: 1,
             ..ResponseHeadRetentionUsage::default()
         };
         assert!(left.checked_add(right).is_err());
@@ -878,10 +1102,11 @@ mod tests {
     #[test]
     fn each_limit_accepts_exact_boundary() {
         let usage = ResponseHeadRetentionUsage {
-            retained_bytes: 3,
+            output_bytes: 3,
             nonempty_chunks: 1,
             events: 2,
             metadata_bytes: HEAD_METADATA_BASE_COST,
+            ..ResponseHeadRetentionUsage::default()
         };
         assert!(usage
             .ensure_fits(limits(3, 1, 2, HEAD_METADATA_BASE_COST))
@@ -891,10 +1116,11 @@ mod tests {
     #[test]
     fn each_limit_rejects_plus_one() {
         let baseline = ResponseHeadRetentionUsage {
-            retained_bytes: 3,
+            output_bytes: 3,
             nonempty_chunks: 1,
             events: 2,
             metadata_bytes: 4,
+            ..ResponseHeadRetentionUsage::default()
         };
         assert!(baseline.ensure_fits(limits(2, 1, 2, 4)).is_err());
         assert!(baseline.ensure_fits(limits(3, 0, 2, 4)).is_err());
@@ -971,12 +1197,18 @@ mod tests {
             .unwrap();
 
         let mut failed = vec![HttpTask::Failed(Error::explain(InternalError, "upstream"))];
-        let error = barrier
+        let failure = barrier
             .capture_or_release(&mut failed, 0, false, false)
             .unwrap_err();
+        let ResponseHeadBarrierFailure::Source(error) = failure else {
+            panic!("source failure must preserve the original error")
+        };
         assert!(error.to_string().contains("upstream"));
         assert!(failed.is_empty());
-        assert!(!barrier.is_holding());
+        assert!(
+            barrier.is_holding(),
+            "the pipeline still needs the Hold usage before recording SourceFailed"
+        );
     }
 
     #[test]
@@ -991,14 +1223,17 @@ mod tests {
             .unwrap();
 
         let mut terminal = vec![HttpTask::Body(None, true)];
-        let error = barrier
+        let failure = barrier
             .capture_or_release(&mut terminal, 0, false, true)
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("before the held response head was released"));
+        assert!(matches!(
+            failure,
+            ResponseHeadBarrierFailure::Boundary(
+                ResponseHeadBoundary::CleanTerminalWithoutDecision
+            )
+        ));
         assert!(terminal.is_empty());
-        assert!(!barrier.is_holding());
+        assert!(barrier.is_holding());
     }
 
     #[test]
@@ -1015,7 +1250,7 @@ mod tests {
             .capture_or_release(&mut oversized, 0, false, false)
             .is_err());
         assert_eq!(body_values(&oversized), vec![b"x".as_slice()]);
-        assert!(!barrier.is_holding());
+        assert!(barrier.is_holding());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1039,12 +1274,15 @@ mod tests {
         tokio::time::sleep_until(deadline).await;
 
         let mut release_batch = vec![body(b"late")];
-        let error = barrier
+        let failure = barrier
             .capture_or_release(&mut release_batch, 0, true, false)
             .unwrap_err();
-        assert!(error.to_string().contains("absolute deadline exceeded"));
+        assert!(matches!(
+            failure,
+            ResponseHeadBarrierFailure::Boundary(ResponseHeadBoundary::Timeout)
+        ));
         assert!(release_batch.is_empty());
-        assert!(!barrier.is_holding());
+        assert!(barrier.is_holding());
     }
 
     #[test]

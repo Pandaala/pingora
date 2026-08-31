@@ -3,14 +3,14 @@
 ## Status and scope
 
 This is the canonical description of the body-relay architecture implemented
-by the Edgion Pingora fork and its `../Edgion` consumer after phases 1-3 of the
-relay refactor. It describes current ownership and executable behavior, not the
-future response-head commit barrier.
+by the Edgion Pingora fork and its `../Edgion` consumer after phases 1-4 of the
+relay refactor. It describes current ownership and executable behavior,
+including the optional bounded response-head commit barrier.
 
-The recorded baseline is Pingora `82ab02b50cd6` and Edgion `af83f6842491`, plus
-the uncommitted phase 1-3 worktrees in both repositories. The commit IDs alone
+The recorded baseline is Pingora `48f603e9def4` and Edgion `af83f6842491`, plus
+the uncommitted phase 1-4 worktrees in both repositories. The commit IDs alone
 therefore do not contain the complete architecture described here; use this
-record together with the pending worktree until the changes are committed.
+record together with the current worktrees until the changes are committed.
 
 The architecture has two directional lanes rather than one universal relay:
 
@@ -29,7 +29,7 @@ framing, and completion rules are materially different.
 | 1. Request event extraction | Implemented | One protocol-neutral semantic event sequence used by H1/H2/custom request pumps |
 | 2. Request relay plan | Implemented | One request-scoped policy/source freeze, canonical attempt identity, backing-aware retry gate, per-attempt framing |
 | 3. Response processor ownership | Implemented | One Edgion request-local driver with body/trailer execution leases and durable logging handle |
-| 4. Response-head commit barrier | Not implemented | Must be designed and delivered separately; current headers are not body-prefix-aware |
+| 4. Response-head commit barrier | Implemented | Default-Immediate, explicitly claimed bounded Hold with precommit Release/Replace/Fail, cache bypass, writer claim, and H1/H2 cleanup |
 
 ## Three-stage system model
 
@@ -568,42 +568,52 @@ Pingora owns generic transport and relay mechanics. Edgion owns product policy
 and durable finalization. Cross-repository changes must update both sides only
 for the behavior each side owns.
 
-## Remaining phase: bounded response-head commit
+## Bounded response-head commit
 
-The current architecture does **not** hold a final response header while
-inspecting a body prefix. Same-batch processing is an optimization accident,
-not a commit contract. Once the header has been written, a later processor may
-terminate the stream but cannot safely replace status or headers.
-
-Phase 4 must be a separate feature with an explicit plan and hard bounds:
+The response relay now has an explicit optional precommit stage. The default
+path is `Immediate`; an eligible single claimant may instead request a bounded
+Hold from the final post-onion response head:
 
 ```text
 Immediate
 or
-Hold { max_bytes, max_chunks, timeout, overflow_policy }
+Hold {
+  input/output bytes,
+  chunks/events,
+  metadata/work,
+  absolute deadline
+}
   -> Release(original head + ordered body)
   -> Replace(new head + bounded body)
   -> Fail closed
 ```
 
-Its budgets must independently cover retained bytes, chunk/event count,
-processor metadata/handles, queued work, and wall-clock time. It must remain a
-bounded prefix barrier: it is not permission to buffer an entire response or
-an unbounded SSE stream. Correctness cannot depend on a header and decisive
-body chunk happening to arrive in the same pump batch, nor on wire END_STREAM
-alone.
+This remains a bounded prefix barrier, not permission to buffer an entire
+response or unbounded SSE stream. Pingora retains protocol-neutral tasks and
+enforces ordering, limits, deadline, cache exclusion, writer handoff, and H1/H2
+origin cleanup. Edgion retains its processor driver and owns claimant policy,
+semantic windows, dependency calls, replacement presentation, terminal
+arbitration, and logging.
 
-The accepted v1 design and its intentionally unsupported combinations are in
-[the response-head commit barrier design](../review/response-head-commit-barrier-design.md).
-Implementation and closure evidence are tracked separately in
-[the Phase 4 pending record](../pending-issues/response-head-commit-barrier.md).
+Edgion's Guardrail claimant records a pending request-stage claim before cache
+admission and activates it only after the semantic processor installs. The
+final response onion must still produce an eligible identity-encoded 2xx
+canonical SSE response. With `holdFirstWindow` enabled, the first semantic
+decision releases the selected response, replaces it with a complete bounded
+403, or fails before commit. Release remains upgradeable within the same
+callback until the shared pipeline consumes it; afterward the established
+streaming response lane continues without head-barrier accumulation.
 
-The accepted design defines H1/H2 writer behavior, cache bypass, cancellation,
-terminal/trailer handling, compression ordering, overflow, observability, and
-the point at which retries become impossible. Implementation must preserve
-those boundaries. Moving an opaque application handle into a broader Pingora
-response lifecycle remains unjustified unless that lifecycle also spans
-downstream write outcome and explicit handback to Edgion logging.
+The implemented contract and source map are in
+[the response-head commit barrier feature](../features/response-head-commit-barrier.md).
+The accepted rationale and intentionally unsupported combinations remain in
+[the design record](../review/response-head-commit-barrier-design.md), while
+implementation and closure evidence are tracked in
+[the Phase 4 record](../pending-issues/response-head-commit-barrier.md).
+
+Moving an opaque application handle into the broader Pingora lifecycle remains
+unjustified: the generic barrier owns retained tasks, while Edgion's driver
+continues through downstream outcome and explicit finalization in logging.
 
 ## Source map
 
