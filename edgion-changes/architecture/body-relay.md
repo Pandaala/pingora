@@ -628,9 +628,11 @@ continues through downstream outcome and explicit finalization in logging.
 
 Pingora:
 
-- `pingora-proxy/src/request_relay.rs`
+- `pingora-proxy/src/request_relay.rs` (request plan state, attempts, retry
+  backing, policy, and event sequence)
 - `pingora-proxy/src/proxy_trait.rs` (`RequestRelayPlan`, retry state, hooks)
-- `pingora-proxy/src/lib.rs` (plan freeze, attempts, retry loop)
+- `pingora-proxy/src/lib.rs` (`Session` fields and initialization, plan-freeze
+  and per-attempt call sites, retry loop)
 - `pingora-proxy/src/proxy_{h1,h2,custom}.rs`
 - `pingora-proxy/src/proxy_h2_request_body.rs` (H2 request framing, writes,
   liveness, and abandonment cleanup)

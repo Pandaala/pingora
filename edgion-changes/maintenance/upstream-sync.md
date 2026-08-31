@@ -33,9 +33,12 @@ The expected shared-main conflict surface is intentionally concentrated:
   `on_connection_reuse` and all routing phases. Its forced-close policy must be
   applied after every mutable error hook and must directly veto returning a
   reusable downstream session; keepalive metadata alone is not that veto.
+  Preserve `Session` relay fields and initialization plus the plan-freeze,
+  per-attempt, and retry-loop call sites at their lifecycle boundaries.
 - `pingora-proxy/src/request_relay.rs`: preserve request disposition validation,
-  safe coercion, the bodyless application contract, and per-event relay
-  semantics as one protocol-neutral policy station.
+  safe coercion, the bodyless application contract, per-event relay semantics,
+  and the `Session` plan, attempt, and native-retry backing transitions as one
+  protocol-neutral policy station.
 - `pingora-proxy/src/pump_termination.rs`: preserve typed duplex outcomes, the
   biased join and error priority, and shared termination diagnostics and
   cleanup as one capability.

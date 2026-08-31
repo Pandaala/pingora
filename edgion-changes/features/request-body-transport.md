@@ -135,14 +135,15 @@ settling the failed current AI predispatch reservation.
 ## Pump rules
 
 - H1 and H2 pumps read downstream uploads and upstream responses concurrently.
-- `pingora-proxy/src/request_relay.rs` owns the shared disposition validation
-  and safe coercion, the `Bodyless` application-contract classification, and
-  the per-event semantic sequence: source EOF normalization, the
-  capability-gated request-trailer hook, downstream modules, and the
-  application body-action hook. It returns the same `Bytes` owner and typed
-  action to the pump without performing I/O. H1/H2/custom keep their existing
-  capability differences: custom does not dispatch the trailer hook and
-  request-body termination remains fail-closed.
+- `pingora-proxy/src/request_relay.rs` owns the `Session` relay-plan, attempt,
+  and native-retry backing transitions, the shared disposition validation and
+  safe coercion, the `Bodyless` application-contract classification, and the
+  per-event semantic sequence: source EOF normalization, the capability-gated
+  request-trailer hook, downstream modules, and the application body-action
+  hook. It returns the same `Bytes` owner and typed action to the pump without
+  performing I/O. H1/H2/custom keep their existing capability differences:
+  custom does not dispatch the trailer hook and request-body termination
+  remains fail-closed.
 - Pipe/capacity reservation, empty-output suppression, post-filter `Bodyless`
   validation call placement, task/frame construction, timeouts, reset, retry,
   early-response cleanup, and connection reuse remain in the protocol pumps.

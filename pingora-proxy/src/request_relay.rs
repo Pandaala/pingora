@@ -21,8 +21,9 @@
 //! its filtered form back to the protocol writer.
 
 use crate::{
-    custom, HttpProxy, ProxyHttp, RequestBodyAction, RequestBodyEvent, RequestRelayPlan,
-    RequestReplayPolicy, Session, UpstreamRequestBodyDisposition,
+    custom, HttpProxy, ProxyHttp, RequestAttemptId, RequestBodyAction, RequestBodyEvent,
+    RequestRelayPlan, RequestRelayRetryState, RequestReplayPolicy, Session,
+    UpstreamRequestBodyDisposition,
 };
 use bytes::Bytes;
 use http::Method;
@@ -318,6 +319,101 @@ impl FrozenRequestRelayPlan {
     pub(crate) fn enables_native_retry_buffer(self) -> bool {
         self.requested.replay == RequestReplayPolicy::Replayable
             && self.source == RequestRelaySource::LiveDownstream
+    }
+}
+
+impl Session {
+    pub(super) fn freeze_request_relay_plan(&mut self, requested: RequestRelayPlan) -> Result<()> {
+        if self.frozen_request_relay_plan.is_some() {
+            return Error::e_explain(
+                InternalError,
+                "request relay plan was frozen more than once",
+            );
+        }
+        if requested.disposition == UpstreamRequestBodyDisposition::Streamed
+            && requested.replay != RequestReplayPolicy::Never
+        {
+            return Error::e_explain(
+                InternalError,
+                "a streamed request relay plan must disable replay",
+            );
+        }
+        let registered = self.downstream_session.request_body_buffer_registered();
+        self.downstream_session.freeze_request_body_configuration();
+        self.frozen_request_relay_plan =
+            Some(FrozenRequestRelayPlan::derive(requested, registered));
+        Ok(())
+    }
+
+    pub(super) fn frozen_request_relay_plan(&self) -> FrozenRequestRelayPlan {
+        self.frozen_request_relay_plan
+            .expect("request relay plan must be frozen before an upstream attempt")
+    }
+
+    /// Return the request-scoped relay policy once it has been frozen.
+    pub fn request_relay_plan(&self) -> Option<RequestRelayPlan> {
+        self.frozen_request_relay_plan.map(|plan| plan.requested)
+    }
+
+    /// Return the current canonical upstream attempt identity.
+    pub fn request_attempt_id(&self) -> Option<RequestAttemptId> {
+        self.request_attempt_id
+    }
+
+    pub(super) fn begin_request_relay_attempt(&mut self, attempt: usize) {
+        self.request_attempt_id = Some(RequestAttemptId::new(attempt));
+    }
+
+    pub(super) fn enable_request_relay_retry_buffer(&mut self) {
+        let plan = self.frozen_request_relay_plan();
+        if !plan.enables_native_retry_buffer()
+            || self.native_retry_buffer_state != NativeRetryBufferState::NotStarted
+        {
+            return;
+        }
+        if self.downstream_session.retry_buffering_supported() {
+            self.downstream_session.enable_retry_buffering();
+            self.native_retry_buffer_state = NativeRetryBufferState::Enabled;
+        } else {
+            self.native_retry_buffer_state = NativeRetryBufferState::Unsupported;
+        }
+    }
+
+    pub(super) fn request_relay_retry_buffer(&self) -> Option<Bytes> {
+        (self.native_retry_buffer_state == NativeRetryBufferState::Enabled)
+            .then(|| self.downstream_session.get_retry_buffer())
+            .flatten()
+    }
+
+    /// Return the current body backing state used by the retry gate.
+    pub fn request_relay_retry_state(&self) -> RequestRelayRetryState {
+        let Some(plan) = self.frozen_request_relay_plan else {
+            return RequestRelayRetryState::Disabled;
+        };
+        if plan.requested.replay == RequestReplayPolicy::Never {
+            return RequestRelayRetryState::Disabled;
+        }
+        if plan.source == RequestRelaySource::RegisteredReplay {
+            return if self
+                .downstream_session
+                .request_body_buffer_replay_available()
+            {
+                RequestRelayRetryState::RegisteredReplay
+            } else {
+                RequestRelayRetryState::RegisteredUnavailable
+            };
+        }
+        match self.native_retry_buffer_state {
+            NativeRetryBufferState::NotStarted => RequestRelayRetryState::LiveUnread,
+            NativeRetryBufferState::Unsupported => RequestRelayRetryState::Unsupported,
+            NativeRetryBufferState::Enabled => {
+                if self.downstream_session.retry_buffer_truncated() {
+                    RequestRelayRetryState::NativeTruncated
+                } else {
+                    RequestRelayRetryState::NativeCapturing
+                }
+            }
+        }
     }
 }
 

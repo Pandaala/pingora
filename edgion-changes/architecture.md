@@ -45,8 +45,9 @@ targets. Small tests that directly exercise one private detail remain inline.
 ## Proxy implementation map
 
 - `pingora-proxy/src/proxy_trait.rs`: public `ProxyHttp` lifecycle contract.
-- `pingora-proxy/src/lib.rs`: `HttpProxy`, `Session`, cache short-circuit,
-  upstream selection/retry, errors, and pump dispatch.
+- `pingora-proxy/src/lib.rs`: `HttpProxy`, `Session` layout and initialization,
+  cache short-circuit, upstream selection/retry lifecycle, errors, and pump
+  dispatch.
 - `proxy_h1.rs`, `proxy_h2.rs`, `proxy_custom.rs`: protocol-specific duplex
   request/response pumps, transport cancellation, framing, and reuse outcomes.
 - `response_pipeline.rs`: shared response-task semantic stages: optional
@@ -56,8 +57,9 @@ targets. Small tests that directly exercise one private detail remain inline.
   explicit without dynamic dispatch.
 - `response_terminal.rs`: exactly-once terminal-body dispatch and empty-trailer
   normalization, privately owned by the response pipeline module.
-- `request_relay.rs`: shared request disposition and bodyless-contract policy,
-  plus the protocol-neutral per-event relay sequence.
+- `request_relay.rs`: `Session` relay-plan, attempt, and native-retry backing
+  transitions, shared request disposition and bodyless-contract policy, plus
+  the protocol-neutral per-event relay sequence.
 - `pump_termination.rs`: typed duplex outcomes, biased pump joining, and shared
   termination diagnostics and cleanup.
 - `proxy_common.rs`: hop-by-hop header sanitation, pump state machines, and
