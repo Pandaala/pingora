@@ -96,6 +96,7 @@ mod proxy_trait;
 mod pump_termination;
 mod request_relay;
 mod response_body_sink;
+mod response_cache_relay;
 mod response_head_barrier;
 mod response_pipeline;
 mod response_reconciliation;

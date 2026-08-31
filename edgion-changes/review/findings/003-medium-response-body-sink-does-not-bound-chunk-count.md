@@ -20,10 +20,11 @@ The `extra: Vec<Bytes>` has no item-count limit. One callback can legally push
 
 The fan-out continues after the sink:
 
-- `pingora-proxy/src/proxy_cache.rs:1014-1038` writes each emitted chunk to the
-  cache separately.
-- `pingora-proxy/src/proxy_cache.rs:1452-1485` creates one `HttpTask` per
-  emitted chunk for downstream delivery.
+- `pingora-proxy/src/response_cache_relay.rs`
+  (`cache_task_and_emitted_chunks_with_decision`) writes each emitted chunk to
+  the cache separately.
+- `pingora-proxy/src/response_cache_relay.rs` (`drain_emitted_chunks`) creates
+  one `HttpTask` per emitted chunk for downstream delivery.
 
 The per-batch input bound does not solve this: each input body task can create
 a very large number of output tasks before the batch is drained.

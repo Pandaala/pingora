@@ -108,7 +108,7 @@ Re-open only if:
 ## Reference Cases
 
 - Fork: `pingora-proxy/src/response_terminal.rs` (`TerminalBodyDispatch`),
-  `proxy_cache.rs` (`drain_emitted_chunks_before`,
+  `response_cache_relay.rs` (`drain_emitted_chunks_before`,
   `cache_task_and_emitted_chunks_before`), `proxy_h2.rs`, `proxy_custom.rs`.
 - Regression tests: `pingora-proxy/tests/test_terminal_body_dispatch.rs` (H2),
   `test_upstream_response_body_sink.rs::custom_trailered_*` and

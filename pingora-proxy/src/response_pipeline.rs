@@ -23,11 +23,9 @@ mod response_terminal;
 
 pub(crate) use response_terminal::{normalize_trailers, TerminalBodyDispatch};
 
-use crate::proxy_cache::{
-    self, drain_emitted_chunks, drain_emitted_chunks_before, range_filter::RangeBodyFilter,
-    ServeFromCache,
-};
+use crate::proxy_cache::{self, range_filter::RangeBodyFilter, ServeFromCache};
 use crate::response_body_sink::ResponseHeadDecision;
+use crate::response_cache_relay::{drain_emitted_chunks, drain_emitted_chunks_before};
 use crate::response_head_barrier::{
     ResponseHeadBarrier, ResponseHeadBarrierFailure, ResponseHeadBarrierOutput,
 };

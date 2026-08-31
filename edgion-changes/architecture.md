@@ -67,7 +67,9 @@ targets. Small tests that directly exercise one private detail remain inline.
   termination diagnostics and cleanup.
 - `proxy_common.rs`: hop-by-hop header sanitation, pump state machines, and
   custom-reader restoration.
-- `proxy_cache.rs`: cache lookup/fill/hit interleaved with body processing.
+- `response_cache_relay.rs`: response cacheability preflight, cache/sink chunk
+  ordering, and end-of-stream migration shared by the response pipeline.
+- `proxy_cache.rs`: cache lookup/fill/hit lifecycle and synthetic cache marker.
 - `response_body_sink.rs`: fork response-body emission/termination and
   callback-local held-head decision surface.
 - `response_head_barrier.rs`: bounded retained-task/accounting/deadline state.

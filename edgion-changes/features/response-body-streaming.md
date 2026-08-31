@@ -81,7 +81,9 @@ length.
   terminal task/framing, and response-source cache failure reconciliation.
 - `pingora-proxy/src/pump_termination.rs`: shared pump outcomes and termination
   diagnostics and cleanup.
-- `pingora-proxy/src/proxy_cache.rs`: EOS migration and synthetic cache marker.
+- `pingora-proxy/src/response_cache_relay.rs`: EOS migration and cache/sink
+  emitted-chunk ordering.
+- `pingora-proxy/src/proxy_cache.rs`: cache lifecycle and synthetic cache marker.
 - `proxy_h1.rs`, `proxy_h2.rs`, `proxy_custom.rs`: protocol pumps.
 - `proxy_trait.rs`: allocation-free object-safe defaults and compatible async
   override surface.
