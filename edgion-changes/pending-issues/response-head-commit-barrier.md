@@ -3,17 +3,21 @@
 ## Status
 
 Resolved Phase 4 implementation and verification record. The generic Pingora
-barrier and the default-off Edgion Guardrail claimant are implemented locally;
-production opt-in is constructible through `holdFirstWindow: true`. The full
-cross-repository protocol/cancellation/performance matrix passed, canonical
-architecture and feature records were promoted, and two independent reviews
-accepted the corrected implementation. The work remains uncommitted in both
-repositories. Severity: feature-safety and maintainability. Ownership:
-cross-repository.
+barrier is committed as `af9e1ac057c6ed454b5348beb34e14df1d435410`; the
+default-off Edgion Guardrail claimant is committed on `feature-08-30` as
+`f31d0169da977853723c3d3e63a7ea5bf332e9ee`, where production opt-in is
+constructible through `holdFirstWindow: true`. Edgion's lockfile selects the
+exact Pingora commit from the fork's `edgion_v3` git source without a permanent
+local path patch. The full cross-repository
+protocol/cancellation/performance matrix passed, canonical architecture and
+feature records were promoted, and two independent reviews accepted the
+corrected implementation. Severity: feature-safety and maintainability.
+Ownership: cross-repository.
 
-Baseline: Pingora `48f603e9def49547d128d1efdfd6dd4c3af44184` and Edgion
-`af83f684249186a25d2edecabab51baa76d60edf` plus the uncommitted Phase 1-4
-consumer worktrees in both repositories.
+Implementation provenance: Pingora
+`af9e1ac057c6ed454b5348beb34e14df1d435410`; Edgion baseline
+`f31d0169da977853723c3d3e63a7ea5bf332e9ee` on `feature-08-30`, plus
+uncommitted configuration-to-wire regression coverage.
 
 ## Canonical records
 
@@ -107,9 +111,11 @@ cache-hit Hold, multiple claimants, and fail-open Hold remain unsupported.
   and final independent closure review found no remaining implementation or
   test blocker after documentation status was reconciled.
 
-These entries describe the verified current worktree architecture. They do not
-claim that the baseline commits alone or any released revision contains the
-feature; both repositories still have uncommitted changes.
+These entries describe the verified cross-repository architecture. Pingora
+`af9e1ac057c6ed454b5348beb34e14df1d435410` contains the generic mechanism;
+Edgion `f31d0169da977853723c3d3e63a7ea5bf332e9ee` contains the production
+consumer integration. The remaining Edgion worktree delta strengthens tests
+and documentation rather than completing a missing production mechanism.
 
 ## Current local implementation map
 

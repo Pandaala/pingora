@@ -286,9 +286,11 @@ Conflicting or repeated terminal decisions fail closed. With the v1 single
 claimant, `Release` may be upgraded to `Replace` or `Fail` within the same
 callback but is final once consumed by the barrier.
 
-These target APIs are introduced slice by slice. In particular, no public Hold
-constructor is exposed until H1/H2 idle and callback deadlines are wired. A
-dormant internal Hold test seam is not a production capability.
+This sequencing gate was enforced while the target APIs were introduced slice
+by slice: no public Hold constructor was exposed before H1/H2 idle and callback
+deadlines were wired. The completed implementation now exposes bounded Hold to
+verified application claimants; a dormant internal test seam by itself would
+still not constitute a production capability.
 
 ## State machine
 

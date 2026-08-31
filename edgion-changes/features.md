@@ -32,9 +32,10 @@ implementation.
 
 The cross-cutting composition and ownership of request and response body
 features is canonicalized in [the body relay architecture](architecture/body-relay.md).
-The bounded response-head commit barrier is implemented in the current local
-worktree and remains default-Immediate unless an application explicitly opts
-in. Its closure history and exact verification snapshot are tracked in
+The bounded response-head commit barrier is committed in Pingora `af9e1ac` and
+integrated by Edgion `feature-08-30` at `f31d0169`. It remains default-Immediate
+unless an application explicitly opts in. Its closure history and exact
+verification snapshot are tracked in
 [the Phase 4 record](pending-issues/response-head-commit-barrier.md).
 
 ## Cross-feature invariants

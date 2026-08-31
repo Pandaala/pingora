@@ -12,7 +12,7 @@ next action, and closure evidence.
 | [H2 trailer validation](h2-trailer-validation.md) | Deferred upstream | Upstream decoder, then fork integration | [Upstream limitation](../review/upstream-limitations.md) |
 | [Non-streaming cache trailer completion](non-streaming-cache-trailer-completion.md) | Open | Fork | Discovered while closing [trailer filter parity](../review/response-trailer-filter-error-parity.md) |
 | [Custom conditional-filter gate](custom-conditional-filter-gate.md) | Open investigation | Fork custom response pump | Preserved explicitly by the shared response pipeline |
-| [Bounded response-head commit barrier](response-head-commit-barrier.md) | Resolved locally; Phase 4 implementation, full closure matrix, architecture promotion, and independent review complete | Cross-repository | [Feature](../features/response-head-commit-barrier.md), [design](../review/response-head-commit-barrier-design.md), [current Phase 1-4 architecture](../architecture/body-relay.md) |
+| [Bounded response-head commit barrier](response-head-commit-barrier.md) | Resolved; Pingora mechanism committed as `af9e1ac`, Edgion production consumer committed on `feature-08-30` as `f31d016`, local-source integration rerun passed | Cross-repository | [Feature](../features/response-head-commit-barrier.md), [design](../review/response-head-commit-barrier-design.md), [current Phase 1-4 architecture](../architecture/body-relay.md) |
 
 ## Required issue fields
 

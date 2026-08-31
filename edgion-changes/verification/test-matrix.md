@@ -83,7 +83,125 @@ not raise this workspace's Rust 1.85 MSRV.
 
 ## Validation snapshot
 
-Validated on 2026-08-31 for the uncommitted Phase 4 response-head barrier
+### Authoritative ws3 `feature-08-30` local-source run
+
+The final ws3 consumer run on 2026-08-31 used Edgion
+`f31d0169da977853723c3d3e63a7ea5bf332e9ee` (`feature-08-30`) plus the
+uncommitted integration-test additions, against the actual local Pingora
+checkout `af9e1ac057c6ed454b5348beb34e14df1d435410` (`edgion_v3`). A temporary
+Cargo home patched all 16 Pingora-family packages to
+`/Volumes/ExtStore/ws3/pingora`; metadata and integration build output showed
+the local manifest paths for `pingora-core`, `pingora-proxy`, cache, limits,
+TinyUFO, and the remaining fork packages.
+
+- `cargo check --workspace --all-targets --offline`: passed.
+- `cargo clippy --workspace --all-targets --offline --locked`: exited 0 with
+  the existing feature-08-30 warning baseline; no warning was promoted to an
+  error.
+- `cargo test -p edgion-gateway --lib --offline --locked`: 3393 passed,
+  2 ignored. The first run exposed a pre-existing parallel-test race: several
+  modules mutated the same process-global panic-threshold atomics while using
+  unrelated locks. Edgion now uses one test-only cross-module mutex for every
+  such mutation; the isolated test and the complete rerun both passed. This
+  changes test isolation only, not production synchronization or relay policy.
+- Focused Gateway suites passed 13 response-head tests, 2 response-processor
+  driver tests, and 24 Guardrail tests.
+- `cargo test -p edgion-resources --lib --offline --locked`: 1680 passed.
+- The real `EdgionPlugins/Guardrail` suite passed 11/11, including H1/H2
+  `held_first_window_reject_replaces_head_on_h1_and_h2`; report
+  `testing_20260831_135210/report.log`.
+- The real `HTTPRoute/Transport` suite passed 72/72 across its explicit H1/H2
+  matrix, including ordinary and streamed request relay, retry/early-response,
+  reset, framing, connection reuse, and disconnect cases; report
+  `testing_20260831_135244/report.log`.
+- The real `EdgionPlugins/BodyPlugins` suite passed 32/32, covering buffered
+  mutation, spill, replay/retry, chained owners, mirror, ExtProc, and Wasm body
+  consumers; report `testing_20260831_135349/report.log`.
+- Formatting and `git diff --check` passed. After local-source testing,
+  Edgion's `Cargo.lock` was restored byte-for-byte to SHA-256
+  `c4415fa572df7cde3cc084efba61745c1d9732680ab0e551bb15d579add090d5`;
+  the Pingora source-policy guard, locked offline metadata, and a complete
+  `cargo check --workspace --all-targets --offline --locked` then passed with
+  the normal git-pinned sources.
+
+The snapshots below are retained as historical migration evidence. This
+feature-08-30 ws3 run is authoritative for the current consumer worktree.
+
+### Earlier ws3 `feature-06-24` migration run
+
+The ws3 consumer was revalidated on 2026-08-31 against the actual local
+Pingora checkout `af9e1ac057c6ed454b5348beb34e14df1d435410` (`edgion_v3`).
+Edgion was `af83f684249186a25d2edecabab51baa76d60edf`
+(`feature-06-24`) plus its uncommitted relay migration. A temporary Cargo home
+patched all 16 Pingora-family packages to `/Volumes/ExtStore/ws3/pingora`; build
+output and metadata confirmed that the checks and integration binaries used
+those local paths rather than the git checkout cache.
+
+- `cargo check --workspace --all-targets --offline` and
+  `cargo clippy --workspace --all-targets --offline --locked` passed with the
+  existing warning baseline. Formatting, diff, agent-document, SSA-force,
+  metrics-inventory, Pingora-source, and gateway tracing-boundary guards passed.
+- `cargo test -p edgion-gateway --lib`: 3308 passed, 2 ignored.
+  `cargo test -p edgion-resources --lib`: 1680 passed. Focused response-head,
+  response-processor-driver, and Guardrail filters passed 13, 2, and 24 tests.
+- `cargo test -p pingora-proxy --lib`: 194 passed, 2 ignored;
+  `test_request_body_seam`: 61 passed; `test_terminal_body_dispatch`: 28 passed.
+- Real Edgion suites `EdgionPlugins/Guardrail`, `HTTPRoute/Transport`, and
+  `EdgionPlugins/BodyPlugins` passed through the locally built Controller,
+  Gateway, and test server. Their reports are under
+  `testing_20260831_123432`, `testing_20260831_123511`, and
+  `testing_20260831_123614` respectively.
+- Review found that `holdFirstWindow: true` had unit and Pingora pump coverage
+  but no Edgion configuration-to-wire test. The Guardrail integration fixture
+  now adds an H1/H2 first-window Reject case that requires exact complete
+  `403 application/json`, `cache-control: no-store`, matching content length,
+  no origin SSE leakage, and exactly one decision call. The final local-source
+  rerun passed all 11 Guardrail cases; report
+  `testing_20260831_125459/report.log`.
+- The temporary path resolution was removed after testing. Edgion's lockfile
+  returned byte-for-byte to its saved pre-test SHA-256
+  `c4415fa572df7cde3cc084efba61745c1d9732680ab0e551bb15d579add090d5`;
+  locked offline metadata and the source-policy guard then confirmed all 16
+  git entries still select `af9e1ac057c6`.
+
+### Earlier `feature-08-30` git-pinned closure run
+
+Cross-repository source closure was revalidated on 2026-08-31 after the generic
+Pingora implementation was committed as
+`af9e1ac057c6ed454b5348beb34e14df1d435410`. The Edgion consumer was then
+migrated onto `feature-08-30` at
+`a7b19937646d34bd383ba3cf5ddf57d2c8ec2978` plus its uncommitted phase 1-4
+worktree:
+
+- Edgion has no local Pingora path patch. Its 16 Pingora-family lock entries
+  use `branch=edgion_v3` and the single commit `af9e1ac057c6`; the source-policy
+  guard, `cargo metadata --locked`, and the dependency-tree inspection passed.
+- `cargo check --workspace --all-targets --locked` and `git diff --check`
+  passed in Edgion. Repository-wide `cargo fmt --all -- --check` reached only
+  the pre-existing uncommitted
+  `link_sys/providers/local_file/data_sender_impl.rs` formatting delta; no
+  migrated file appeared in the formatter diff.
+- `cargo clippy --workspace --all-targets --locked` exited successfully with
+  the repository's existing warning baseline.
+- Agent-document, SSA-force, metrics-inventory, Pingora-source, and gateway
+  tracing-boundary guards passed.
+- `cargo test -p edgion-gateway --lib --locked`: 3388 passed, 2 ignored, and
+  one unrelated failure in the pre-existing uncommitted local-file rotation
+  worktree. The failing test and panic are confined to
+  `size_rotation_keeps_base_path_active_when_archive_is_backfilled` and
+  `link_sys/providers/local_file/rotation.rs`; neither file is part of the
+  relay migration.
+- Focused Gateway migration filters passed: 13 response-head tests, 2 response
+  processor driver tests, and 24 Guardrail tests.
+- `cargo test -p edgion-resources --lib --locked`: 1680 passed.
+
+The full Phase 4 protocol and performance matrix below was originally run on
+the same implementation content before the Pingora commit, with Edgion using a
+temporary local path patch. Pingora `af9e1ac057c6` now contains that generic
+implementation, and the git-pinned consumer revalidation above proves that the
+committed source is consumable without the development patch.
+
+Validated on 2026-08-31 for the pre-commit Phase 4 response-head barrier
 working trees based on Pingora `48f603e9` and Edgion `af83f684`:
 
 - `cargo fmt --all -- --check`: passed in both repositories.

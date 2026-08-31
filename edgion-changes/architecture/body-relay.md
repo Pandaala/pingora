@@ -7,10 +7,13 @@ by the Edgion Pingora fork and its `../Edgion` consumer after phases 1-4 of the
 relay refactor. It describes current ownership and executable behavior,
 including the optional bounded response-head commit barrier.
 
-The recorded baseline is Pingora `48f603e9def4` and Edgion `af83f6842491`, plus
-the uncommitted phase 1-4 worktrees in both repositories. The commit IDs alone
-therefore do not contain the complete architecture described here; use this
-record together with the current worktrees until the changes are committed.
+Pingora `af9e1ac057c6` contains the generic phase 1-4 relay and response-head
+barrier mechanisms. Edgion `feature-08-30` at `f31d0169da97` contains the
+production consumer integration and selects the full Pingora commit from the
+fork's `edgion_v3` git source. The current Edgion worktree adds configuration-
+to-wire regression coverage and a shared test-only global-state lock; those
+uncommitted test changes do not alter the production architecture described
+here.
 
 The architecture has two directional lanes rather than one universal relay:
 
