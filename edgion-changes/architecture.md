@@ -134,7 +134,7 @@ consumer tree.
 
 - PROXY: `listeners/l4.rs` -> `listeners/mod.rs` ->
   `protocols/l4/proxy_protocol.rs` -> L4 stream/digest.
-- Replay: `protocols/http/body_buffer.rs` -> unified server -> H1/H2 sessions ->
+- Replay: `protocols/http/request_body_buffer.rs` -> unified server -> H1/H2 sessions ->
   proxy retry and pumps.
 - H2 evidence: `protocols/http/v2/end_stream_watch.rs` -> H2 client -> connector
   -> proxy H2 and cache completion.
