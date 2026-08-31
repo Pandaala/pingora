@@ -638,6 +638,8 @@ Pingora:
   liveness, and abandonment cleanup)
 - `pingora-proxy/src/response_pipeline.rs`
 - `pingora-proxy/src/response_terminal.rs`
+- `pingora-proxy/src/response_reconciliation.rs` (downstream body-forbidden,
+  terminal task/framing, and response-source cache failure reconciliation)
 - `pingora-proxy/src/response_body_sink.rs`
 - `pingora-proxy/src/proxy_cache.rs`
 - `pingora-proxy/src/pump_termination.rs`

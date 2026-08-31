@@ -77,6 +77,8 @@ length.
 - `pingora-proxy/src/response_body_sink.rs`: bounded output state.
 - `pingora-proxy/src/response_terminal.rs`: terminal latch and empty-trailer
   normalization.
+- `pingora-proxy/src/response_reconciliation.rs`: downstream body-forbidden,
+  terminal task/framing, and response-source cache failure reconciliation.
 - `pingora-proxy/src/pump_termination.rs`: shared pump outcomes and termination
   diagnostics and cleanup.
 - `pingora-proxy/src/proxy_cache.rs`: EOS migration and synthetic cache marker.
@@ -90,5 +92,7 @@ length.
   termination and custom connector behavior.
 - `test_terminal_body_dispatch.rs`: self-contained end-shape and trailer
   handling against per-test origins.
-- Library tests pin the sink budget, EOS migration and terminal latch without
-  external processes.
+- `response_reconciliation_tests.rs`: focused terminal followup suppression and
+  framing reconciliation.
+- Library tests pin the sink budget, EOS migration, terminal latch, and
+  reconciliation without external processes.

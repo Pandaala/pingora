@@ -29,6 +29,9 @@ The expected shared-main conflict surface is intentionally concentrated:
 - `pingora-proxy/src/response_terminal.rs`: preserve the exactly-once terminal
   latch, filtered-upgrade body tagging, and empty-trailer normalization as one
   private response-pipeline capability.
+- `pingora-proxy/src/response_reconciliation.rs`: preserve downstream
+  body-forbidden classification, terminal task/framing normalization, and
+  response-source cache failure reconciliation as one shared private seam.
 - `pingora-proxy/src/lib.rs`: preserve H1 transfer-coding admission before
   `on_connection_reuse` and all routing phases. Its forced-close policy must be
   applied after every mutable error hook and must directly veto returning a

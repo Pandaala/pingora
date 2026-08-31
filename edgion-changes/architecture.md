@@ -57,6 +57,9 @@ targets. Small tests that directly exercise one private detail remain inline.
   explicit without dynamic dispatch.
 - `response_terminal.rs`: exactly-once terminal-body dispatch and empty-trailer
   normalization, privately owned by the response pipeline module.
+- `response_reconciliation.rs`: downstream body-forbidden classification,
+  terminal task/framing normalization, and response-source cache failure
+  reconciliation shared by the pipeline, cache path, and protocol pumps.
 - `request_relay.rs`: `Session` relay-plan, attempt, and native-retry backing
   transitions, shared request disposition and bodyless-contract policy, plus
   the protocol-neutral per-event relay sequence.

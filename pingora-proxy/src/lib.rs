@@ -43,7 +43,6 @@ use http::{header, version::Version, Method};
 use log::{debug, error, trace, warn};
 use once_cell::sync::Lazy;
 pub use pingora_core::modules::http::RequestBodyEvent;
-use pingora_core::protocols::http::v1::common::header_value_content_length;
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::fmt::Debug;
 use std::str;
@@ -55,131 +54,9 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 use tokio::time;
 
-fn downstream_response_body_forbidden(session: &Session, header: &ResponseHeader) -> bool {
-    session.req_header().method == http::Method::HEAD
-        || header.status.is_informational()
-        || matches!(header.status.as_u16(), 204 | 304)
-}
-
-fn is_downstream_followup(task: &HttpTask) -> bool {
-    !matches!(task, HttpTask::Header(..))
-}
-
-fn abort_cache_after_response_source_failure(session: &mut Session, from_cache: bool) {
-    if session.cache.enabled() || session.cache.bypassing() {
-        session.cache.disable(if from_cache {
-            NoCacheReason::StorageError
-        } else {
-            NoCacheReason::UpstreamError
-        });
-    }
-}
-
-fn reconcile_terminal_response_tasks(
-    tasks: &mut Vec<HttpTask>,
-    start: usize,
-    downstream_body_forbidden: bool,
-) -> Result<()> {
-    if !matches!(tasks.get(start), Some(HttpTask::Header(..))) {
-        return Ok(());
-    }
-
-    if downstream_body_forbidden {
-        tasks.truncate(start + 1);
-        let HttpTask::Header(header, eos) = &mut tasks[start] else {
-            unreachable!("retained task must be a response header")
-        };
-        *eos = true;
-        header.remove_header(&http::header::TRANSFER_ENCODING);
-        if header.status.is_informational() || header.status.as_u16() == 204 {
-            header.remove_header(&http::header::CONTENT_LENGTH);
-        }
-        return Ok(());
-    }
-
-    let body_len = tasks
-        .iter()
-        .skip(start + 1)
-        .filter_map(|task| match task {
-            HttpTask::Body(Some(data), _) | HttpTask::UpgradedBody(Some(data), _) => {
-                Some(data.len())
-            }
-            _ => None,
-        })
-        .sum::<usize>();
-    let has_followup = tasks.len() > start + 1;
-    let HttpTask::Header(header, eos) = &mut tasks[start] else {
-        unreachable!("located task must be a response header")
-    };
-    *eos = !has_followup;
-
-    reconcile_content_length(header, body_len);
-    if !has_followup {
-        header.remove_header(&http::header::TRANSFER_ENCODING);
-        return Ok(());
-    }
-    if header.headers.get(http::header::CONTENT_LENGTH).is_none()
-        && header
-            .headers
-            .get(http::header::TRANSFER_ENCODING)
-            .is_none()
-    {
-        header.set_version(Version::HTTP_11);
-        header.insert_header(http::header::TRANSFER_ENCODING, "chunked")?;
-    }
-    Ok(())
-}
-
-fn reconcile_content_length(header: &mut ResponseHeader, body_len: usize) {
-    let content_length_matches =
-        header_value_content_length(header.headers.get(http::header::CONTENT_LENGTH))
-            .is_some_and(|content_length| content_length == body_len);
-    if header.headers.contains_key(http::header::CONTENT_LENGTH) && !content_length_matches {
-        header.remove_header(&http::header::CONTENT_LENGTH);
-    }
-}
-
-fn reconcile_terminal_cache_header(header: &mut ResponseHeader, sink: &ResponseBodySink) {
-    let body_len = sink.peek_extra().iter().map(Bytes::len).sum();
-    reconcile_content_length(header, body_len);
-}
-
 #[cfg(test)]
-mod downstream_body_suppression_tests {
-    use super::*;
-
-    #[test]
-    fn terminal_followups_are_dropped_instead_of_converted_to_done() {
-        assert!(is_downstream_followup(&HttpTask::Body(None, true)));
-        assert!(is_downstream_followup(&HttpTask::Trailer(None)));
-        assert!(is_downstream_followup(&HttpTask::Done));
-        assert!(!is_downstream_followup(&HttpTask::Header(
-            Box::new(ResponseHeader::build(204, None).unwrap()),
-            true,
-        )));
-    }
-
-    #[test]
-    fn terminal_framing_removes_a_stale_content_length() {
-        let mut header = ResponseHeader::build(503, None).unwrap();
-        header
-            .insert_header(http::header::CONTENT_LENGTH, "0")
-            .unwrap();
-        let mut tasks = vec![
-            HttpTask::Header(Box::new(header), false),
-            HttpTask::Body(Some(Bytes::from_static(b"generated")), true),
-        ];
-        reconcile_terminal_response_tasks(&mut tasks, 0, false).unwrap();
-        let HttpTask::Header(header, false) = &tasks[0] else {
-            panic!("unexpected header task")
-        };
-        assert!(header.headers.get(http::header::CONTENT_LENGTH).is_none());
-        assert_eq!(
-            header.headers.get(http::header::TRANSFER_ENCODING).unwrap(),
-            "chunked"
-        );
-    }
-}
+#[path = "response_reconciliation_tests.rs"]
+mod downstream_body_suppression_tests;
 
 use pingora_cache::NoCacheReason;
 use pingora_core::apps::{
@@ -221,11 +98,17 @@ mod request_relay;
 mod response_body_sink;
 mod response_head_barrier;
 mod response_pipeline;
+mod response_reconciliation;
 pub mod subrequest;
 #[cfg(test)]
 mod test_allocator;
 
 use subrequest::{BodyMode, Ctx as SubrequestCtx};
+
+use response_reconciliation::{
+    abort_cache_after_response_source_failure, downstream_response_body_forbidden,
+    is_downstream_followup, reconcile_terminal_cache_header, reconcile_terminal_response_tasks,
+};
 
 pub use proxy_cache::range_filter::{range_header_filter, MultiRangeInfo, RangeType};
 pub use proxy_purge::PurgeStatus;
