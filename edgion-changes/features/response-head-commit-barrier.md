@@ -170,6 +170,7 @@ Pingora:
 - `pingora-proxy/src/response_head_barrier.rs`
 - `pingora-proxy/src/response_body_sink.rs`
 - `pingora-proxy/src/response_pipeline.rs`
+- `pingora-proxy/src/response_terminal.rs`
 - `pingora-proxy/src/proxy_common.rs`
 - `pingora-proxy/src/proxy_h1.rs`
 - `pingora-proxy/src/proxy_h2.rs`

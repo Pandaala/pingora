@@ -13,7 +13,7 @@ closed: 2026-08-24
 `upstream_response_body_filter` now receives `end_of_stream = true` exactly once
 for every response that terminates normally, including an H2 response that ends
 with trailers and one that ends with a bare `HttpTask::Done`. A per-response
-latch (`proxy_common::TerminalBodyDispatch`) decides which task delivers it, and
+latch (`response_pipeline::TerminalBodyDispatch`) decides which task delivers it, and
 released bytes are emitted ahead of the terminating task.
 
 The H1 trailer re-evaluation trigger fired on 2026-08-28. The response-wide
@@ -107,13 +107,14 @@ Re-open only if:
 
 ## Reference Cases
 
-- Fork: `pingora-proxy/src/proxy_common.rs` (`TerminalBodyDispatch`),
+- Fork: `pingora-proxy/src/response_terminal.rs` (`TerminalBodyDispatch`),
   `proxy_cache.rs` (`drain_emitted_chunks_before`,
   `cache_task_and_emitted_chunks_before`), `proxy_h2.rs`, `proxy_custom.rs`.
 - Regression tests: `pingora-proxy/tests/test_terminal_body_dispatch.rs` (H2),
   `test_upstream_response_body_sink.rs::custom_trailered_*` and
   `custom_empty_upgrade_tags_terminal_output_as_upgraded_body` (custom pump),
-  plus latch and ordering unit tests in `proxy_common.rs` / `proxy_cache.rs`.
+  plus latch and ordering unit tests in
+  `proxy_common_terminal_body_dispatch_tests.rs` / `proxy_cache.rs`.
 - Prior instance of the same class: commit `83f3912`
   (`terminal_upstream_body_filter` for `Header(_, true)`).
 - Related: [abandoned-request-body-terminal-event.md](../../../../Edgion/skills/04-review/h2-grpc/abandoned-request-body-terminal-event.md)

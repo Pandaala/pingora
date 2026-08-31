@@ -54,6 +54,8 @@ targets. Small tests that directly exercise one private detail remain inline.
   admission, downstream transforms, sink drain, and prepared task batches.
   `ResponseProtocol` keeps the H1/H2/custom wire and upgrade differences
   explicit without dynamic dispatch.
+- `response_terminal.rs`: exactly-once terminal-body dispatch and empty-trailer
+  normalization, privately owned by the response pipeline module.
 - `proxy_common.rs`: shared event, completion, retry, and reuse decisions.
 - `proxy_cache.rs`: cache lookup/fill/hit interleaved with body processing.
 - `response_body_sink.rs`: fork response-body emission/termination and
@@ -125,7 +127,8 @@ consumer tree.
 - H2 evidence: `protocols/http/v2/end_stream_watch.rs` -> H2 client -> connector
   -> proxy H2 and cache completion.
 - Streaming: `proxy_trait.rs` and `response_body_sink.rs` ->
-  `response_pipeline.rs` / `proxy_common.rs` -> all pumps -> `proxy_cache.rs`.
+  `response_pipeline.rs` / `response_terminal.rs` -> all pumps ->
+  `proxy_cache.rs`.
 
 ## Progressive review order
 

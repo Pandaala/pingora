@@ -260,7 +260,8 @@ generic response semantics:
 - a filtered terminal header;
 - upstream reuse eligibility;
 - the bounded `ResponseBodySink`; and
-- the exactly-once `TerminalBodyDispatch` latch.
+- the exactly-once `TerminalBodyDispatch` latch, implemented in the private
+  `pingora-proxy/src/response_terminal.rs` child module.
 
 It deliberately does not own `Session`, application context, cache storage,
 protocol writers, or Edgion processor boxes because those lifetimes extend to
@@ -629,6 +630,7 @@ Pingora:
 - `pingora-proxy/src/proxy_h2_request_body.rs` (H2 request framing, writes,
   liveness, and abandonment cleanup)
 - `pingora-proxy/src/response_pipeline.rs`
+- `pingora-proxy/src/response_terminal.rs`
 - `pingora-proxy/src/response_body_sink.rs`
 - `pingora-proxy/src/proxy_cache.rs`
 - `pingora-proxy/src/proxy_common.rs`

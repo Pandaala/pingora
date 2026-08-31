@@ -1553,7 +1553,7 @@ pub(crate) fn drain_emitted_chunks(
 ///
 /// Used only for a terminal `Trailer`/`Done` that dispatched the terminal
 /// `upstream_response_body_filter` callback (see
-/// `proxy_common::TerminalBodyDispatch`). The chunks queued there are response
+/// `response_pipeline::TerminalBodyDispatch`). The chunks queued there are response
 /// BODY the filter had been withholding, so they must reach the wire before the
 /// trailer that terminates the response, not after it.
 ///
@@ -1566,7 +1566,7 @@ pub(crate) fn drain_emitted_chunks(
 ///
 /// `is_upgraded` comes from the latch rather than from `task`, which is a
 /// `Trailer`/`Done` and carries no body variant of its own -- see
-/// `TerminalBodyDispatch::is_upgraded` for why the tag must be preserved.
+/// `response_pipeline::TerminalBodyDispatch::is_upgraded` for why the tag must be preserved.
 pub(crate) fn drain_emitted_chunks_before(
     task: HttpTask,
     sink: &mut ResponseBodySink,

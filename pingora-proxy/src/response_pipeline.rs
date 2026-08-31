@@ -18,11 +18,15 @@
 //! and connection reuse. This module owns the shared semantic sequence between
 //! receiving an [`HttpTask`] and handing a prepared task batch to a writer.
 
+#[path = "response_terminal.rs"]
+mod response_terminal;
+
+pub(crate) use response_terminal::{normalize_trailers, TerminalBodyDispatch};
+
 use crate::proxy_cache::{
     self, drain_emitted_chunks, drain_emitted_chunks_before, range_filter::RangeBodyFilter,
     ServeFromCache,
 };
-use crate::proxy_common::{normalize_trailers, TerminalBodyDispatch};
 use crate::response_body_sink::ResponseHeadDecision;
 use crate::response_head_barrier::{
     ResponseHeadBarrier, ResponseHeadBarrierFailure, ResponseHeadBarrierOutput,

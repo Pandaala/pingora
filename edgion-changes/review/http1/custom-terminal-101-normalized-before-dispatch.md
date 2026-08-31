@@ -113,6 +113,6 @@ thread in `buffer_body_data`.
 - `../Edgion/tasks/todo/issue-custom-terminal-101-upgrade-panic.md` (2026-08-24), derived from
   the deep review of `h2-trailer-eos-bypasses-response-body-filter`.
 - `pingora-proxy/src/proxy_custom.rs` — `custom_pipe_up_to_down_response`.
-- `pingora-proxy/src/proxy_common.rs` — `TerminalBodyDispatch`.
+- `pingora-proxy/src/response_terminal.rs` — `TerminalBodyDispatch`.
 - [bodyless-header-eos-terminal-body-hook.md](../../../../Edgion/skills/04-review/http1/bodyless-header-eos-terminal-body-hook.md) —
   the parent contract for terminal Header-EOS dispatch.

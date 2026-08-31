@@ -26,12 +26,15 @@ The expected shared-main conflict surface is intentionally concentrated:
 - `pingora-proxy/src/proxy_h2_request_body.rs`: preserve H2 request framing,
   the pinned write future, weak END_STREAM evidence, timeout precedence,
   capacity cancellation, and bounded abandonment as one capability.
+- `pingora-proxy/src/response_terminal.rs`: preserve the exactly-once terminal
+  latch, filtered-upgrade body tagging, and empty-trailer normalization as one
+  private response-pipeline capability.
 - `pingora-proxy/src/lib.rs`: preserve H1 transfer-coding admission before
   `on_connection_reuse` and all routing phases. Its forced-close policy must be
   applied after every mutable error hook and must directly veto returning a
   reusable downstream session; keepalive metadata alone is not that veto.
 - `pingora-proxy/src/proxy_common.rs`: upstream hop-by-hop sanitization and the
-  Edgion event/disposition state machines are independent and both required.
+  request event/disposition state machines are independent and both required.
 
 ## Resolution rules
 

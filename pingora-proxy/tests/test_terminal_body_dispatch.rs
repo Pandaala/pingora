@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! End-to-end coverage for the single terminal `upstream_response_body_filter`
-//! callback (`proxy_common::TerminalBodyDispatch`).
+//! callback (`response_pipeline::TerminalBodyDispatch`).
 //!
 //! `HttpProxy::upstream_filter` reaches the body filter only from a
 //! `Body`/`UpgradedBody` task. On HTTP/2 the `END_STREAM` flag rides the
