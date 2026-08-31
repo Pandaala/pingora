@@ -68,9 +68,10 @@ hand.
 ## Request-body writes
 
 The weak wire flag has one consumer outside response completion: the proxy's
-h2 request-body pump, in `pingora-proxy/src/proxy_h2.rs`. It asks a different
-question -- "did the origin say it was done with me" -- and it decides nothing
-about the response, which is settled by the read half exactly as above.
+H2 request-body capability in
+`pingora-proxy/src/proxy_h2_request_body.rs`. It asks a different question --
+"did the origin say it was done with me" -- and it decides nothing about the
+response, which is settled by the read half exactly as above.
 
 A `poll_capacity` wait has no end of its own. `h2` reports that a stream closed
 and that a stream was reset, but nothing distinguishes a peer that is about to
@@ -145,5 +146,6 @@ frame-order handoff recorded beside the watcher.
   classifies response completion.
 - `pingora-core/src/protocols/http/v2/server.rs` tracks strict downstream body
   completion and timeout behavior.
-- `pingora-proxy/src/proxy_h2.rs` classifies request-body write failures and
-  bounds a write the upstream has stopped taking.
+- `pingora-proxy/src/proxy_h2_request_body.rs` classifies request-body write
+  failures, applies the write-progress bound, and releases abandoned capacity;
+  `pingora-proxy/src/proxy_h2.rs` retains the owning duplex pump.

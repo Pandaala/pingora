@@ -92,7 +92,7 @@ findings were corrected.
 
 ## References
 
-- `pingora-proxy/src/proxy_h2.rs`
+- `pingora-proxy/src/proxy_h2_request_body.rs`
 - `pingora-proxy/tests/test_h2_upstream_stalled_after_response.rs`
 - `pingora-proxy/tests/test_h2_upstream_cache_and_reuse.rs`
 - [`h2-writer-capacity-stall-after-response.md`](h2-writer-capacity-stall-after-response.md)

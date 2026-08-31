@@ -21,7 +21,11 @@ The expected shared-main conflict surface is intentionally concentrated:
   wrapping IO with the END_STREAM watch.
 - `pingora-proxy/src/proxy_{h1,h2,custom}.rs`: preserve upstream batch helpers,
   pending-task backpressure, warning suppression and finish-hit guards while
-  carrying Edgion filter state through them.
+  carrying Edgion filter state through them. The H2 parent retains duplex,
+  response, cache, reset, allocation, and reuse ownership.
+- `pingora-proxy/src/proxy_h2_request_body.rs`: preserve H2 request framing,
+  the pinned write future, weak END_STREAM evidence, timeout precedence,
+  capacity cancellation, and bounded abandonment as one capability.
 - `pingora-proxy/src/lib.rs`: preserve H1 transfer-coding admission before
   `on_connection_reuse` and all routing phases. Its forced-close policy must be
   applied after every mutable error hook and must directly veto returning a

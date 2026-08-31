@@ -82,8 +82,10 @@ complete response and that timeout without END_STREAM fails.
 
 ## References
 
-- `pingora-proxy/src/proxy_h2.rs` — successful write-abandonment classification,
-  cleanup helper, and capacity regression test.
+- `pingora-proxy/src/proxy_h2_request_body.rs` — successful
+  write-abandonment classification and cleanup helper.
+- `pingora-proxy/src/proxy_h2_request_body_tests.rs` — physical location of
+  the capacity regression test, whose test identity remains under `proxy_h2`.
 - [H2 writer stall after response](h2-writer-capacity-stall-after-response.md) —
   the successful-abandonment decision this cleanup preserves.
 - [H2 writer stall without END_STREAM](h2-writer-stall-without-end-stream-bounded.md) —

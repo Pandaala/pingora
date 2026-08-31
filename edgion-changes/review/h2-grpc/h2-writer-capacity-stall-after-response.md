@@ -146,7 +146,7 @@ Re-open this decision only if:
 
 - H2 whole-change audit 2026-08-26, issue H2-007
   (`../Edgion/tasks/todo/pingora-h2-end-stream-watch-simplification/issues/`).
-- `pingora-proxy/src/proxy_h2.rs` — `UPSTREAM_STALL_PROBE_INTERVAL`,
+- `pingora-proxy/src/proxy_h2_request_body.rs` — `UPSTREAM_STALL_PROBE_INTERVAL`,
   `write_upstream_body_watching_stall`, `upstream_write_stalled_after_response`,
   `upstream_write_error_outcome`.
 - `pingora-proxy/tests/test_h2_upstream_stalled_after_response.rs` — the

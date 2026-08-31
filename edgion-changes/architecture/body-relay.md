@@ -626,6 +626,8 @@ Pingora:
 - `pingora-proxy/src/proxy_trait.rs` (`RequestRelayPlan`, retry state, hooks)
 - `pingora-proxy/src/lib.rs` (plan freeze, attempts, retry loop)
 - `pingora-proxy/src/proxy_{h1,h2,custom}.rs`
+- `pingora-proxy/src/proxy_h2_request_body.rs` (H2 request framing, writes,
+  liveness, and abandonment cleanup)
 - `pingora-proxy/src/response_pipeline.rs`
 - `pingora-proxy/src/response_body_sink.rs`
 - `pingora-proxy/src/proxy_cache.rs`
