@@ -18,7 +18,10 @@ use futures::StreamExt;
 use super::*;
 use crate::proxy_cache::ServeFromCache;
 use crate::proxy_common::*;
-use crate::request_relay::{RequestRelayOutcome, RequestRelayProtocol};
+use crate::request_relay::{
+    bodyless_contract_violation, safe_upstream_disposition, validate_streamed_upstream_disposition,
+    violates_bodyless_contract, RequestRelayOutcome, RequestRelayProtocol,
+};
 use crate::response_pipeline::{ResponsePipelineState, ResponseProtocol, ResponseTaskBatchOutcome};
 use pingora_core::protocols::http::{
     custom::CUSTOM_MESSAGE_QUEUE_SIZE, v1::common::is_upgrade_req as is_h1_upgrade_req,

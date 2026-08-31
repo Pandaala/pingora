@@ -13,6 +13,10 @@
 // limitations under the License.
 
 use super::*;
+use crate::request_relay::{
+    safe_disposition, safe_upstream_disposition, violates_bodyless_contract, DispositionFacts,
+};
+use crate::UpstreamRequestBodyDisposition;
 
 fn request_with_headers(headers: &[(&str, &str)]) -> RequestHeader {
     let mut request = RequestHeader::build("GET", b"/", Some(headers.len())).unwrap();
@@ -234,54 +238,6 @@ fn safe_disposition_truth_table() {
             }
         }
     }
-}
-
-#[test]
-fn streamed_protocol_conflict_excludes_only_tunnel_and_legacy_framing() {
-    assert!(!facts(false, false, false, false).streamed_protocol_conflict());
-    assert!(facts(true, false, false, false).streamed_protocol_conflict());
-    assert!(facts(false, true, false, false).streamed_protocol_conflict());
-    assert!(facts(false, false, false, true).streamed_protocol_conflict());
-    assert!(
-        !facts(false, false, true, false).streamed_protocol_conflict(),
-        "a strictly bodyless request keeps the existing benign Ordinary coercion"
-    );
-}
-
-/// The tunnel facts come from the UNION of both sides, because the
-/// rewrite the disposition drives targets the upstream request while the
-/// downstream request is what the client actually sent.
-#[test]
-fn disposition_facts_union_both_sides() {
-    fn upstream(method: &str, upgrade: bool) -> RequestHeader {
-        let mut req = RequestHeader::build(method, b"/", None).unwrap();
-        if upgrade {
-            req.insert_header(http::header::UPGRADE, "websocket")
-                .unwrap();
-            req.insert_header(http::header::CONNECTION, "upgrade")
-                .unwrap();
-        }
-        req
-    }
-
-    // Neither side: nothing to protect.
-    let plain = DispositionFacts::union(false, false, false, &upstream("POST", false));
-    assert!(!plain.is_upgrade_req && !plain.is_connect);
-
-    // Only the DOWNSTREAM request is a tunnel (the application stripped
-    // `Upgrade` from the upstream request).
-    let downstream_only = DispositionFacts::union(true, false, false, &upstream("POST", false));
-    assert!(downstream_only.is_upgrade_req);
-    let downstream_connect = DispositionFacts::union(false, true, false, &upstream("POST", false));
-    assert!(downstream_connect.is_connect);
-
-    // Only the UPSTREAM request is a tunnel (the application synthesized
-    // it from an ordinary downstream request).
-    let upstream_only = DispositionFacts::union(false, false, false, &upstream("GET", true));
-    assert!(upstream_only.is_upgrade_req);
-    let upstream_connect =
-        DispositionFacts::union(false, false, false, &upstream("CONNECT", false));
-    assert!(upstream_connect.is_connect);
 }
 
 /// The individually load-bearing rows, spelled out so a regression names

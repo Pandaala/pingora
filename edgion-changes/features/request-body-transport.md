@@ -135,17 +135,19 @@ settling the failed current AI predispatch reservation.
 ## Pump rules
 
 - H1 and H2 pumps read downstream uploads and upstream responses concurrently.
-- `pingora-proxy/src/request_relay.rs` owns the shared per-event semantic
-  sequence: source EOF normalization, the capability-gated request-trailer
-  hook, downstream modules, and the application body-action hook. It returns
-  the same `Bytes` owner and typed action to the pump without performing I/O.
-  H1/H2/custom keep their existing capability differences: custom does not
-  dispatch the trailer hook and request-body termination remains fail-closed.
+- `pingora-proxy/src/request_relay.rs` owns the shared disposition validation
+  and safe coercion, the `Bodyless` application-contract classification, and
+  the per-event semantic sequence: source EOF normalization, the
+  capability-gated request-trailer hook, downstream modules, and the
+  application body-action hook. It returns the same `Bytes` owner and typed
+  action to the pump without performing I/O. H1/H2/custom keep their existing
+  capability differences: custom does not dispatch the trailer hook and
+  request-body termination remains fail-closed.
 - Pipe/capacity reservation, empty-output suppression, post-filter `Bodyless`
-  validation, task/frame construction, timeouts, reset, retry, early-response
-  cleanup, and connection reuse remain in the protocol pumps. In particular,
-  the H1 pump still acquires its permit before awaiting the relay, so the
-  extraction does not weaken backpressure.
+  validation call placement, task/frame construction, timeouts, reset, retry,
+  early-response cleanup, and connection reuse remain in the protocol pumps.
+  In particular, the H1 pump still acquires its permit before awaiting the
+  relay, so the extraction does not weaken backpressure.
 - The main branch's batch processing and downstream proxy-task backpressure
   remain authoritative; Edgion filtering state is passed through the shared
   batch helpers rather than duplicating inline loops.

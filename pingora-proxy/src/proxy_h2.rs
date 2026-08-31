@@ -18,6 +18,7 @@ use futures::StreamExt;
 use super::*;
 use crate::proxy_cache::ServeFromCache;
 use crate::proxy_common::*;
+use crate::request_relay::{safe_upstream_disposition, validate_streamed_upstream_disposition};
 use crate::response_pipeline::{ResponsePipelineState, ResponseProtocol, ResponseTaskBatchOutcome};
 
 #[path = "proxy_h2_request_body.rs"]

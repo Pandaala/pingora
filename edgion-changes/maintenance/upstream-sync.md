@@ -33,8 +33,12 @@ The expected shared-main conflict surface is intentionally concentrated:
   `on_connection_reuse` and all routing phases. Its forced-close policy must be
   applied after every mutable error hook and must directly veto returning a
   reusable downstream session; keepalive metadata alone is not that veto.
-- `pingora-proxy/src/proxy_common.rs`: upstream hop-by-hop sanitization and the
-  request event/disposition state machines are independent and both required.
+- `pingora-proxy/src/request_relay.rs`: preserve request disposition validation,
+  safe coercion, the bodyless application contract, and per-event relay
+  semantics as one protocol-neutral policy station.
+- `pingora-proxy/src/proxy_common.rs`: preserve upstream hop-by-hop sanitation
+  and the remaining completion, retry, and reuse state independently from the
+  relay policy.
 
 ## Resolution rules
 
