@@ -426,24 +426,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_conn_error_other() {
-        let peer = HttpPeer::new("240.0.0.1:80".to_string(), false, "".to_string()); // non localhost
-        let addr = "127.0.0.1:0".parse().ok();
-        // create an error: cannot send from src addr: localhost to dst addr: a public IP
+    async fn test_conn_error_bind() {
+        let occupied_source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_addr = occupied_source.local_addr().unwrap();
+        let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = BasicPeer::new(&destination.local_addr().unwrap().to_string());
         let bind_to = BindTo {
-            addr,
+            addr: Some(source_addr),
             ..Default::default()
         };
-        let new_session = connect(&peer, Some(bind_to)).await;
-        let error = new_session.unwrap_err();
-        // XXX: some system will allow the socket to bind and connect without error, only to timeout
+
+        let error = connect(&peer, Some(bind_to)).await.unwrap_err();
+        assert_eq!(error.etype(), &InternalError);
+        assert_eq!(error.root_etype(), &BindError);
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .expect("BindError must preserve its OS cause")
+                .kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+        let display = error.to_string();
+        assert!(display.contains("Fail to connect to"), "{display}");
         assert!(
-            error.etype() == &ConnectError
-                || error.etype() == &ConnectTimedout
-                // The error seen on mac: https://github.com/cloudflare/pingora/pull/679
-                || (error.etype() == &InternalError),
-            "{error:?}"
-        )
+            display.contains(&format!("failed to bind to socket {source_addr}")),
+            "{display}"
+        );
     }
 
     #[tokio::test]
