@@ -28,10 +28,10 @@ use pingora_timeout::timeout;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::ready;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
-use crate::protocols::http::body_buffer::FixedBuffer;
+use crate::protocols::http::body_buffer::{FixedBuffer, RegisteredRequestBodyBuffer};
 use crate::protocols::http::date::get_cached_date;
 use crate::protocols::http::v1::client::{
     http_req_header_to_wire, request_target_has_forbidden_byte,
@@ -41,8 +41,23 @@ use crate::protocols::http::HttpTask;
 use crate::protocols::{Digest, SocketAddr, Stream};
 use crate::server::ShutdownWatch;
 use crate::{Error, ErrorType, OrErr, Result};
+#[path = "server_request_body_replay.rs"]
+mod request_body_replay;
 
 const BODY_BUF_LIMIT: usize = 1024 * 64;
+
+/// The default downstream request-body read timeout, matching the HTTP/1
+/// server session's own default (`v1::server::HttpSession::new`).
+///
+/// A default is what makes the bound real: nothing in `pingora-core` or
+/// `pingora-proxy` calls [`HttpSession::set_read_timeout`], so an opt-in bound
+/// would leave every consumer that does not set one -- including pingora's own
+/// server apps -- with an unbounded H2 body read, while the same application
+/// over HTTP/1 is protected. Applications with legitimately idle uploads
+/// (long-idle client-streaming gRPC) raise or clear it per request with
+/// [`HttpSession::set_read_timeout`]; CONNECT tunnels are exempt by
+/// construction, see [`HttpSession::body_read_timeout`].
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 type H2Connection<S> = server::Connection<S, Bytes>;
 
@@ -267,10 +282,62 @@ impl Future for Idle<'_> {
     }
 }
 
+/// Whether an `h2` error observed *after* the request body already reached EOF
+/// is a benign way for the client to end the stream rather than a read failure.
+///
+/// The request is complete at this point, so none of these mean the bytes we
+/// read are suspect:
+/// - GOAWAY with `NO_ERROR`: graceful connection shutdown.
+/// - RST_STREAM with `NO_ERROR`: RFC 9113 §8.1's "stop sending the request
+///   body without breaking the response" signal, sent by a client that has
+///   already finished its body.
+/// - RST_STREAM with `CANCEL`: the client no longer wants the response (a
+///   browser navigating away is the common case). Surfacing it as a read error
+///   would fail the request AND -- because both proxy pumps convert it with
+///   `into_down()` -- close and re-dial an otherwise healthy pooled upstream
+///   connection, once per client cancel. The upstream request has already been
+///   sent by the time this runs, so nothing is saved by failing hard here; a
+///   later write to the cancelled stream still fails and is classified on its
+///   own merits.
+///
+/// Mirrors the client-side classification in
+/// [`crate::protocols::http::v2::client::Http2Session::read_trailers`].
+fn benign_post_eof_stream_end(e: &h2::Error) -> bool {
+    (e.is_go_away() || e.is_reset())
+        && e.is_remote()
+        && matches!(
+            e.reason(),
+            Some(h2::Reason::NO_ERROR) | Some(h2::Reason::CANCEL)
+        )
+}
+
+/// The non-zero `content-length` a message declares, if any.
+///
+/// `0` is deliberately mapped to `None`: on HTTP/2 `content-length: 0` promises
+/// zero DATA payload bytes but says nothing about END_STREAM, so a request that
+/// declares it may still legitimately close its stream later (design 4.3). Were
+/// it treated as "fully received" the moment the message is created, every such
+/// request would be classified as complete before the transport ever said so,
+/// which is exactly the distinction the rest of this module preserves.
+pub(crate) fn declared_body_length(headers: &http::HeaderMap) -> Option<usize> {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        // Digits only, staying at least as strict as h2's own `parse_u64`,
+        // which rejects `+5` and surrounding whitespace and kills such a stream
+        // with PROTOCOL_ERROR before it reaches here. `usize::parse` is laxer,
+        // so reject any non-digit byte first. An empty value has no digits and
+        // yields `None`, exactly as before.
+        .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|len| *len > 0)
+}
+
 /// HTTP/2 server session
 pub struct HttpSession {
     request_header: RequestHeader,
     request_body_reader: RecvStream,
+    request_headers_end_stream: bool,
     send_response: SendResponse<Bytes>,
     send_response_body: Option<SendStream<Bytes>>,
     // Remember what has been written
@@ -284,12 +351,82 @@ pub struct HttpSession {
     body_sent: usize,
     // buffered request body for retry logic
     retry_buffer: Option<FixedBuffer>,
+    // early body capture hook for upstream replay
+    early_body_buffer: Option<RegisteredRequestBodyBuffer>,
+    // Set right before awaiting an `early_body_buffer` capture/finish and cleared
+    // once the await returns Ok. A body-read future dropped mid-await
+    // (select!/timeout cancellation) leaves it set: the chunk was already
+    // consumed from the stream, so the buffered body is incomplete and any
+    // further body read or replay must fail closed.
+    early_body_capture_poisoned: bool,
+    // Set when `drain_request_body` discards a registered `early_body_buffer`.
+    // The body bytes are gone from both the stream and the buffer, so a later
+    // replay attempt must fail closed instead of silently forwarding a bodyless
+    // request upstream.
+    early_body_buffer_discarded: bool,
+    // Set when the session drops a captured or fully replayed `early_body_buffer`
+    // after the response was committed downstream (no further retry is possible then).
+    // A later replay attempt indicates a broken retry decision upstream of this
+    // session and must fail closed instead of silently forwarding a bodyless
+    // request.
+    early_body_buffer_released: bool,
+    /// Prevent request-body source changes after the proxy freezes its
+    /// request-scoped relay plan.
+    request_body_configuration_frozen: bool,
+    // Whether actual request trailer fields were received. Set once the
+    // request body reader reaches EOF and its trailers are polled.
+    request_trailers_present: bool,
+    // Latched once the TRANSPORT said the request body ended: END_STREAM on the
+    // HEADERS frame, or `RecvStream::is_end_stream()` observed at any body poll.
+    //
+    // It is latched rather than recomputed so the accepted-header fact and a
+    // clean body poll remain monotonic across later errors and dependency
+    // state-machine changes. Supported h2 0.4.19 preserves received END_STREAM
+    // across reset, but Pingora's request-body contract does not depend on that
+    // private representation.
+    request_body_eof: bool,
+    // Source (iii) of the same end-of-body proof: a declared `content-length`
+    // that has been fully received. Stored as the declared length (only when
+    // non-zero, see `request_body_length_satisfied`) and compared against
+    // `body_read`.
+    //
+    // This independently proves a fixed-length request once every declared
+    // byte was delivered, including natural DATA(END_STREAM)-then-reset
+    // orderings.
+    request_body_declared_len: Option<usize>,
+    // Whether `trailers()` has already been awaited for this request. The
+    // post-EOF branch of `read_body_bytes()` can be reached more than once
+    // (e.g. an idling pump keeps polling); re-awaiting would report `None`
+    // the second time and clear an already-established trailer fact.
+    trailers_polled: bool,
     // digest to record underlying connection info
     digest: Arc<Digest>,
     /// The write timeout which will be applied to writing response body.
     /// The timeout is reset on every write. This is not a timeout on the overall duration of the
     /// response.
     pub write_timeout: Option<Duration>,
+    // The read timeout applied to each downstream request-body read. The
+    // timeout is reset on every received chunk, so it bounds a stalled upload
+    // without limiting the overall duration of a progressing one (the same
+    // per-read semantics as the HTTP/1 `read_timeout`).
+    read_timeout: Option<Duration>,
+    // Absolute deadline of the CURRENT request-body read, i.e. "the client has
+    // been silent since this instant plus `read_timeout`".
+    //
+    // The bound is a DEADLINE and not a per-call duration on purpose. Every
+    // caller of `read_body_bytes` in this repo polls it from a `tokio::select!`
+    // branch (see `proxy_h1::bidirection_1to2` / `proxy_h2::bidirection_down_to_up`),
+    // where any OTHER branch becoming ready -- an upstream response chunk, a
+    // cache task, a custom message -- completes the select and DROPS this
+    // future. A duration recomputed per call would restart from zero on the
+    // next loop iteration, so a client that stalls forever against an upstream
+    // that speaks even once per timeout period would never be released: the
+    // exact DoS this bound exists to close. Carrying the deadline on the
+    // session makes cancellation unable to rearm it.
+    //
+    // Cleared ONLY by transport progress (a non-empty DATA payload, or
+    // END_STREAM), never by a cancelled read. See `read_body_bytes`.
+    read_deadline: Option<Instant>,
     // How long to wait when draining (discarding) request body
     total_drain_timeout: Option<Duration>,
 }
@@ -310,6 +447,32 @@ pub enum H2Accept {
     /// reset. Sibling streams and the connection are unaffected; the caller
     /// should continue accepting.
     Rejected,
+}
+
+// The replay tests below predate `H2Accept` and only create valid requests.
+// Keep their focus on body-state behavior while still exercising the current
+// accept API; an unexpected rejected stream fails loudly instead of being
+// treated as a session.
+#[cfg(test)]
+impl std::ops::Deref for H2Accept {
+    type Target = HttpSession;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Session(session) => session,
+            Self::Rejected => panic!("test request was unexpectedly rejected"),
+        }
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for H2Accept {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Session(session) => session,
+            Self::Rejected => panic!("test request was unexpectedly rejected"),
+        }
+    }
 }
 
 fn authority_host_mismatch(request: &RequestHeader) -> bool {
@@ -400,6 +563,8 @@ impl HttpSession {
         };
 
         let (request_header, request_body_reader) = req.into_parts();
+        let request_headers_end_stream = request_body_reader.is_end_stream();
+        let request_body_declared_len = declared_body_length(&request_header.headers);
         let request_header: RequestHeader = request_header.into();
 
         // Depending on how the request URI is parsed, control bytes
@@ -472,8 +637,20 @@ impl HttpSession {
             body_read: 0,
             body_sent: 0,
             retry_buffer: None,
+            early_body_buffer: None,
+            early_body_capture_poisoned: false,
+            early_body_buffer_discarded: false,
+            early_body_buffer_released: false,
+            request_body_configuration_frozen: false,
+            request_trailers_present: false,
+            request_headers_end_stream,
+            request_body_eof: request_headers_end_stream,
+            request_body_declared_len,
+            trailers_polled: false,
             digest,
             write_timeout: None,
+            read_timeout: Some(DEFAULT_READ_TIMEOUT),
+            read_deadline: None,
             total_drain_timeout: None,
         })))
     }
@@ -494,31 +671,231 @@ impl HttpSession {
         &mut self.request_header
     }
 
+    /// Whether the request body is provably complete, from ANY source the peer
+    /// cannot retract.
+    ///
+    /// This is the guard on treating a stream end as benign rather than as a
+    /// truncated read, and it is deliberately broader than
+    /// [`Self::is_body_done`]:
+    /// - (i) END_STREAM on the HEADERS frame and (ii) `is_end_stream()` observed
+    ///   at a body poll are both latched into `request_body_eof`;
+    /// - (iii) a declared, non-zero `content-length` whose bytes have all been
+    ///   read is computed here.
+    ///
+    /// Source (iii) is what covers the natural wire ordering -- peer writes
+    /// DATA(END_STREAM) then RST_STREAM, and we poll only afterwards -- in which
+    /// `h2` hands over the final chunk with the END_STREAM evidence already
+    /// overwritten by the reset, so (i) and (ii) can never fire.
+    ///
+    /// RESIDUAL GAP, deliberate and load-bearing: a request that declares NO
+    /// `content-length` (or declares `content-length: 0`) and whose peer resets
+    /// the stream before we poll the final DATA frame has no surviving proof
+    /// that its body is whole, so the reset still surfaces as a read error. That
+    /// is the correct failure direction -- the alternative would be to guess,
+    /// and a wrong guess forwards a TRUNCATED request body upstream as if it
+    /// were complete. Do NOT "fix" this by dropping the guard and classifying
+    /// every benign-looking reset as EOF; the negative-direction tests
+    /// (`test_mid_body_reset_is_still_a_read_error`) exist to keep that from
+    /// happening quietly.
+    fn request_body_complete(&self) -> bool {
+        self.request_body_eof
+            || self
+                .request_body_declared_len
+                .is_some_and(|len| self.body_read >= len)
+    }
+
+    /// The idle bound that applies to the next request-body chunk read, or
+    /// `None` when this session's body reads are deliberately unbounded.
+    ///
+    /// CONNECT is exempt. For a tunnel the "request body" IS the client-to-peer
+    /// uplink, and a long idle period on it is ordinary rather than abusive: an
+    /// idle SSH session, or a WebSocket over extended CONNECT (RFC 8441, which
+    /// also uses `:method = CONNECT`, so this one check covers both) whose
+    /// traffic happens to run server-to-client only. Applying the bound would
+    /// tear such tunnels down at exactly the moment they are behaving
+    /// correctly. The same check guards the request-body buffer registrations
+    /// below.
+    fn body_read_timeout(&self) -> Option<Duration> {
+        if self.request_header.method == http::Method::CONNECT {
+            return None;
+        }
+        self.read_timeout
+    }
+
     /// Read request body bytes. `None` when there is no more body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
-        // TODO: timeout
-        let data = self.request_body_reader.data().await.transpose().or_err(
-            ErrorType::ReadError,
-            "while reading downstream request body",
-        )?;
+        if self.early_body_capture_poisoned {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                "request body capture failed or was cancelled mid-chunk; buffered body is incomplete",
+            );
+        }
+        let polled = match self.body_read_timeout() {
+            Some(t) => {
+                // Resume the deadline of the read this one continues; only
+                // transport progress clears it (see `read_deadline`). A read
+                // whose deadline already passed still gets one poll: the data
+                // may already be buffered, and answering a ready chunk with a
+                // timeout would be wrong.
+                let now = Instant::now();
+                let deadline = *self.read_deadline.get_or_insert(now + t);
+                let remaining = deadline.saturating_duration_since(now);
+                match timeout(remaining, self.request_body_reader.data()).await {
+                    Ok(data) => data,
+                    Err(_) => {
+                        // A body the TRANSPORT has promised is empty
+                        // (`Content-Length: 0`) has no bytes left to lose, so
+                        // there is nothing for this timeout to protect: the
+                        // client owes us only an END_STREAM that H2 does not
+                        // require it to have sent yet (design 4.3). Failing the
+                        // exchange here would 4xx a request that is otherwise
+                        // complete -- and would do it for an entirely ordinary
+                        // client whose upstream simply had nothing more to say.
+                        // Finish the read side instead; it is the same
+                        // conclusion `proxy_common::downstream_body_read_is_futile`
+                        // reaches for this shape, just reached from the read
+                        // side and without waiting on the response.
+                        //
+                        // No trailer poll and no capture finish here, unlike
+                        // the EOF branch below: the data section has NOT ended,
+                        // so `trailers()` would park forever, and a registered
+                        // capture buffer cannot coexist with an empty body
+                        // (`set_request_body_buffer` rejects it, and
+                        // `is_body_empty()` is false while one is registered).
+                        if self.is_body_empty() {
+                            debug!(
+                                "downstream request body read timed out after {t:?} on a body \
+                                 declared empty; finishing the read side instead of failing the \
+                                 request"
+                            );
+                            self.request_body_eof = true;
+                            return Ok(None);
+                        }
+                        return Error::e_explain(
+                            ErrorType::ReadTimedout,
+                            format!("while reading downstream request body, timeout: {t:?}"),
+                        );
+                    }
+                }
+            }
+            None => self.request_body_reader.data().await,
+        };
+        let data = match polled.transpose() {
+            Ok(data) => data,
+            Err(e) => {
+                // Once the request body is complete, a client ending the
+                // stream is not a read failure -- see
+                // `benign_post_eof_stream_end`. h2 surfaces the RST_STREAM
+                // here rather than from `trailers()` when it arrives before
+                // the EOF is polled, so the classification belongs on both.
+                if self.request_body_complete() && benign_post_eof_stream_end(&e) {
+                    None
+                } else {
+                    return Err(e).or_err(
+                        ErrorType::ReadError,
+                        "while reading downstream request body",
+                    );
+                }
+            }
+        };
         if let Some(data) = data.as_ref() {
+            // Rearm the idle bound only on real progress. An EMPTY DATA frame
+            // without END_STREAM is legal, costs the peer 9 bytes, consumes
+            // NO flow-control window (h2 `proto::streams::recv::recv_data`
+            // credits the window back for a zero-length payload) and trips no
+            // flood counter, so treating it as progress would hand an attacker
+            // a free, unlimited rearm -- and `body_read` never advances, so no
+            // byte-count body-size limit catches it either. END_STREAM is
+            // progress even with a zero-length payload: it ends the body.
+            if !data.is_empty() || self.request_body_reader.is_end_stream() {
+                self.read_deadline = None;
+            }
             self.body_read += data.len();
             if let Some(buffer) = self.retry_buffer.as_mut() {
                 buffer.write_to_buffer(data);
             }
+            // Release flow control before the (cancellable) capture await: the
+            // bytes are already consumed from the stream either way, and doing
+            // it here keeps a cancelled capture from leaking this chunk's
+            // flow-control window.
             let _ = self
                 .request_body_reader
                 .flow_control()
                 .release_capacity(data.len());
+            if let Some(buffer) = self.early_body_buffer.as_mut() {
+                // Poison across the await: if this future is dropped mid-await
+                // the flag stays set and the session fails closed from then on.
+                self.early_body_capture_poisoned = true;
+                buffer.capture(data).await?;
+                self.early_body_capture_poisoned = false;
+            }
+            if self.request_body_reader.is_end_stream() {
+                self.request_body_eof = true;
+                if let Some(buffer) = self.early_body_buffer.as_mut() {
+                    self.early_body_capture_poisoned = true;
+                    buffer.finish_capture().await?;
+                    self.early_body_capture_poisoned = false;
+                }
+            }
+        } else {
+            self.read_deadline = None;
+            self.request_body_eof = true;
+            // Establish the trailer fact exactly once: it is never cleared
+            // again within this request.
+            if !self.trailers_polled {
+                // Latched BEFORE the await, which is safe only because the await
+                // cannot be cancelled mid-poll here: `data()` returns `None`
+                // (this `else` branch) exclusively after END_STREAM was
+                // observed, at which point the trailers -- or the stream error
+                // -- are already queued in h2, so `trailers()` is immediately
+                // Ready and completes within this poll. Were it ever pending,
+                // cancellation between this store and the await completing would
+                // lose the trailer fact forever. Re-verify this invariant if the
+                // h2 dependency is upgraded; if it no longer holds, latch after a
+                // successful await instead (as `send_body_to2` in proxy_h2.rs
+                // does for the same hazard).
+                self.trailers_polled = true;
+                let trailers = match self.request_body_reader.trailers().await {
+                    Ok(trailers) => trailers,
+                    Err(e) => {
+                        if benign_post_eof_stream_end(&e) {
+                            None
+                        } else {
+                            return Err(e).or_err(
+                                ErrorType::ReadError,
+                                "while reading downstream request trailers",
+                            );
+                        }
+                    }
+                };
+                self.request_trailers_present = trailers.is_some_and(|fields| !fields.is_empty());
+            }
+            if let Some(buffer) = self.early_body_buffer.as_mut() {
+                self.early_body_capture_poisoned = true;
+                buffer.finish_capture().await?;
+                self.early_body_capture_poisoned = false;
+            }
         }
         Ok(data)
     }
 
+    // A `RequestBodyBuffer::write` is async and cannot run in a poll context.
+    // Fail closed when capture/replay is registered instead of silently returning
+    // bytes that bypass the buffer.
+    //
+    // NOTE: this does NOT apply `read_timeout` -- it is a plain poll with no
+    // timer of its own, so a caller that drives the request body through here
+    // is responsible for its own idle bound (`read_body_bytes` is the bounded
+    // entry point). There is no in-tree consumer today; add the bound here
+    // before adding one.
     #[doc(hidden)]
     pub fn poll_read_body_bytes(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Bytes, h2::Error>>> {
+        if self.early_body_buffer.is_some() {
+            return Poll::Ready(Some(Err(h2::Reason::INTERNAL_ERROR.into())));
+        }
         let data = match ready!(self.request_body_reader.poll_data(cx)).transpose() {
             Ok(data) => data,
             Err(err) => return Poll::Ready(Some(Err(err))),
@@ -529,9 +906,16 @@ impl HttpSession {
             self.request_body_reader
                 .flow_control()
                 .release_capacity(data.len())?;
+            // Latch source (ii) here as well: this poll consumes the same
+            // evidence `read_body_bytes` does, and a later reset would
+            // otherwise destroy it (see `request_body_eof`).
+            if self.request_body_reader.is_end_stream() {
+                self.request_body_eof = true;
+            }
             return Poll::Ready(Some(Ok(data)));
         }
 
+        self.request_body_eof = true;
         Poll::Ready(None)
     }
 
@@ -548,8 +932,20 @@ impl HttpSession {
     /// Drain the request body. `Ok(())` when there is no (more) body to read.
     // NOTE for h2 it may be worth allowing cancellation of the stream via reset.
     pub async fn drain_request_body(&mut self) -> Result<()> {
-        if self.is_body_done() {
+        // `is_body_empty()` is checked here (and deliberately NOT in
+        // `is_body_done()`, which must stay the pure transport fact): a
+        // request declaring `Content-Length: 0` promises zero DATA bytes, so
+        // there is nothing to drain even if END_STREAM has not arrived yet.
+        // Without this bound, and with `total_drain_timeout` defaulting to
+        // `None`, draining such a request would await forever.
+        if self.is_body_done() || self.is_body_empty() {
             return Ok(());
+        }
+        // Draining discards the remaining body — incompatible with capture-for-replay,
+        // so drop any early body buffer first and remember the discard so a later
+        // replay attempt fails closed (see the v1 counterpart for rationale).
+        if self.early_body_buffer.take().is_some() {
+            self.early_body_buffer_discarded = true;
         }
         match self.total_drain_timeout {
             Some(t) => match timeout(t, self.do_drain_request_body()).await {
@@ -561,6 +957,29 @@ impl HttpSession {
             },
             None => self.do_drain_request_body().await,
         }
+    }
+
+    /// Sets the downstream read timeout. This will trigger if the next
+    /// request-body chunk cannot be read within `timeout`.
+    ///
+    /// The bound is an INTER-CHUNK idle bound, not a bound on the overall
+    /// upload: it is rearmed by every DATA payload that carries at least one
+    /// byte (and by END_STREAM), so a slow but progressing upload is never
+    /// limited in total duration, while a client that stops sending is
+    /// released after one `timeout` of silence. An empty DATA frame is not
+    /// progress and does not rearm it.
+    ///
+    /// Defaults to 60s, matching the HTTP/1 server session. CONNECT requests
+    /// (including extended CONNECT) are exempt regardless of what is set here;
+    /// their "body" is a tunnel uplink on which idling is normal. Pass `None`
+    /// to make the reads unbounded.
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.read_timeout = timeout;
+    }
+
+    /// Get the read timeout.
+    pub fn get_read_timeout(&self) -> Option<Duration> {
+        self.read_timeout
     }
 
     /// Sets the downstream write timeout. This will trigger if we're unable
@@ -635,7 +1054,32 @@ impl HttpSession {
         self.response_written = Some(header);
         self.send_response_body = Some(body_writer);
         self.ended = self.ended || end;
+        // Committing the response ends any possibility of an upstream retry; a
+        // captured or fully replayed body buffer is dead weight for the rest of the response
+        // (which may be long-lived, e.g. SSE / gRPC streaming).
+        self.maybe_release_early_body_buffer();
         Ok(())
+    }
+
+    /// Drop the registered early body buffer once it can no longer be needed:
+    /// capture completed without replay, or replay reached EOF, AND the response
+    /// header was committed downstream. Before the response commits, a retry may
+    /// still rewind and replay the buffer; while replay is in progress, the
+    /// current attempt is still reading it. Called from each place where a release
+    /// condition can become true. The `early_body_buffer_released` flag makes any
+    /// later replay attempt fail closed (see `begin_request_body_replay`). Unlike
+    /// HTTP/1, `response_written` here is only ever a non-informational header
+    /// (1xx are not sent on the h2 path), so its presence alone means committed.
+    fn maybe_release_early_body_buffer(&mut self) {
+        if self.response_written.is_some()
+            && self
+                .early_body_buffer
+                .as_ref()
+                .is_some_and(RegisteredRequestBodyBuffer::is_ready_or_replay_done)
+        {
+            self.early_body_buffer = None;
+            self.early_body_buffer_released = true;
+        }
     }
 
     /// Write response body to the client. See [Self::write_response_header] for how to use `end`.
@@ -840,21 +1284,75 @@ impl HttpSession {
     }
 
     /// Whether there is no more body to read
+    ///
+    /// Reports the LATCHED transport fact (`request_body_eof`, sources (i) and
+    /// (ii)) rather than the live `is_end_stream()`, so that a peer resetting a
+    /// stream it already ended cannot flip this back to `false`. The live value
+    /// is still consulted so that an END_STREAM which arrived without us polling
+    /// is picked up immediately.
+    ///
+    /// Deliberately does NOT consult source (iii) (`content-length` satisfied,
+    /// see [`Self::request_body_complete`]): the callers of this function stop
+    /// reading the request body once it returns `true`, and an H2 request may
+    /// legally send TRAILERS after a complete, `content-length`-declared body.
+    /// Ending the read there would silently drop those trailers and skip the
+    /// trailer hook. Source (iii) exists to classify a stream END, which is a
+    /// strictly later event, so nothing is lost by the narrower rule here.
     pub fn is_body_done(&self) -> bool {
-        // Check no body in request
-        // Also check we hit end of stream
-        self.is_body_empty() || self.request_body_reader.is_end_stream()
+        if self
+            .early_body_buffer
+            .as_ref()
+            .is_some_and(RegisteredRequestBodyBuffer::is_replaying)
+        {
+            return false;
+        }
+        self.request_body_eof || self.request_body_reader.is_end_stream()
     }
 
     /// Whether there is any body to read. true means there no body in request.
+    ///
+    /// While an early request body buffer is registered, the effective body is whatever
+    /// the buffer replays, which may be a non-empty rewrite of a zero-byte original
+    /// (e.g. HEADERS without END_STREAM followed by an empty END_STREAM DATA frame).
+    /// Report non-empty then, so upstream framing decisions (H2 END_STREAM on HEADERS)
+    /// keep the stream open until replay reaches EOF.
+    ///
+    /// Like [`Self::is_body_done`] this reads the LATCHED end-of-stream fact,
+    /// never the live `is_end_stream()`: a bodyless request (END_STREAM on
+    /// HEADERS, e.g. a plain `GET`) whose client then resets the stream must not
+    /// stop reporting itself as bodyless. A retractable answer here defeats the
+    /// anti-smuggling coercion in `pingora-proxy`'s `safe_disposition`, which
+    /// keys on "this request has no body at all".
     pub fn is_body_empty(&self) -> bool {
+        if self.early_body_buffer.is_some() {
+            return false;
+        }
         self.body_read == 0
-            && (self.request_body_reader.is_end_stream()
+            && (self.request_body_eof
+                || self.request_body_reader.is_end_stream()
                 || self
                     .request_header
                     .headers
                     .get(header::CONTENT_LENGTH)
                     .is_some_and(|cl| cl.as_bytes() == b"0"))
+    }
+
+    /// Whether the initial HEADERS frame carried END_STREAM.
+    pub fn request_headers_end_stream(&self) -> bool {
+        self.request_headers_end_stream
+    }
+
+    /// Whether actual request trailer fields were received.
+    ///
+    /// This is meaningful after `read_body_bytes()` returns EOF.
+    pub fn request_trailers_present(&self) -> bool {
+        self.request_trailers_present
+    }
+
+    /// Whether the response body writer has already been ended (END_STREAM
+    /// sent). `false` while a response is still being streamed.
+    pub fn response_body_finished(&self) -> bool {
+        self.ended
     }
 
     pub fn retry_buffer_truncated(&self) -> bool {
@@ -890,6 +1388,18 @@ impl HttpSession {
     /// Similar to `read_body_bytes()` but will be pending after Ok(None) is returned,
     /// until the client closes the connection
     pub async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
+        if let Some(registered) = self.early_body_buffer.as_mut() {
+            if registered.is_replaying() {
+                let chunk = registered.next_chunk().await?;
+                if chunk.is_none() {
+                    // Replay EOF. If the response was already committed downstream
+                    // (upstream responded before replay finished), the buffer can
+                    // never be needed again — drop it now.
+                    self.maybe_release_early_body_buffer();
+                }
+                return Ok(chunk);
+            }
+        }
         if no_body_expected || self.is_body_done() {
             let reason = self.idle().await?;
             Error::e_explain(
@@ -933,847 +1443,5 @@ impl HttpSession {
 }
 
 #[cfg(test)]
-mod test {
-    use super::*;
-    use bytes::Bytes;
-    use futures::SinkExt;
-    use h2::frame::{Frame, Headers, Pseudo, Reset, Settings};
-    use http::{HeaderValue, Method, Request, Uri};
-    use tokio::io::{duplex, AsyncWriteExt, DuplexStream};
-    use tokio::sync::oneshot;
-    use tokio_stream::StreamExt;
-
-    async fn advertised_settings(options: Option<H2Options>) -> Settings {
-        let (mut client, server) = duplex(65536);
-        let handshake = tokio::spawn(async move { handshake(Box::new(server), options).await });
-
-        client
-            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
-            .await
-            .unwrap();
-        let mut codec: h2::Codec<DuplexStream, Bytes> = h2::Codec::new(client);
-        let settings = match codec.next().await.unwrap().unwrap() {
-            Frame::Settings(settings) => settings,
-            frame => panic!("expected SETTINGS frame, received {frame:?}"),
-        };
-
-        let _ = handshake.await.unwrap().unwrap();
-        settings
-    }
-
-    #[test]
-    fn test_authority_host_mismatch() {
-        let request = |hosts: &[&str]| {
-            let mut request = Request::builder()
-                .uri("https://authority.example/test")
-                .body(())
-                .unwrap();
-            for host in hosts {
-                request
-                    .headers_mut()
-                    .append(header::HOST, HeaderValue::from_str(host).unwrap());
-            }
-            RequestHeader::from(request.into_parts().0)
-        };
-
-        assert!(!authority_host_mismatch(&request(&[])));
-        assert!(!authority_host_mismatch(&request(&["authority.example"])));
-        assert!(authority_host_mismatch(&request(&["other.example"])));
-        assert!(authority_host_mismatch(&request(&["AUTHORITY.EXAMPLE"])));
-        assert!(authority_host_mismatch(&request(&[
-            "authority.example:443"
-        ])));
-        assert!(authority_host_mismatch(&request(&[
-            "authority.example",
-            "authority.example",
-        ])));
-        assert!(authority_host_mismatch(&request(&[
-            "authority.example",
-            "other.example",
-        ])));
-
-        let request = RequestHeader::from(
-            Request::builder()
-                .uri("/test")
-                .header(header::HOST, "host.example")
-                .body(())
-                .unwrap()
-                .into_parts()
-                .0,
-        );
-        assert!(!authority_host_mismatch(&request));
-    }
-
-    #[tokio::test]
-    async fn test_server_rejects_authority_host_mismatch_with_400() {
-        let (client, server) = duplex(65536);
-
-        let client = tokio::spawn(async move {
-            let (h2, connection) = h2::client::handshake(client).await.unwrap();
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-
-            let mut h2 = h2.ready().await.unwrap();
-            let mismatched = Request::builder()
-                .method(Method::GET)
-                .uri("https://authority.example/test")
-                .header(header::HOST, "other.example")
-                .body(())
-                .unwrap();
-            let (response, request_body) = h2.send_request(mismatched, false).unwrap();
-
-            let response = response.await.unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            drop(response);
-            drop(request_body);
-
-            let mut h2 = h2.ready().await.unwrap();
-            let duplicate = Request::builder()
-                .method(Method::GET)
-                .uri("https://authority.example/test")
-                .header(header::HOST, "authority.example")
-                .header(header::HOST, "authority.example")
-                .body(())
-                .unwrap();
-            let (response, _) = h2.send_request(duplicate, true).unwrap();
-
-            let response = response.await.unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            let mut body = response.into_body();
-            assert!(body.data().await.is_none());
-
-            let mut h2 = h2.ready().await.unwrap();
-            let matching = Request::builder()
-                .method(Method::GET)
-                .uri("https://authority.example/test")
-                .header(header::HOST, "authority.example")
-                .body(())
-                .unwrap();
-            let (response, _) = h2.send_request(matching, true).unwrap();
-
-            assert_eq!(response.await.unwrap().status(), StatusCode::NO_CONTENT);
-        });
-
-        let mut connection = handshake(Box::new(server), None).await.unwrap();
-        let digest = Arc::new(Digest::default());
-        let accepted = HttpSession::from_h2_conn(&mut connection, digest.clone())
-            .await
-            .unwrap();
-        assert!(
-            matches!(accepted, Some(H2Accept::Rejected)),
-            "mismatched authority reached the application"
-        );
-
-        let accepted = HttpSession::from_h2_conn(&mut connection, digest.clone())
-            .await
-            .unwrap();
-        assert!(
-            matches!(accepted, Some(H2Accept::Rejected)),
-            "duplicate Host fields reached the application"
-        );
-
-        let Some(H2Accept::Session(mut session)) =
-            HttpSession::from_h2_conn(&mut connection, digest.clone())
-                .await
-                .unwrap()
-        else {
-            panic!("matching authority did not reach the application");
-        };
-        assert_eq!(
-            session.req_header().headers[header::HOST],
-            "authority.example"
-        );
-        session
-            .write_response_header(
-                Box::new(ResponseHeader::build(StatusCode::NO_CONTENT, Some(0)).unwrap()),
-                true,
-            )
-            .unwrap();
-        drop(session);
-
-        let done = timeout(
-            Duration::from_secs(1),
-            HttpSession::from_h2_conn(&mut connection, digest),
-        )
-        .await
-        .expect("connection did not finish after authority mismatch test")
-        .expect("connection failed after authority mismatch test");
-        assert!(done.is_none());
-
-        client.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_failed_authority_rejection_write_is_stream_local() {
-        let (mut client, server) = duplex(65536);
-        let (frames_sent, wait_for_frames) = oneshot::channel();
-
-        let client = tokio::spawn(async move {
-            client
-                .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
-                .await
-                .unwrap();
-            let mut codec: h2::Codec<DuplexStream, Bytes> = h2::Codec::new(client);
-            codec.send(Settings::default().into()).await.unwrap();
-            codec.send(Settings::ack().into()).await.unwrap();
-
-            let mut fields = HeaderMap::new();
-            fields.insert(header::HOST, HeaderValue::from_static("other.example"));
-            let mut mismatched = Headers::new(
-                1.into(),
-                Pseudo::request(
-                    Method::GET,
-                    Uri::from_static("https://authority.example/test"),
-                    None,
-                ),
-                fields,
-            );
-            mismatched.set_end_headers();
-            codec.send(mismatched.into()).await.unwrap();
-            codec
-                .send(Reset::new(1.into(), h2::Reason::CANCEL).into())
-                .await
-                .unwrap();
-
-            let mut fields = HeaderMap::new();
-            fields.insert(header::HOST, HeaderValue::from_static("authority.example"));
-            let mut matching = Headers::new(
-                3.into(),
-                Pseudo::request(
-                    Method::GET,
-                    Uri::from_static("https://authority.example/test"),
-                    None,
-                ),
-                fields,
-            );
-            matching.set_end_headers();
-            matching.set_end_stream();
-            codec.send(matching.into()).await.unwrap();
-            frames_sent.send(()).unwrap();
-
-            timeout(Duration::from_secs(1), async {
-                while let Some(frame) = codec.next().await {
-                    if let Frame::Headers(headers) = frame.unwrap() {
-                        if headers.stream_id() == 3u32 {
-                            return;
-                        }
-                    }
-                }
-                panic!("connection closed before the sibling response");
-            })
-            .await
-            .expect("timed out waiting for the sibling response");
-        });
-
-        let mut connection = handshake(Box::new(server), None).await.unwrap();
-        wait_for_frames.await.unwrap();
-        let digest = Arc::new(Digest::default());
-
-        let accepted = HttpSession::from_h2_conn(&mut connection, digest.clone())
-            .await
-            .unwrap();
-        assert!(
-            matches!(accepted, Some(H2Accept::Rejected)),
-            "reset authority mismatch reached the application"
-        );
-
-        let Some(H2Accept::Session(mut session)) =
-            HttpSession::from_h2_conn(&mut connection, digest.clone())
-                .await
-                .unwrap()
-        else {
-            panic!("sibling stream was dropped after the failed 400 write");
-        };
-        session
-            .write_response_header(
-                Box::new(ResponseHeader::build(StatusCode::NO_CONTENT, Some(0)).unwrap()),
-                true,
-            )
-            .unwrap();
-        drop(session);
-
-        let done = timeout(
-            Duration::from_secs(1),
-            HttpSession::from_h2_conn(&mut connection, digest),
-        )
-        .await
-        .expect("connection did not finish after the sibling response")
-        .expect("connection failed after the sibling response");
-        assert!(done.is_none());
-        client.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_authority_mismatch_exhausts_malformed_stream_budget() {
-        let (client, server) = duplex(65536);
-
-        let client = tokio::spawn(async move {
-            let (h2, connection) = h2::client::handshake(client).await.unwrap();
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-
-            let mut h2 = h2.ready().await.unwrap();
-            let mismatched = Request::builder()
-                .method(Method::GET)
-                .uri("https://authority.example/test")
-                .header(header::HOST, "other.example")
-                .body(())
-                .unwrap();
-            let (response, _) = h2.send_request(mismatched, true).unwrap();
-
-            // The connection can close before the queued 400 is flushed when
-            // this request exhausts the connection-level malformed budget.
-            let _ = response.await;
-        });
-
-        let mut connection = handshake(Box::new(server), None).await.unwrap();
-        let digest = Arc::new(Digest::default());
-        let mut malformed_streams = MAX_MALFORMED_STREAMS_PER_CONN - 1;
-
-        let err = match HttpSession::from_h2_conn_with_malformed_budget(
-            &mut connection,
-            digest,
-            &mut malformed_streams,
-        )
-        .await
-        {
-            Ok(Some(_)) => panic!("authority mismatch must not surface as a session"),
-            Ok(None) => panic!("connection ended before malformed budget was exhausted"),
-            Err(err) => err,
-        };
-
-        assert_eq!(err.etype(), &ErrorType::H2Error);
-        assert_eq!(malformed_streams, MAX_MALFORMED_STREAMS_PER_CONN);
-
-        drop(connection);
-        client.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_server_handshake_uses_bounded_default_options() {
-        let settings = advertised_settings(None).await;
-
-        assert_eq!(
-            settings.max_header_list_size(),
-            Some(DEFAULT_MAX_HEADER_LIST_SIZE)
-        );
-        assert_eq!(
-            settings.max_concurrent_streams(),
-            Some(DEFAULT_MAX_CONCURRENT_STREAMS)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_server_handshake_uses_caller_options() {
-        let mut options = H2Options::default();
-        options.max_header_list_size(1234);
-        options.max_concurrent_streams(42);
-
-        let settings = advertised_settings(Some(options)).await;
-
-        assert_eq!(settings.max_header_list_size(), Some(1234));
-        assert_eq!(settings.max_concurrent_streams(), Some(42));
-    }
-
-    #[tokio::test]
-    async fn test_zero_idle_timeout_waits_for_active_session() {
-        let active = Arc::new(ActiveSessions::new());
-        let guard = active.start_session();
-        let timeout_active = active.clone();
-        let timeout = tokio::spawn(async move {
-            wait_for_idle_timeout(&timeout_active, Duration::ZERO).await;
-        });
-
-        tokio::task::yield_now().await;
-        assert!(
-            !timeout.is_finished(),
-            "zero timeout must not spin or expire while a session is active"
-        );
-
-        drop(guard);
-        pingora_timeout::timeout(Duration::from_secs(1), timeout)
-            .await
-            .expect("zero timeout did not expire after the session finished")
-            .expect("timeout task panicked");
-    }
-
-    #[tokio::test]
-    async fn test_server_handshake_rejects_oversized_header_list_by_default() {
-        let (client, server) = duplex(256 * 1024);
-
-        let client = tokio::spawn(async move {
-            let (h2, connection) = h2::client::handshake(client).await.unwrap();
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-
-            let mut request = Request::builder()
-                .method(Method::GET)
-                .uri("https://www.example.com/")
-                .body(())
-                .unwrap();
-            for _ in 0..2000 {
-                request
-                    .headers_mut()
-                    .append("a", HeaderValue::from_static(""));
-            }
-
-            let (response, _) = h2
-                .ready()
-                .await
-                .unwrap()
-                .send_request(request, true)
-                .unwrap();
-            assert_eq!(
-                response.await.unwrap().status(),
-                http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
-            );
-        });
-
-        let server = tokio::spawn(async move {
-            let mut connection = handshake(Box::new(server), None).await.unwrap();
-            let digest = Arc::new(Digest::default());
-            let accepted = timeout(
-                Duration::from_secs(1),
-                HttpSession::from_h2_conn(&mut connection, digest),
-            )
-            .await;
-            assert!(
-                !matches!(accepted, Ok(Ok(Some(_)))),
-                "oversized request reached the application"
-            );
-        });
-
-        client.await.unwrap();
-        server.await.unwrap();
-    }
-
-    #[cfg(feature = "patched_http1")]
-    #[tokio::test]
-    async fn test_server_rejects_forbidden_byte_in_request_target() {
-        // Control bytes (CR/LF) may be accepted in the request path depending
-        // on URI parsing. Ensure such a request target is rejected on ingest as
-        // defense-in-depth, since these bytes are not permitted in a URI.
-        let (client, server) = duplex(65536);
-
-        let client = tokio::spawn(async move {
-            let (h2, connection) = h2::client::handshake(client).await.unwrap();
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-
-            let mut h2 = h2.ready().await.unwrap();
-
-            let request = Request::builder()
-                .method(Method::GET)
-                .uri("https://www.example.com/a\r\nX-Injected: 1")
-                .body(())
-                .unwrap();
-            // Ensure CR/LF survived URI parsing, otherwise the test is a no-op.
-            assert!(request.uri().path().contains('\n'));
-
-            let (response, _) = h2.send_request(request, true).unwrap();
-            // The stream must be rejected (reset), not answered.
-            assert!(response.await.is_err());
-        });
-
-        let server = tokio::spawn(async move {
-            let mut connection = handshake(Box::new(server), None).await.unwrap();
-            let digest = Arc::new(Digest::default());
-            let accepted = timeout(
-                Duration::from_secs(1),
-                HttpSession::from_h2_conn(&mut connection, digest),
-            )
-            .await
-            .expect("from_h2_conn hung: the offending stream was not rejected")
-            .expect("from_h2_conn returned an error");
-            // The offending stream is reset during acceptance, so `from_h2_conn`
-            // yields `Rejected` rather than a session built from the forbidden
-            // request target. Sibling streams and the connection are unaffected.
-            assert!(
-                matches!(accepted, Some(H2Accept::Rejected)),
-                "request with forbidden byte in target was not rejected"
-            );
-        });
-
-        client.await.unwrap();
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_server_handshake_accept_request() {
-        let (client, server) = duplex(65536);
-        let client_body = "test client body";
-        let server_body = "test server body";
-
-        let mut expected_trailers = HeaderMap::new();
-        expected_trailers.insert("test", HeaderValue::from_static("trailers"));
-        let trailers = expected_trailers.clone();
-
-        let mut handles = vec![];
-        handles.push(tokio::spawn(async move {
-            let (h2, connection) = h2::client::handshake(client).await.unwrap();
-            tokio::spawn(async move {
-                connection.await.unwrap();
-            });
-
-            let mut h2 = h2.ready().await.unwrap();
-
-            let request = Request::builder()
-                .method(Method::GET)
-                .uri("https://www.example.com/")
-                .body(())
-                .unwrap();
-
-            let (response, mut req_body) = h2.send_request(request, false).unwrap();
-            req_body.reserve_capacity(client_body.len());
-            req_body.send_data(client_body.into(), true).unwrap();
-
-            let (head, mut body) = response.await.unwrap().into_parts();
-            assert_eq!(head.status, 200);
-            let data = body.data().await.unwrap().unwrap();
-            assert_eq!(data, server_body);
-            let resp_trailers = body.trailers().await.unwrap().unwrap();
-            assert_eq!(resp_trailers, expected_trailers);
-        }));
-
-        let mut connection = handshake(Box::new(server), None).await.unwrap();
-        let digest = Arc::new(Digest::default());
-
-        while let Some(accepted) = HttpSession::from_h2_conn(&mut connection, digest.clone())
-            .await
-            .unwrap()
-        {
-            let H2Accept::Session(mut http) = accepted else {
-                continue;
-            };
-            let trailers = trailers.clone();
-            handles.push(tokio::spawn(async move {
-                let req = http.req_header();
-                assert_eq!(req.method, Method::GET);
-                assert_eq!(req.uri, "https://www.example.com/");
-
-                http.enable_retry_buffering();
-
-                assert!(!http.is_body_empty());
-                assert!(!http.is_body_done());
-
-                let body = http.read_body_or_idle(false).await.unwrap().unwrap();
-                assert_eq!(body, client_body);
-                assert!(http.is_body_done());
-                assert_eq!(http.body_bytes_read(), 16);
-
-                let retry_body = http.get_retry_buffer().unwrap();
-                assert_eq!(retry_body, client_body);
-
-                // test idling before response header is sent
-                tokio::select! {
-                    _ = http.idle() => {panic!("downstream should be idling")},
-                    _= tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {}
-                }
-
-                let response_header = Box::new(ResponseHeader::build(200, None).unwrap());
-                assert!(http
-                    .write_response_header(response_header.clone(), false)
-                    .is_ok());
-                // this write should be ignored otherwise we will error
-                assert!(http.write_response_header(response_header, false).is_ok());
-
-                // test idling after response header is sent
-                tokio::select! {
-                    _ = http.read_body_or_idle(false) => {panic!("downstream should be idling")},
-                    _= tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {}
-                }
-
-                // end: false here to verify finish() closes the stream nicely
-                http.write_body(server_body.into(), false).await.unwrap();
-                assert_eq!(http.body_bytes_sent(), 16);
-
-                http.write_trailers(trailers).unwrap();
-                http.finish().unwrap();
-            }));
-        }
-        for handle in handles {
-            // ensure no panics
-            assert!(handle.await.is_ok());
-        }
-    }
-
-    #[tokio::test]
-    async fn test_req_conflicting_content_length_rejected() {
-        let (client, server) = duplex(65536);
-
-        let client_task = tokio::spawn(async move {
-            let (h2, connection) = h2::client::handshake(client).await.unwrap();
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            let mut h2 = h2.ready().await.unwrap();
-
-            // Conflicting duplicate Content-Length values: unrecoverable framing.
-            let request = Request::builder()
-                .method(Method::GET)
-                .uri("https://www.example.com/")
-                .header("content-length", "5")
-                .header("content-length", "6")
-                .body(())
-                .unwrap();
-
-            let (response, mut req_body) = h2.send_request(request, false).unwrap();
-            // Send a body matching the first Content-Length value so the h2
-            // codec accepts the stream and Pingora's duplicate-CL validation is
-            // what rejects the request.
-            req_body.reserve_capacity(5);
-            req_body.send_data("abcde".into(), true).unwrap();
-
-            // The server must reject the stream with PROTOCOL_ERROR rather than
-            // surface the request to the application.
-            let err = response.await.unwrap_err();
-            assert_eq!(err.reason(), Some(h2::Reason::PROTOCOL_ERROR));
-            // Dropping `h2` lets the connection close so the server loop exits.
-        });
-
-        let mut connection = handshake(Box::new(server), None).await.unwrap();
-        let digest = Arc::new(Digest::default());
-
-        // The malformed stream is reset during acceptance, so it is reported as
-        // rejected rather than surfaced to the application as a session.
-        let accepted = HttpSession::from_h2_conn(&mut connection, digest.clone())
-            .await
-            .unwrap();
-        assert!(
-            matches!(accepted, Some(H2Accept::Rejected)),
-            "malformed request must not surface as a session"
-        );
-
-        let done = timeout(
-            Duration::from_secs(1),
-            HttpSession::from_h2_conn(&mut connection, digest),
-        )
-        .await
-        .expect("from_h2_conn hung after rejecting malformed request")
-        .expect("from_h2_conn returned an error after rejecting malformed request");
-        assert!(done.is_none(), "connection should close after rejection");
-
-        client_task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_req_malformed_stream_budget_exhausted() {
-        let (client, server) = duplex(65536);
-
-        let client_task = tokio::spawn(async move {
-            let (h2, connection) = h2::client::handshake(client).await.unwrap();
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            let mut h2 = h2.ready().await.unwrap();
-
-            let request = Request::builder()
-                .method(Method::GET)
-                .uri("https://www.example.com/")
-                .header("content-length", "5")
-                .header("content-length", "6")
-                .body(())
-                .unwrap();
-
-            let (response, mut req_body) = h2.send_request(request, false).unwrap();
-            req_body.reserve_capacity(5);
-            req_body.send_data("abcde".into(), true).unwrap();
-            let err = response.await.unwrap_err();
-            if let Some(reason) = err.reason() {
-                assert_eq!(reason, h2::Reason::PROTOCOL_ERROR);
-            }
-        });
-
-        let mut connection = handshake(Box::new(server), None).await.unwrap();
-        let digest = Arc::new(Digest::default());
-        let mut malformed_streams = MAX_MALFORMED_STREAMS_PER_CONN - 1;
-
-        let err = match HttpSession::from_h2_conn_with_malformed_budget(
-            &mut connection,
-            digest,
-            &mut malformed_streams,
-        )
-        .await
-        {
-            Ok(Some(_)) => panic!("malformed request must not surface as a session"),
-            Ok(None) => panic!("connection ended before malformed budget was exhausted"),
-            Err(err) => err,
-        };
-
-        assert_eq!(err.etype(), &ErrorType::H2Error);
-        assert_eq!(malformed_streams, MAX_MALFORMED_STREAMS_PER_CONN);
-
-        drop(connection);
-        client_task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_req_content_length_eq_0_and_no_header_eos() {
-        let (client, server) = duplex(65536);
-
-        let server_body = "test server body";
-
-        let mut handles = vec![];
-
-        handles.push(tokio::spawn(async move {
-            let (h2, connection) = h2::client::handshake(client).await.unwrap();
-            tokio::spawn(async move {
-                connection.await.unwrap();
-            });
-
-            let mut h2 = h2.ready().await.unwrap();
-
-            let request = Request::builder()
-                .method(Method::POST)
-                .uri("https://www.example.com/")
-                .header("content-length", "0") // explicitly set
-                .body(())
-                .unwrap();
-
-            let (response, mut req_body) = h2.send_request(request, false).unwrap(); // no EOS
-
-            let (head, mut body) = response.await.unwrap().into_parts();
-
-            assert_eq!(head.status, 200);
-            let data = body.data().await.unwrap().unwrap();
-            assert_eq!(data, server_body);
-
-            req_body.send_data("".into(), true).unwrap(); // set EOS after read the resp body
-        }));
-
-        let mut connection = handshake(Box::new(server), None).await.unwrap();
-        let digest = Arc::new(Digest::default());
-
-        while let Some(accepted) = HttpSession::from_h2_conn(&mut connection, digest.clone())
-            .await
-            .unwrap()
-        {
-            let H2Accept::Session(mut http) = accepted else {
-                continue;
-            };
-            handles.push(tokio::spawn(async move {
-                let req = http.req_header();
-                assert_eq!(req.method, Method::POST);
-                assert_eq!(req.uri, "https://www.example.com/");
-
-                // 1. Check body related methods
-                http.enable_retry_buffering();
-                assert!(http.is_body_empty());
-                assert!(http.is_body_done());
-                let retry_body = http.get_retry_buffer();
-                assert!(retry_body.is_none());
-
-                // 2. Send response
-                let response_header = Box::new(ResponseHeader::build(200, None).unwrap());
-                assert!(http
-                    .write_response_header(response_header.clone(), false)
-                    .is_ok());
-
-                http.write_body(server_body.into(), false).await.unwrap();
-                assert_eq!(http.body_bytes_sent(), 16);
-
-                // 3. Waiting for the reset from the client
-                assert!(http.read_body_or_idle(http.is_body_done()).await.is_err());
-            }));
-        }
-
-        for handle in handles {
-            // ensure no panics
-            assert!(handle.await.is_ok());
-        }
-    }
-
-    #[tokio::test]
-    async fn test_req_header_no_eos_empty_data_with_eos() {
-        let (client, server) = duplex(65536);
-
-        let server_body = "test server body";
-
-        let mut handles = vec![];
-
-        handles.push(tokio::spawn(async move {
-            let (h2, connection) = h2::client::handshake(client).await.unwrap();
-            tokio::spawn(async move {
-                connection.await.unwrap();
-            });
-
-            let mut h2 = h2.ready().await.unwrap();
-
-            let request = Request::builder()
-                .method(Method::POST)
-                .uri("https://www.example.com/")
-                .body(())
-                .unwrap();
-
-            let (response, mut req_body) = h2.send_request(request, false).unwrap(); // no EOS
-
-            let (head, mut body) = response.await.unwrap().into_parts();
-
-            assert_eq!(head.status, 200);
-            let data = body.data().await.unwrap().unwrap();
-            assert_eq!(data, server_body);
-
-            req_body.send_data("".into(), true).unwrap(); // set EOS after read the resp body
-
-            // Drain the response to EOS before dropping the stream. Newer h2
-            // sends RST_STREAM(CANCEL) when a still-open recv stream is dropped,
-            // which would race with the server reading the request EOS and turn
-            // the server-side read into a stream-reset error.
-            while let Some(chunk) = body.data().await {
-                let chunk = chunk.expect("response body error");
-                body.flow_control()
-                    .release_capacity(chunk.len())
-                    .expect("release capacity");
-            }
-        }));
-
-        let mut connection = handshake(Box::new(server), None).await.unwrap();
-        let digest = Arc::new(Digest::default());
-
-        while let Some(accepted) = HttpSession::from_h2_conn(&mut connection, digest.clone())
-            .await
-            .unwrap()
-        {
-            let H2Accept::Session(mut http) = accepted else {
-                continue;
-            };
-            handles.push(tokio::spawn(async move {
-                let req = http.req_header();
-                assert_eq!(req.method, Method::POST);
-                assert_eq!(req.uri, "https://www.example.com/");
-
-                // 1. Check body related methods
-                http.enable_retry_buffering();
-                assert!(!http.is_body_empty());
-                assert!(!http.is_body_done());
-                let retry_body = http.get_retry_buffer();
-                assert!(retry_body.is_none());
-
-                // 2. Send response
-                let response_header = Box::new(ResponseHeader::build(200, None).unwrap());
-                assert!(http
-                    .write_response_header(response_header.clone(), false)
-                    .is_ok());
-
-                http.write_body(server_body.into(), false).await.unwrap();
-                assert_eq!(http.body_bytes_sent(), 16);
-
-                // 3. Read the empty DATA frame carrying the request EOS.
-                http.read_body_or_idle(http.is_body_done()).await.unwrap();
-
-                // 4. Finish the response so the client can drain it to EOS and
-                //    close the stream cleanly instead of cancelling it.
-                http.finish().unwrap();
-            }));
-        }
-
-        for handle in handles {
-            // ensure no panics
-            assert!(handle.await.is_ok());
-        }
-    }
-}
+#[path = "server_tests.rs"]
+mod test;

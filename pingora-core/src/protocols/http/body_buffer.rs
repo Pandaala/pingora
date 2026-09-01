@@ -14,6 +14,14 @@
 
 use bytes::{Bytes, BytesMut};
 
+#[path = "request_body_buffer.rs"]
+mod request_body_buffer;
+
+pub(crate) use request_body_buffer::RegisteredRequestBodyBuffer;
+#[cfg(test)]
+use request_body_buffer::REQUEST_BODY_REPLAY_CHUNK_SIZE;
+pub use request_body_buffer::{InMemoryRequestBodyBuffer, RequestBodyBuffer};
+
 /// A buffer with size limit. When the total amount of data written to the buffer is below the limit
 /// all the data will be held in the buffer. Otherwise, the buffer will report to be truncated.
 pub struct FixedBuffer {
@@ -67,7 +75,7 @@ impl FixedBuffer {
 }
 
 #[cfg(test)]
-mod tests {
+mod early_buffer_tests {
     use super::*;
 
     #[test]
@@ -82,4 +90,6 @@ mod tests {
         assert_eq!(buffer.buffer.capacity(), 0);
         assert!(buffer.get_buffer().is_none());
     }
+
+    include!("request_body_buffer_tests.rs");
 }

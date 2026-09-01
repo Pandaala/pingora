@@ -19,7 +19,7 @@ use bytes::Bytes;
 use bytes::{BufMut, BytesMut};
 use http::header::{CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::HeaderValue;
-use http::{header, header::AsHeaderName, Method, Version};
+use http::{header, header::AsHeaderName, Method, StatusCode, Version};
 use log::{debug, trace, warn};
 use once_cell::sync::Lazy;
 use percent_encoding::{percent_encode, AsciiSet, CONTROLS};
@@ -29,15 +29,20 @@ use pingora_timeout::timeout;
 use regex::bytes::Regex;
 use std::any::Any;
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::body::{BodyReader, BodyWriter};
 use super::common::*;
 use super::header::HeaderWriter;
-use crate::protocols::http::{body_buffer::FixedBuffer, date, HttpTask, ReusableHttpStream};
+use crate::protocols::http::{
+    body_buffer::{FixedBuffer, RegisteredRequestBodyBuffer},
+    date, HttpTask, ReusableHttpStream,
+};
 use crate::protocols::{Digest, SocketAddr, Stream};
 use crate::utils::{BufRef, KVRef};
+#[path = "server_request_body_replay.rs"]
+mod request_body_replay;
 
 /// Tracks which writer is currently processing a task.
 ///
@@ -51,6 +56,9 @@ enum ProxyTaskWriter {
     /// Currently writing a body task (`Body` or `UpgradedBody`).
     /// Stores: (end_stream flag)
     WritingBody(bool),
+    /// Writing a validated trailer block. Stores application body bytes
+    /// written before the trailer block.
+    WritingTrailers(usize),
     /// Currently finishing the body (writing last chunk + flush).
     FinishingBody,
 }
@@ -84,6 +92,14 @@ pub struct HttpSession {
     preread_body: Option<BytesMut>,
     /// A state machine to track how to read the request body
     body_reader: BodyReader,
+    /// Snapshot of whether the request framing ended at the header section,
+    /// taken once when the body reader is initialized for the current request
+    /// and cleared when the next request starts on a keepalive connection.
+    /// Snapshotting matters because the live parser state moves: a chunked
+    /// request with an empty body only reports "empty" once its terminal
+    /// chunk has been parsed, which would flip this transport fact from
+    /// false to true mid-request (and again for a retry attempt).
+    request_headers_end_stream: Option<bool>,
     /// A state machine to track how to write the response body
     body_writer: BodyWriter,
     /// Cancel-safe proxy task state.
@@ -99,15 +115,56 @@ pub struct HttpSession {
     /// timeouts:
     keepalive_timeout: KeepaliveStatus,
     read_timeout: Option<Duration>,
+    /// Absolute deadline of the CURRENT request-body read.
+    ///
+    /// The body bound is a DEADLINE, not a per-call duration, for the same
+    /// reason as its h2 counterpart (see `v2::server::HttpSession::read_deadline`):
+    /// the proxy polls `read_body_or_idle` from a `tokio::select!` branch, so
+    /// any other ready branch drops the read future, and a duration recomputed
+    /// on the next iteration would restart the bound from zero. A client that
+    /// stalls forever while the upstream speaks even once per period would
+    /// then never be released.
+    ///
+    /// Cleared only by a read that actually produced body bytes, or by the end
+    /// of the body -- never by a cancelled read.
+    read_deadline: Option<Instant>,
     write_timeout: Option<Duration>,
     /// How long to wait to make downstream session reusable, if body needs to be drained.
     total_drain_timeout: Option<Duration>,
     /// A copy of the response that is already written to the client
     response_written: Option<Box<ResponseHeader>>,
+    /// Trailer capability derived from the fully filtered response header
+    /// before it is committed. This covers a header and trailers that arrive
+    /// in the same proxy batch, while the body writer is still `ToSelect`.
+    planned_response_trailers_supported: Option<bool>,
     /// The parsed request header
     request_header: Option<Box<RequestHeader>>,
     /// An internal buffer that holds a copy of the request body up to a certain size
     retry_buffer: Option<FixedBuffer>,
+    /// Optional app-supplied buffer that captures the full request body for early
+    /// inspection / rewrite and replay to upstream. Parallel to `retry_buffer`.
+    early_body_buffer: Option<RegisteredRequestBodyBuffer>,
+    /// Set right before awaiting an `early_body_buffer` capture/finish and cleared
+    /// once the await returns Ok. A body-read future dropped mid-await
+    /// (select!/timeout cancellation) leaves it set: the chunk was already
+    /// consumed from the transport, so the buffered body is incomplete and any
+    /// further body read or replay must fail closed.
+    early_body_capture_poisoned: bool,
+    /// Set when `drain_request_body` discards a registered `early_body_buffer`.
+    /// The body bytes are gone from both the transport and the buffer, so a later
+    /// replay attempt must fail closed instead of silently forwarding a bodyless
+    /// request upstream.
+    early_body_buffer_discarded: bool,
+    /// Set when the session drops a captured or fully replayed `early_body_buffer`
+    /// after the response was committed downstream (no further retry is possible then).
+    /// A later replay attempt indicates a broken retry decision upstream of this
+    /// session and must fail closed instead of silently forwarding a bodyless
+    /// request.
+    early_body_buffer_released: bool,
+    /// Once set, application hooks may no longer replace the request body
+    /// source. The proxy freezes this immediately before entering its retry
+    /// loop so every attempt observes the same source contract.
+    request_body_configuration_frozen: bool,
     /// Whether this session is an upgraded session. This flag is calculated when sending the
     /// response header to the client.
     upgraded: bool,
@@ -176,19 +233,27 @@ impl HttpSession {
             raw_header: None,
             preread_body: None,
             body_reader: BodyReader::new(false),
+            request_headers_end_stream: None,
             body_writer: BodyWriter::new(),
             proxy_task_state: ProxyTaskState::default(),
             body_write_buf: BytesMut::new(),
             keepalive_timeout: KeepaliveStatus::Off,
             update_resp_headers: true,
             response_written: None,
+            planned_response_trailers_supported: None,
             request_header: None,
             read_timeout: Some(Duration::from_secs(60)),
+            read_deadline: None,
             write_timeout: None,
             total_drain_timeout: None,
             body_bytes_sent: 0,
             body_bytes_read: 0,
             retry_buffer: None,
+            early_body_buffer: None,
+            early_body_capture_poisoned: false,
+            early_body_buffer_discarded: false,
+            early_body_buffer_released: false,
+            request_body_configuration_frozen: false,
             upgraded: false,
             digest,
             min_send_rate: None,
@@ -416,7 +481,20 @@ impl HttpSession {
 
                         self.body_reader.reinit();
                         self.pipelined_idle_bytes_stashed = false;
+                        // A new request on this (keepalive) connection gets its
+                        // own transport facts.
+                        self.request_headers_end_stream = None;
                         self.response_written = None;
+                        self.planned_response_trailers_supported = None;
+                        // Reset the per-request early-body-buffer state too, so a reused
+                        // ServerSession struct can use the capture feature again on the
+                        // next request instead of inheriting request 1's sticky flags.
+                        self.early_body_buffer_released = false;
+                        self.early_body_buffer_discarded = false;
+                        self.early_body_capture_poisoned = false;
+                        self.request_body_configuration_frozen = false;
+                        self.body_bytes_read = 0;
+                        self.read_deadline = None;
                         self.respect_keepalive();
 
                         // Disable keepalive if both Transfer-Encoding and Content-Length were present
@@ -578,15 +656,40 @@ impl HttpSession {
 
     /// Read the request body. `Ok(None)` when there is no (more) body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
-        let read = self.read_body().await?;
-        Ok(read.map(|b| {
-            let bytes = Bytes::copy_from_slice(self.get_body(&b));
-            self.body_bytes_read += bytes.len();
-            if let Some(buffer) = self.retry_buffer.as_mut() {
-                buffer.write_to_buffer(&bytes);
+        if self.early_body_capture_poisoned {
+            return Error::e_explain(
+                InternalError,
+                "request body capture failed or was cancelled mid-chunk; buffered body is incomplete",
+            );
+        }
+        let Some(b) = self.read_body().await? else {
+            if let Some(buffer) = self.early_body_buffer.as_mut() {
+                // Poison across the await: if this future is dropped mid-await
+                // the flag stays set and the session fails closed from then on.
+                self.early_body_capture_poisoned = true;
+                buffer.finish_capture().await?;
+                self.early_body_capture_poisoned = false;
             }
-            bytes
-        }))
+            return Ok(None);
+        };
+        let bytes = Bytes::copy_from_slice(self.get_body(&b));
+        self.body_bytes_read += bytes.len();
+        if let Some(buffer) = self.retry_buffer.as_mut() {
+            buffer.write_to_buffer(&bytes);
+        }
+        if let Some(buffer) = self.early_body_buffer.as_mut() {
+            self.early_body_capture_poisoned = true;
+            buffer.capture(&bytes).await?;
+            self.early_body_capture_poisoned = false;
+        }
+        if self.body_reader.body_done() {
+            if let Some(buffer) = self.early_body_buffer.as_mut() {
+                self.early_body_capture_poisoned = true;
+                buffer.finish_capture().await?;
+                self.early_body_capture_poisoned = false;
+            }
+        }
+        Ok(Some(bytes))
     }
 
     async fn do_read_body(&mut self) -> Result<Option<BufRef>> {
@@ -597,12 +700,37 @@ impl HttpSession {
     }
 
     /// Read the body into the internal buffer
+    ///
+    /// The `read_timeout` is applied as an inter-chunk idle bound anchored on
+    /// `read_deadline`: it survives the cancellation of this future by a losing
+    /// `select!` branch, and it is rearmed only by a read that produced body
+    /// bytes or reached the end of the body. A read that returns zero bytes --
+    /// chunked framing split across packets, and the empty payloads the chunk
+    /// parser reports for it -- is not progress and must not rearm it, or a
+    /// peer could hold the connection open forever with framing alone.
     async fn read_body(&mut self) -> Result<Option<BufRef>> {
         match self.read_timeout {
-            Some(t) => match timeout(t, self.do_read_body()).await {
-                Ok(res) => res,
-                Err(_) => Error::e_explain(ReadTimedout, format!("reading body, timeout: {t:?}")),
-            },
+            Some(t) => {
+                let now = Instant::now();
+                let deadline = *self.read_deadline.get_or_insert(now + t);
+                let remaining = deadline.saturating_duration_since(now);
+                match timeout(remaining, self.do_read_body()).await {
+                    Ok(res) => {
+                        let progressed = match res.as_ref() {
+                            Ok(Some(b)) => !b.is_empty(),
+                            Ok(None) => true, // end of body
+                            Err(_) => true,   // failed reads get a fresh bound
+                        };
+                        if progressed {
+                            self.read_deadline = None;
+                        }
+                        res
+                    }
+                    Err(_) => {
+                        Error::e_explain(ReadTimedout, format!("reading body, timeout: {t:?}"))
+                    }
+                }
+            }
             None => self.do_read_body().await,
         }
     }
@@ -619,8 +747,22 @@ impl HttpSession {
 
     /// Drain the request body. `Ok(())` when there is no (more) body to read.
     pub async fn drain_request_body(&mut self) -> Result<()> {
+        // Clear any read deadline armed by an earlier (possibly long-cancelled) read
+        // so the end-of-request drain gets a fresh `read_timeout` per read instead of
+        // failing the first pending read instantly with ReadTimedout.
+        self.read_deadline = None;
         if self.is_body_done() {
             return Ok(());
+        }
+        // Draining means the remaining body is discarded (e.g. keepalive reuse after
+        // the app rejected the request without reading it). That is incompatible with
+        // capture-for-replay, so drop any early body buffer first: replay can no
+        // longer happen, and teeing a discarded (possibly hostile) body into the
+        // buffer would be pure waste. Remember the discard: the body now exists in
+        // neither the transport nor the buffer, so a later replay attempt must fail
+        // closed instead of silently proxying a bodyless request.
+        if self.early_body_buffer.take().is_some() {
+            self.early_body_buffer_discarded = true;
         }
         match self.total_drain_timeout {
             Some(t) => match timeout(t, self.do_drain_request_body()).await {
@@ -633,6 +775,25 @@ impl HttpSession {
 
     /// Whether there is no (more) body to be read.
     pub fn is_body_done(&mut self) -> bool {
+        if self
+            .early_body_buffer
+            .as_ref()
+            .is_some_and(RegisteredRequestBodyBuffer::is_replaying)
+        {
+            return false;
+        }
+        self.init_body_reader();
+        self.body_reader.body_done()
+    }
+
+    /// Whether the REAL downstream request body has been fully read.
+    ///
+    /// Unlike [`Self::is_body_done`], this ignores the early-body-buffer
+    /// replay override: while a registered buffer is replaying to the
+    /// upstream, the downstream body was already fully captured, so
+    /// downstream-facing decisions (e.g. whether connection reuse is safe)
+    /// must consult the actual body reader state, not the widened replay view.
+    fn downstream_body_done(&mut self) -> bool {
         self.init_body_reader();
         self.body_reader.body_done()
     }
@@ -641,16 +802,59 @@ impl HttpSession {
     /// Because HTTP 1.1 clients have to send either `Content-Length` or `Transfer-Encoding` in order
     /// to signal the server that it will send the body, this function returns accurate results even
     /// only when the request header is just read.
+    ///
+    /// While an early request body buffer is registered, the effective body is whatever
+    /// the buffer replays, which may be a non-empty rewrite of a zero-byte original
+    /// (e.g. chunked terminated by an immediate zero chunk). Report non-empty then, so
+    /// upstream framing decisions (H2 END_STREAM on HEADERS) keep the stream open until
+    /// replay reaches EOF.
     pub fn is_body_empty(&mut self) -> bool {
+        if self.early_body_buffer.is_some() {
+            return false;
+        }
         self.init_body_reader();
         self.body_reader.body_empty()
+    }
+
+    /// Whether the request ended with actual trailer fields.
+    ///
+    /// This is meaningful after the request body reader reaches EOF. A
+    /// `Trailer` declaration header alone does not affect this result.
+    pub fn request_trailers_present(&mut self) -> bool {
+        self.init_body_reader();
+        self.body_reader.trailers_present()
+    }
+
+    /// Whether request framing ended at the header section.
+    ///
+    /// This is a transport fact, snapshotted once when the body reader is
+    /// initialized for the current request and stable for the rest of it
+    /// (including across retry attempts): reading the live parser state
+    /// instead would flip a chunked-but-empty request from false to true once
+    /// its terminal chunk was parsed.
+    ///
+    /// On H1 the framing is declarative, so `Content-Length: 0` (and the
+    /// absence of both `Content-Length` and `Transfer-Encoding`) counts as
+    /// ended-at-headers. This intentionally differs from H2, where only an
+    /// END_STREAM flag on the HEADERS frame counts and a `Content-Length: 0`
+    /// request may still legitimately send DATA frames -- a protocol-inherent
+    /// asymmetry, not an inconsistency.
+    ///
+    /// Unlike [`Self::is_body_empty`] it deliberately ignores a registered
+    /// early request body buffer -- that buffer is an application artifact
+    /// which rewrites the effective body for upstream framing, and must not
+    /// rewrite what the client actually put on the wire.
+    pub fn request_headers_end_stream(&mut self) -> bool {
+        self.init_body_reader();
+        // `init_body_reader()` above always establishes the snapshot.
+        self.request_headers_end_stream.unwrap_or(false)
     }
 
     /// Write the response header to the client.
     /// This function can be called more than once to send 1xx informational headers excluding 101.
     pub async fn write_response_header(&mut self, mut header: Box<ResponseHeader>) -> Result<()> {
         // Prepare header (handle upgrades, set headers, initialize body writer, serialize to bytes)
-        let Some((write_buf, flush)) = self.prepare_response_header(&mut header)? else {
+        let Some((write_buf, flush)) = self.prepare_response_header_for_write(&mut header)? else {
             // Header already sent or should be ignored
             return Ok(());
         };
@@ -665,15 +869,50 @@ impl HttpSession {
                         .or_err(WriteError, "flushing response header")?;
                 }
                 self.response_written = Some(header);
+                // Committing a non-informational response ends any possibility of
+                // an upstream retry; a captured or fully replayed body buffer is dead weight
+                // for the rest of the response (which may be long-lived, e.g. SSE).
+                self.maybe_release_early_body_buffer();
                 Ok(())
             }
             Err(e) => Error::e_because(WriteError, "writing response header", e),
         }
     }
 
+    /// Drop the registered early body buffer once it can no longer be needed:
+    /// capture completed without replay, or replay reached EOF, AND a
+    /// non-informational response header was committed downstream. Before the
+    /// response commits, a retry may still rewind and replay the buffer; while
+    /// replay is in progress, the current attempt is still reading it. Called
+    /// from each place where a release condition can become true. The
+    /// `early_body_buffer_released` flag makes any later replay attempt fail
+    /// closed (see `begin_request_body_replay`).
+    fn maybe_release_early_body_buffer(&mut self) {
+        let response_committed = self
+            .response_written
+            .as_ref()
+            .is_some_and(|resp| !resp.status.is_informational());
+        if response_committed
+            && self
+                .early_body_buffer
+                .as_ref()
+                .is_some_and(RegisteredRequestBodyBuffer::is_ready_or_replay_done)
+        {
+            self.early_body_buffer = None;
+            self.early_body_buffer_released = true;
+        }
+    }
+
     /// Return the response header if it is already sent.
     pub fn response_written(&self) -> Option<&ResponseHeader> {
         self.response_written.as_deref()
+    }
+
+    /// Whether the response body writer has already been finished, i.e. the
+    /// full framed body (including a chunked terminator, if any) was handed to
+    /// the writer. `false` while a response is still being streamed.
+    pub fn response_body_finished(&self) -> bool {
+        self.body_writer.finished()
     }
 
     /// `Some(true)` if the this is a successful upgrade
@@ -808,13 +1047,92 @@ impl HttpSession {
         }
     }
 
+    /// Finalize HTTP/1 response framing facts before response-trailer hooks.
+    /// Calling this again at header commit is intentional and idempotent.
+    pub fn prepare_response_header(&mut self, header: &mut ResponseHeader) -> Result<()> {
+        // Planning must preserve the writer's ignored-informational no-op.
+        // In particular, an ignored 1xx must not disable HTTP/1.0 keepalive
+        // before the final response is known.
+        if header.status.is_informational() && self.ignore_info_resp(header.status.into()) {
+            return Ok(());
+        }
+
+        let downstream_http10 = self
+            .request_header
+            .as_ref()
+            .is_some_and(|request| request.version == Version::HTTP_10);
+        if downstream_http10 {
+            header.set_version(Version::HTTP_10);
+            if header.headers.contains_key(header::TRANSFER_ENCODING) {
+                if !is_only_chunked_transfer_encoding(&header.headers) {
+                    return Error::e_explain(
+                        InvalidHTTPHeader,
+                        "HTTP/1.0 cannot represent non-chunked transfer codings",
+                    );
+                }
+                header.remove_header(&header::TRANSFER_ENCODING);
+            }
+            let response_body_forbidden = (header.status.is_informational()
+                && header.status != StatusCode::SWITCHING_PROTOCOLS)
+                || matches!(
+                    header.status,
+                    StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+                )
+                || self.get_method() == Some(&Method::HEAD);
+            if !response_body_forbidden && header.headers.get(header::CONTENT_LENGTH).is_none() {
+                self.set_keepalive(None);
+                header.insert_header(header::CONNECTION, "close")?;
+            }
+        }
+
+        if !header.status.is_informational() || header.status == StatusCode::SWITCHING_PROTOCOLS {
+            self.planned_response_trailers_supported = Some(
+                !downstream_http10
+                    && !matches!(
+                        header.status,
+                        StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+                    )
+                    && self.get_method() != Some(&Method::HEAD)
+                    && self.is_upgrade(header) != Some(true)
+                    && is_chunked_encoding_from_headers(&header.headers),
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether this downstream can represent response trailers with the
+    /// framing selected for the committed response.
+    pub fn response_trailers_supported(&self) -> bool {
+        let final_response_committed = self.response_written.as_ref().is_some_and(|response| {
+            !response.status.is_informational()
+                || response.status == StatusCode::SWITCHING_PROTOCOLS
+        });
+        if final_response_committed {
+            let actual = self
+                .request_header
+                .as_ref()
+                .is_some_and(|request| request.version == Version::HTTP_11)
+                && self.body_writer.trailers_supported();
+            debug_assert!(
+                self.planned_response_trailers_supported
+                    .is_none_or(|planned| planned == actual),
+                "planned and committed response trailer capability diverged"
+            );
+            actual
+        } else {
+            self.planned_response_trailers_supported.unwrap_or(false)
+        }
+    }
+
     /// Prepare response header for writing: handle upgrades, set headers, initialize body writer.
     /// This contains all the synchronous logic that should happen before writing the header.
     /// Returns Ok(Some((bytes, should_flush))) if the header should be written, Ok(None) if should skip.
-    fn prepare_response_header(
+    fn prepare_response_header_for_write(
         &mut self,
         header: &mut ResponseHeader,
     ) -> Result<Option<(Bytes, bool)>> {
+        self.prepare_response_header(header)?;
+
         // Check if we should ignore informational responses
         if header.status.is_informational() && self.ignore_info_resp(header.status.into()) {
             debug!("ignoring informational headers");
@@ -831,7 +1149,7 @@ impl HttpSession {
 
         // if body unfinished, or request header was not finished reading
         if self.close_on_response_before_downstream_finish
-            && (self.request_header.is_none() || !self.is_body_done())
+            && (self.request_header.is_none() || !self.downstream_body_done())
         {
             debug!("set connection close before downstream finish");
             self.set_keepalive(None);
@@ -1091,6 +1409,22 @@ impl HttpSession {
         Ok(res)
     }
 
+    /// Finish a chunked HTTP/1.1 response with trailers.
+    pub async fn write_trailers(&mut self, trailers: &http::HeaderMap) -> Result<Option<usize>> {
+        if trailers.is_empty() || !self.response_trailers_supported() {
+            return self.finish_body().await;
+        }
+        if !self.body_write_buf.is_empty() {
+            self.write_body_buf().await?;
+        }
+        let res = self
+            .body_writer
+            .write_trailers(&mut self.underlying_stream, trailers)
+            .await?;
+        self.maybe_force_close_body_reader();
+        Ok(res)
+    }
+
     /// Return how many response body bytes (application, not wire) already sent downstream
     pub fn body_bytes_sent(&self) -> usize {
         self.body_bytes_sent
@@ -1111,6 +1445,18 @@ impl HttpSession {
 
     fn init_body_reader(&mut self) {
         if self.body_reader.need_init() {
+            // No request has been read yet (no preread body captured), so there is
+            // nothing to initialize the body reader from. Return early instead of
+            // unwrapping, so the read-only accessors (`is_body_done`,
+            // `is_body_empty`, `request_headers_end_stream`,
+            // `request_trailers_present`) answer conservatively instead of
+            // panicking. Actually reading a body before `read_request` still
+            // panics one frame down in `BodyReader::read_body`, which is
+            // unchanged: that is a caller sequencing error, not an accessor.
+            if self.preread_body.is_none() {
+                return;
+            }
+
             // reset retry buffer
             if let Some(buffer) = self.retry_buffer.as_mut() {
                 buffer.clear();
@@ -1142,6 +1488,14 @@ impl HttpSession {
                         self.body_reader.init_content_length_owned(0, preread_body);
                     }
                 }
+            }
+
+            // Snapshot the headers-end-stream transport fact exactly once per
+            // request, while the body reader still reflects only the framing
+            // declared by the header section. Reading it later would observe
+            // parser progress instead (see the field's doc).
+            if self.request_headers_end_stream.is_none() {
+                self.request_headers_end_stream = Some(self.body_reader.body_empty());
             }
         }
     }
@@ -1209,6 +1563,18 @@ impl HttpSession {
     /// is called after the connection is already marked half-closed and `abort_on_close` is
     /// **disabled**, then it will pend forever.
     pub async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
+        if let Some(registered) = self.early_body_buffer.as_mut() {
+            if registered.is_replaying() {
+                let chunk = registered.next_chunk().await?;
+                if chunk.is_none() {
+                    // Replay EOF. If the response was already committed downstream
+                    // (upstream responded before replay finished), the buffer can
+                    // never be needed again — drop it now.
+                    self.maybe_release_early_body_buffer();
+                }
+                return Ok(chunk);
+            }
+        }
         if no_body_expected || self.is_body_done() {
             if self.half_closed {
                 if self.abort_on_close {
@@ -1515,7 +1881,13 @@ impl HttpSession {
                 self.write_non_empty_body(data, true).await?;
                 end_stream
             }
-            HttpTask::Trailer(_) => true, // h1 trailer is not supported yet
+            HttpTask::Trailer(Some(trailers)) => {
+                self.write_trailers(&trailers)
+                    .await
+                    .map_err(|e| e.into_down())?;
+                true
+            }
+            HttpTask::Trailer(None) => true,
             HttpTask::Done => true,
             HttpTask::Failed(e) => return Err(e),
         };
@@ -1568,7 +1940,14 @@ impl HttpSession {
                     self.buffer_body_data(data, true);
                     end_stream
                 }
-                HttpTask::Trailer(_) => true, // h1 trailer is not supported yet
+                HttpTask::Trailer(Some(trailers)) => {
+                    self.write_body_buf().await.map_err(|e| e.into_down())?;
+                    self.write_trailers(&trailers)
+                        .await
+                        .map_err(|e| e.into_down())?;
+                    true
+                }
+                HttpTask::Trailer(None) => true,
                 HttpTask::Done => true,
                 HttpTask::Failed(e) => {
                     // flush the data we have and quit
@@ -1618,7 +1997,7 @@ impl HttpSession {
             // - Resume any in-progress write
             if let Some(ref writer_state) = self.proxy_task_state.current_writer {
                 match writer_state {
-                    ProxyTaskWriter::WritingHeader(_, _) => {
+                    ProxyTaskWriter::WritingHeader(_, _) | ProxyTaskWriter::WritingTrailers(_) => {
                         let _bytes_written = self
                             .proxy_task_state
                             .header_writer()
@@ -1652,10 +2031,16 @@ impl HttpSession {
                 {
                     ProxyTaskWriter::WritingHeader(header, end) => {
                         self.response_written = Some(header);
+                        self.maybe_release_early_body_buffer();
                         end_stream = end;
                     }
                     ProxyTaskWriter::WritingBody(end) => {
                         end_stream = end;
+                    }
+                    ProxyTaskWriter::WritingTrailers(written) => {
+                        self.body_writer.mark_trailers_written(written);
+                        end_stream = true;
+                        self.maybe_force_close_body_reader();
                     }
                     ProxyTaskWriter::FinishingBody => {
                         end_stream = true;
@@ -1680,7 +2065,7 @@ impl HttpSession {
             match task {
                 HttpTask::Header(mut header, end) => {
                     let Some((write_buf, should_flush)) =
-                        self.prepare_response_header(&mut header)?
+                        self.prepare_response_header_for_write(&mut header)?
                     else {
                         end_stream = end;
                         continue;
@@ -1722,6 +2107,16 @@ impl HttpSession {
                         }
                     }
                     end_stream = end;
+                }
+                HttpTask::Trailer(Some(trailers))
+                    if !trailers.is_empty() && self.response_trailers_supported() =>
+                {
+                    let (write_buf, written) = self.body_writer.prepare_trailers(&trailers)?;
+                    self.proxy_task_state
+                        .header_writer()
+                        .send_header_task(write_buf, true, None);
+                    self.proxy_task_state.current_writer =
+                        Some(ProxyTaskWriter::WritingTrailers(written));
                 }
                 HttpTask::Trailer(_) | HttpTask::Done => {
                     end_stream = true;
@@ -1849,1413 +2244,8 @@ fn http_resp_header_to_buf(
 }
 
 #[cfg(test)]
-mod tests_stream {
-    use super::*;
-    use crate::protocols::http::v1::body::{BodyMode, ParseState};
-    use http::StatusCode;
-    use pingora_error::ErrorType;
-    use rstest::rstest;
-    use std::str;
-    use tokio_test::io::Builder;
-
-    fn init_log() {
-        let _ = env_logger::builder().is_test(true).try_init();
-    }
-
-    #[tokio::test]
-    async fn read_basic() {
-        init_log();
-        let input = b"GET / HTTP/1.1\r\n\r\n";
-        let mock_io = Builder::new().read(&input[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        let res = http_stream.read_request().await;
-        assert_eq!(input.len(), res.unwrap().unwrap());
-        assert_eq!(0, http_stream.req_header().headers.len());
-    }
-
-    #[cfg(feature = "patched_http1")]
-    #[tokio::test]
-    async fn read_invalid_path() {
-        init_log();
-        let input = b"GET /\x01\xF0\x90\x80 HTTP/1.1\r\n\r\n";
-        let mock_io = Builder::new().read(&input[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        let res = http_stream.read_request().await;
-        assert_eq!(input.len(), res.unwrap().unwrap());
-        assert_eq!(0, http_stream.req_header().headers.len());
-        assert_eq!(b"/\x01\xF0\x90\x80", http_stream.get_path());
-    }
-
-    #[tokio::test]
-    async fn read_2_buf() {
-        init_log();
-        let input1 = b"GET / HTTP/1.1\r\n";
-        let input2 = b"Host: pingora.org\r\n\r\n";
-        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        let res = http_stream.read_request().await;
-        assert_eq!(input1.len() + input2.len(), res.unwrap().unwrap());
-        assert_eq!(
-            input1.len() + input2.len(),
-            http_stream.raw_header.as_ref().unwrap().len()
-        );
-        assert_eq!(1, http_stream.req_header().headers.len());
-        assert_eq!(Some(&Method::GET), http_stream.get_method());
-        assert_eq!(b"/", http_stream.get_path());
-        assert_eq!(Version::HTTP_11, http_stream.req_header().version);
-
-        assert_eq!(b"pingora.org", http_stream.get_header_bytes("Host"));
-    }
-
-    #[tokio::test]
-    async fn read_with_body_content_length() {
-        init_log();
-        let input1 = b"GET / HTTP/1.1\r\n";
-        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\n";
-        let input3 = b"abc";
-        let mock_io = Builder::new()
-            .read(&input1[..])
-            .read(&input2[..])
-            .read(&input3[..])
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
-        assert_eq!(res, input3.as_slice());
-        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(3));
-        assert_eq!(http_stream.body_bytes_read(), 3);
-    }
-
-    #[tokio::test]
-    #[should_panic(expected = "There is still data left to read.")]
-    async fn read_with_body_timeout() {
-        init_log();
-        let input1 = b"GET / HTTP/1.1\r\n";
-        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\n";
-        let input3 = b"abc";
-        let mock_io = Builder::new()
-            .read(&input1[..])
-            .read(&input2[..])
-            .wait(Duration::from_secs(2))
-            .read(&input3[..])
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_timeout = Some(Duration::from_secs(1));
-        http_stream.read_request().await.unwrap();
-        let res = http_stream.read_body_bytes().await;
-        assert_eq!(http_stream.body_bytes_read(), 0);
-        assert_eq!(res.unwrap_err().etype(), &ReadTimedout);
-    }
-
-    #[tokio::test]
-    async fn read_with_body_content_length_single_read() {
-        init_log();
-        let input1 = b"GET / HTTP/1.1\r\n";
-        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\nabc";
-        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
-        assert_eq!(res, b"abc".as_slice());
-        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(3));
-        assert_eq!(http_stream.body_bytes_read(), 3);
-    }
-
-    #[tokio::test]
-    #[should_panic(expected = "There is still data left to read.")]
-    async fn read_with_body_http10() {
-        init_log();
-        let input1 = b"GET / HTTP/1.0\r\n";
-        let input2 = b"Host: pingora.org\r\n\r\n";
-        let input3 = b"a"; // This should NOT be read as body
-        let input4 = b""; // simulating close - should also NOT be reached
-        let mock_io = Builder::new()
-            .read(&input1[..])
-            .read(&input2[..])
-            .read(&input3[..])
-            .read(&input4[..])
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        let res = http_stream.read_body_bytes().await.unwrap();
-        assert!(res.is_none());
-        assert_eq!(http_stream.body_bytes_read(), 0);
-        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
-    }
-
-    #[tokio::test]
-    async fn read_with_body_http10_single_read() {
-        init_log();
-        // should have 0 body, even when data follows the headers
-        let input1 = b"GET / HTTP/1.0\r\n";
-        let input2 = b"Host: pingora.org\r\n\r\na";
-        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        let res = http_stream.read_body_bytes().await.unwrap();
-        assert!(res.is_none());
-        assert_eq!(http_stream.body_bytes_read(), 0);
-        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
-        assert_eq!(http_stream.body_reader.get_body_overread().unwrap(), b"a");
-    }
-
-    #[tokio::test]
-    async fn read_http11_default_no_body() {
-        init_log();
-        let input1 = b"GET / HTTP/1.1\r\n";
-        let input2 = b"Host: pingora.org\r\n\r\n";
-        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        let res = http_stream.read_body_bytes().await.unwrap();
-        assert!(res.is_none());
-        assert_eq!(http_stream.body_bytes_read(), 0);
-        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
-    }
-
-    #[tokio::test]
-    async fn read_http10_with_content_length() {
-        init_log();
-        let input1 = b"POST / HTTP/1.0\r\n";
-        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\n";
-        let input3 = b"abc";
-        let mock_io = Builder::new()
-            .read(&input1[..])
-            .read(&input2[..])
-            .read(&input3[..])
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
-        assert_eq!(res, input3.as_slice());
-        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(3));
-        assert_eq!(http_stream.body_bytes_read(), 3);
-    }
-
-    #[tokio::test]
-    async fn read_with_body_chunked_0_incomplete() {
-        init_log();
-        let input1 = b"GET / HTTP/1.1\r\n";
-        let input2 = b"Host: pingora.org\r\nTransfer-Encoding: chunked\r\n\r\n";
-        let input3 = b"0\r\n";
-        let mock_io = Builder::new()
-            .read(&input1[..])
-            .read(&input2[..])
-            .read(&input3[..])
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        assert!(http_stream.is_chunked_encoding());
-        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
-        assert_eq!(res, b"".as_slice());
-        let e = http_stream.read_body_bytes().await.unwrap_err();
-        assert_eq!(*e.etype(), ErrorType::ConnectionClosed);
-        assert_eq!(http_stream.body_reader.body_state, ParseState::Done(0));
-    }
-
-    #[tokio::test]
-    async fn read_with_body_chunked_0_extra() {
-        init_log();
-        let input1 = b"GET / HTTP/1.1\r\n";
-        let input2 = b"Host: pingora.org\r\nTransfer-Encoding: chunked\r\n\r\n";
-        let input3 = b"0\r\n";
-        let input4 = b"abc";
-        let mock_io = Builder::new()
-            .read(&input1[..])
-            .read(&input2[..])
-            .read(&input3[..])
-            .read(&input4[..])
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        assert!(http_stream.is_chunked_encoding());
-        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
-        assert_eq!(res, b"".as_slice());
-        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
-        assert_eq!(res, b"".as_slice());
-        let e = http_stream.read_body_bytes().await.unwrap_err();
-        assert_eq!(*e.etype(), ErrorType::ConnectionClosed);
-        assert_eq!(http_stream.body_reader.body_state, ParseState::Done(0));
-    }
-
-    #[tokio::test]
-    async fn read_with_body_chunked_single_read() {
-        init_log();
-        let input1 = b"GET / HTTP/1.1\r\n";
-        let input2 = b"Host: pingora.org\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n";
-        let input3 = b"0\r\n\r\n";
-        let mock_io = Builder::new()
-            .read(&input1[..])
-            .read(&input2[..])
-            .read(&input3[..])
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        assert!(http_stream.is_chunked_encoding());
-        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
-        assert_eq!(res, b"a".as_slice());
-        assert_eq!(
-            http_stream.body_reader.body_state,
-            ParseState::Chunked(1, 0, 0, 0)
-        );
-        let res = http_stream.read_body_bytes().await.unwrap();
-        assert!(res.is_none());
-        assert_eq!(http_stream.body_bytes_read(), 1);
-        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(1));
-    }
-
-    #[tokio::test]
-    async fn read_with_body_chunked_single_read_extra() {
-        init_log();
-        let input1 = b"GET / HTTP/1.1\r\n";
-        let input2 = b"Host: pingora.org\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n";
-        let input3 = b"0\r\n\r\nabc";
-        let mock_io = Builder::new()
-            .read(&input1[..])
-            .read(&input2[..])
-            .read(&input3[..])
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        assert!(http_stream.is_chunked_encoding());
-        let res = http_stream.read_body_bytes().await.unwrap().unwrap();
-        assert_eq!(res, b"a".as_slice());
-        assert_eq!(
-            http_stream.body_reader.body_state,
-            ParseState::Chunked(1, 0, 0, 0)
-        );
-        let res = http_stream.read_body_bytes().await.unwrap();
-        assert!(res.is_none());
-        assert_eq!(http_stream.body_bytes_read(), 1);
-        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(1));
-        assert_eq!(http_stream.body_reader.get_body_overread().unwrap(), b"abc");
-    }
-
-    #[rstest]
-    #[case(None, None)]
-    #[case(Some("transfer-encoding"), None)]
-    #[case(Some("transfer-encoding"), Some("CONTENT-LENGTH"))]
-    #[case(Some("TRANSFER-ENCODING"), Some("CONTENT-LENGTH"))]
-    #[case(Some("TRANSFER-ENCODING"), None)]
-    #[case(None, Some("CONTENT-LENGTH"))]
-    #[case(Some("TRANSFER-ENCODING"), Some("content-length"))]
-    #[case(None, Some("content-length"))]
-    #[tokio::test]
-    async fn transfer_encoding_and_content_length_disallowed(
-        #[case] transfer_encoding_header: Option<&str>,
-        #[case] content_length_header: Option<&str>,
-    ) {
-        init_log();
-        let input1 = b"GET / HTTP/1.1\r\n";
-        let mut input2 = "Host: pingora.org\r\n".to_owned();
-
-        if let Some(transfer_encoding) = transfer_encoding_header {
-            input2 += &format!("{transfer_encoding}: chunked\r\n");
-        }
-        if let Some(content_length) = content_length_header {
-            input2 += &format!("{content_length}: 4\r\n")
-        }
-
-        input2 += "\r\n3e\r\na\r\n";
-        let mock_io = Builder::new()
-            .read(&input1[..])
-            .read(input2.as_bytes())
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        let _ = http_stream.read_request().await.unwrap();
-
-        match (content_length_header, transfer_encoding_header) {
-            (Some(_) | None, Some(_)) => {
-                assert!(http_stream.get_header(TRANSFER_ENCODING).is_some());
-                assert!(http_stream.get_header(CONTENT_LENGTH).is_none());
-            }
-            (Some(_), None) => {
-                assert!(http_stream.get_header(TRANSFER_ENCODING).is_none());
-                assert!(http_stream.get_header(CONTENT_LENGTH).is_some());
-            }
-            _ => {
-                assert!(http_stream.get_header(CONTENT_LENGTH).is_none());
-                assert!(http_stream.get_header(TRANSFER_ENCODING).is_none());
-            }
-        }
-    }
-
-    #[rstest]
-    #[case::negative("-1")]
-    #[case::not_a_number("abc")]
-    #[case::float("1.5")]
-    #[case::empty("")]
-    #[case::spaces("  ")]
-    #[case::mixed("123abc")]
-    #[tokio::test]
-    async fn validate_request_rejects_invalid_content_length(#[case] invalid_value: &str) {
-        init_log();
-        let input = format!(
-            "POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: {}\r\n\r\n",
-            invalid_value
-        );
-        let mock_io = Builder::new().read(input.as_bytes()).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        // read_request calls validate_request internally, so it should fail here
-        let res = http_stream.read_request().await;
-        assert!(res.is_err());
-        assert_eq!(res.unwrap_err().etype(), &InvalidHTTPHeader);
-    }
-
-    #[rstest]
-    #[case::valid_zero("0")]
-    #[case::valid_small("123")]
-    #[case::valid_large("999999")]
-    #[tokio::test]
-    async fn validate_request_accepts_valid_content_length(#[case] valid_value: &str) {
-        init_log();
-        let input = format!(
-            "POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: {}\r\n\r\n",
-            valid_value
-        );
-        let mock_io = Builder::new().read(input.as_bytes()).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        let res = http_stream.read_request().await;
-        assert!(res.is_ok());
-    }
-
-    #[tokio::test]
-    async fn validate_request_accepts_no_content_length() {
-        init_log();
-        let input = b"GET / HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
-        let mock_io = Builder::new().read(&input[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        let res = http_stream.read_request().await;
-        assert!(res.is_ok());
-    }
-
-    #[tokio::test]
-    #[should_panic(expected = "There is still data left to read.")]
-    async fn read_invalid() {
-        let input1 = b"GET / HTP/1.1\r\n";
-        let input2 = b"Host: pingora.org\r\n\r\n";
-        let mock_io = Builder::new().read(&input1[..]).read(&input2[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        let res = http_stream.read_request().await;
-        assert_eq!(&InvalidHTTPHeader, res.unwrap_err().etype());
-    }
-
-    #[tokio::test]
-    async fn read_invalid_header_end() {
-        let input = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 3\r\r\nConnection: keep-alive\r\n\r\nabc";
-        let mock_io = Builder::new().read(&input[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        let res = http_stream.read_request().await;
-        assert_eq!(&InvalidHTTPHeader, res.unwrap_err().etype());
-    }
-
-    async fn build_upgrade_req(upgrade: &str, conn: &str) -> HttpSession {
-        let input = format!("GET / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: {upgrade}\r\nConnection: {conn}\r\n\r\n");
-        let mock_io = Builder::new().read(input.as_bytes()).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        http_stream
-    }
-
-    #[tokio::test]
-    async fn read_upgrade_req() {
-        // http 1.0
-        let input = b"GET / HTTP/1.0\r\nHost: pingora.org\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n";
-        let mock_io = Builder::new().read(&input[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        assert!(!http_stream.is_upgrade_req());
-
-        // different method
-        let input = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n";
-        let mock_io = Builder::new().read(&input[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        assert!(http_stream.is_upgrade_req());
-
-        // missing upgrade header
-        let input = b"GET / HTTP/1.1\r\nHost: pingora.org\r\nConnection: upgrade\r\n\r\n";
-        let mock_io = Builder::new().read(&input[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        assert!(!http_stream.is_upgrade_req());
-
-        // no connection header
-        let input = b"GET / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: WebSocket\r\n\r\n";
-        let mock_io = Builder::new().read(&input[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        assert!(http_stream.is_upgrade_req());
-
-        assert!(build_upgrade_req("websocket", "Upgrade")
-            .await
-            .is_upgrade_req());
-
-        // mixed case
-        assert!(build_upgrade_req("WebSocket", "Upgrade")
-            .await
-            .is_upgrade_req());
-    }
-
-    const POST_CL_UPGRADE_REQ: &[u8] = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: websocket\r\nConnection: upgrade\r\nContent-Length: 10\r\n\r\n";
-    const POST_BODY_DATA: &[u8] = b"abcdefghij";
-    const POST_CHUNKED_UPGRADE_REQ: &[u8] = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: websocket\r\nConnection: upgrade\r\nTransfer-Encoding: chunked\r\n\r\n";
-    const POST_BODY_DATA_CHUNKED: &[u8] = b"3\r\nabc\r\n7\r\ndefghij\r\n0\r\n\r\n";
-
-    #[rstest]
-    #[case::content_length(POST_CL_UPGRADE_REQ, POST_BODY_DATA, POST_BODY_DATA)]
-    #[case::chunked(POST_CHUNKED_UPGRADE_REQ, POST_BODY_DATA, POST_BODY_DATA_CHUNKED)]
-    #[tokio::test]
-    async fn read_upgrade_req_with_body(
-        #[case] header: &[u8],
-        #[case] body: &[u8],
-        #[case] body_wire: &[u8],
-    ) {
-        let ws_data = b"data";
-        let mock_io = Builder::new()
-            .read(header)
-            .read(body_wire)
-            .write(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
-            .read(&ws_data[..])
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        assert!(http_stream.is_upgrade_req());
-        // request has body
-        assert!(!http_stream.is_body_done());
-
-        let mut buf = vec![];
-        while let Some(b) = http_stream.read_body_bytes().await.unwrap() {
-            buf.put_slice(&b);
-        }
-        assert_eq!(buf, body);
-        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(10));
-        assert_eq!(http_stream.body_bytes_read(), 10);
-
-        assert!(http_stream.is_body_done());
-
-        let mut response = ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
-        response.set_version(http::Version::HTTP_11);
-        http_stream
-            .write_response_header(Box::new(response))
-            .await
-            .unwrap();
-        // body reader type switches
-        assert!(!http_stream.is_body_done());
-
-        // now the ws data
-        let buf = http_stream.read_body_bytes().await.unwrap().unwrap();
-        assert_eq!(buf, ws_data.as_slice());
-        assert!(!http_stream.is_body_done());
-
-        // EOF ends body
-        assert!(http_stream.read_body_bytes().await.unwrap().is_none());
-        assert!(http_stream.is_body_done());
-    }
-
-    #[rstest]
-    #[case::content_length(POST_CL_UPGRADE_REQ, POST_BODY_DATA, POST_BODY_DATA)]
-    #[case::chunked(POST_CHUNKED_UPGRADE_REQ, POST_BODY_DATA, POST_BODY_DATA_CHUNKED)]
-    #[tokio::test]
-    async fn read_upgrade_req_with_body_extra(
-        #[case] header: &[u8],
-        #[case] body: &[u8],
-        #[case] body_wire: &[u8],
-    ) {
-        let ws_data = b"data";
-        let data_wire = [body_wire, ws_data.as_slice()].concat();
-        let mock_io = Builder::new()
-            .read(header)
-            .read(&data_wire[..])
-            .write(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        assert!(http_stream.is_upgrade_req());
-        // request has body
-        assert!(!http_stream.is_body_done());
-
-        let mut buf = vec![];
-        while let Some(b) = http_stream.read_body_bytes().await.unwrap() {
-            buf.put_slice(&b);
-        }
-        assert_eq!(buf, body);
-        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(10));
-        assert_eq!(http_stream.body_bytes_read(), 10);
-
-        assert!(http_stream.is_body_done());
-
-        let mut response = ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
-        response.set_version(http::Version::HTTP_11);
-        http_stream
-            .write_response_header(Box::new(response))
-            .await
-            .unwrap();
-        // body reader type switches
-        assert!(!http_stream.is_body_done());
-
-        // now the ws data
-        let buf = http_stream.read_body_bytes().await.unwrap().unwrap();
-        assert_eq!(buf, ws_data.as_slice());
-        assert!(!http_stream.is_body_done());
-
-        // EOF ends body
-        assert!(http_stream.read_body_bytes().await.unwrap().is_none());
-        assert!(http_stream.is_body_done());
-    }
-
-    #[rstest]
-    #[case::content_length(POST_CL_UPGRADE_REQ, POST_BODY_DATA, POST_BODY_DATA)]
-    #[case::chunked(POST_CHUNKED_UPGRADE_REQ, POST_BODY_DATA, POST_BODY_DATA_CHUNKED)]
-    #[tokio::test]
-    async fn read_upgrade_req_with_preread_body(
-        #[case] header: &[u8],
-        #[case] body: &[u8],
-        #[case] body_wire: &[u8],
-    ) {
-        let ws_data = b"data";
-        let data_wire = [header, body_wire, ws_data.as_slice()].concat();
-        let mock_io = Builder::new()
-            .read(&data_wire[..])
-            .write(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        assert!(http_stream.is_upgrade_req());
-        // request has body
-        assert!(!http_stream.is_body_done());
-
-        let mut buf = vec![];
-        while let Some(b) = http_stream.read_body_bytes().await.unwrap() {
-            buf.put_slice(&b);
-        }
-        assert_eq!(buf, body);
-        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(10));
-        assert_eq!(http_stream.body_bytes_read(), 10);
-
-        assert!(http_stream.is_body_done());
-
-        let mut response = ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
-        response.set_version(http::Version::HTTP_11);
-        http_stream
-            .write_response_header(Box::new(response))
-            .await
-            .unwrap();
-        // body reader type switches
-        assert!(!http_stream.is_body_done());
-
-        // now the ws data
-        let buf = http_stream.read_body_bytes().await.unwrap().unwrap();
-        assert_eq!(buf, ws_data.as_slice());
-        assert!(!http_stream.is_body_done());
-
-        // EOF ends body
-        assert!(http_stream.read_body_bytes().await.unwrap().is_none());
-        assert!(http_stream.is_body_done());
-    }
-
-    #[rstest]
-    #[case::content_length(POST_CL_UPGRADE_REQ, POST_BODY_DATA)]
-    #[case::chunked(POST_CHUNKED_UPGRADE_REQ, POST_BODY_DATA_CHUNKED)]
-    #[tokio::test]
-    async fn read_upgrade_req_with_preread_body_after_101(
-        #[case] header: &[u8],
-        #[case] body_wire: &[u8],
-    ) {
-        let ws_data = b"data";
-        let data_wire = [header, body_wire, ws_data.as_slice()].concat();
-        let mock_io = Builder::new()
-            .read(&data_wire[..])
-            .write(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        assert!(http_stream.is_upgrade_req());
-        // request has body
-        assert!(!http_stream.is_body_done());
-
-        let mut response = ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
-        response.set_version(http::Version::HTTP_11);
-        http_stream
-            .write_response_header(Box::new(response))
-            .await
-            .unwrap();
-        // body reader type switches to http10
-        assert!(!http_stream.is_body_done());
-
-        let mut buf = vec![];
-        while let Some(b) = http_stream.read_body_bytes().await.unwrap() {
-            buf.put_slice(&b);
-        }
-        let expected_body = [body_wire, ws_data.as_slice()].concat();
-        assert_eq!(buf, expected_body.as_bytes());
-        assert_eq!(http_stream.body_bytes_read(), expected_body.len());
-        assert!(http_stream.is_body_done());
-    }
-
-    #[tokio::test]
-    async fn read_upgrade_req_with_1xx_response() {
-        let input = b"GET / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n";
-        let mock_io = Builder::new()
-            .read(&input[..])
-            .write(b"HTTP/1.1 100 Continue\r\n\r\n")
-            .write(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        assert!(http_stream.is_upgrade_req());
-        let mut response = ResponseHeader::build(StatusCode::CONTINUE, None).unwrap();
-        response.set_version(http::Version::HTTP_11);
-        http_stream
-            .write_response_header(Box::new(response))
-            .await
-            .unwrap();
-        // 100 won't affect body state
-        // current GET request is done
-        assert!(http_stream.is_body_done());
-
-        let mut response = ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
-        response.set_version(http::Version::HTTP_11);
-        http_stream
-            .write_response_header(Box::new(response))
-            .await
-            .unwrap();
-        // body reader type switches
-        assert!(!http_stream.is_body_done());
-        // EOF ends body
-        assert!(http_stream.read_body_bytes().await.unwrap().is_none());
-        assert!(http_stream.is_body_done());
-    }
-
-    #[tokio::test]
-    async fn test_upgrade_without_content_length_with_ws_data() {
-        let request = b"GET / HTTP/1.1\r\nHost: pingora.org\r\nUpgrade: websocket\r\nConnection: upgrade\r\n\r\n";
-        let ws_data = b"websocket data";
-
-        let mock_io = Builder::new()
-            .read(request)
-            .write(b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
-            .read(ws_data) // websocket data sent after 101
-            .build();
-
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        assert!(http_stream.is_upgrade_req());
-
-        // When enabled (default), is_body_done() is called before the upgrade
-        http_stream.set_close_on_response_before_downstream_finish(false);
-
-        // Send 101 response - this is where the bug occurs
-        let mut response = ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
-        response.set_version(http::Version::HTTP_11);
-        http_stream
-            .write_response_header(Box::new(response))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            http_stream.body_reader.body_state,
-            ParseState::UntilClose(0),
-            "Body reader should be in UntilClose mode after 101 for upgraded connections"
-        );
-
-        // Try to read websocket data
-        let mut buf = vec![];
-        while let Some(b) = http_stream.read_body_bytes().await.unwrap() {
-            buf.put_slice(&b);
-        }
-        assert_eq!(buf, ws_data, "Expected to read websocket data after 101");
-    }
-
-    #[tokio::test]
-    async fn set_server_keepalive() {
-        // close
-        let input = b"GET / HTTP/1.1\r\nHost: pingora.org\r\nConnection: close\r\n\r\n";
-        let mock_io = Builder::new().read(&input[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        // verify close
-        assert_eq!(http_stream.keepalive_timeout, KeepaliveStatus::Off);
-        http_stream.set_server_keepalive(Some(60));
-        // verify no change on override
-        assert_eq!(http_stream.keepalive_timeout, KeepaliveStatus::Off);
-
-        // explicit keep-alive
-        let input = b"GET / HTTP/1.1\r\nHost: pingora.org\r\nConnection: keep-alive\r\n\r\n";
-        let mock_io = Builder::new().read(&input[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        // default is infinite for 1.1
-        http_stream.read_request().await.unwrap();
-        assert_eq!(http_stream.keepalive_timeout, KeepaliveStatus::Infinite);
-        http_stream.set_server_keepalive(Some(60));
-        // override respected
-        assert_eq!(
-            http_stream.keepalive_timeout,
-            KeepaliveStatus::Timeout(Duration::from_secs(60))
-        );
-
-        // not specified
-        let input = b"GET / HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
-        let mock_io = Builder::new().read(&input[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        // default is infinite for 1.1
-        assert_eq!(http_stream.keepalive_timeout, KeepaliveStatus::Infinite);
-        http_stream.set_server_keepalive(Some(60));
-        // override respected
-        assert_eq!(
-            http_stream.keepalive_timeout,
-            KeepaliveStatus::Timeout(Duration::from_secs(60))
-        );
-    }
-
-    #[tokio::test]
-    async fn write() {
-        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
-        let write_expected = b"HTTP/1.1 200 OK\r\nFoo: Bar\r\n\r\n";
-        let mock_io = Builder::new().read(read_wire).write(write_expected).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        let mut new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
-        new_response.append_header("Foo", "Bar").unwrap();
-        http_stream.update_resp_headers = false;
-        http_stream
-            .write_response_header_ref(&new_response)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn write_custom_reason() {
-        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
-        let write_expected = b"HTTP/1.1 200 Just Fine\r\nFoo: Bar\r\n\r\n";
-        let mock_io = Builder::new().read(read_wire).write(write_expected).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        let mut new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
-        new_response.set_reason_phrase(Some("Just Fine")).unwrap();
-        new_response.append_header("Foo", "Bar").unwrap();
-        http_stream.update_resp_headers = false;
-        http_stream
-            .write_response_header_ref(&new_response)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn write_informational() {
-        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
-        let write_expected = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nFoo: Bar\r\n\r\n";
-        let mock_io = Builder::new().read(read_wire).write(write_expected).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        let response_100 = ResponseHeader::build(StatusCode::CONTINUE, None).unwrap();
-        http_stream
-            .write_response_header_ref(&response_100)
-            .await
-            .unwrap();
-        let mut response_200 = ResponseHeader::build(StatusCode::OK, None).unwrap();
-        response_200.append_header("Foo", "Bar").unwrap();
-        http_stream.update_resp_headers = false;
-        http_stream
-            .write_response_header_ref(&response_200)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn write_informational_ignored() {
-        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
-        let write_expected = b"HTTP/1.1 200 OK\r\nFoo: Bar\r\n\r\n";
-        let mock_io = Builder::new().read(read_wire).write(write_expected).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        // ignore the 100 Continue
-        http_stream.ignore_info_resp = true;
-        http_stream.read_request().await.unwrap();
-        let response_100 = ResponseHeader::build(StatusCode::CONTINUE, None).unwrap();
-        http_stream
-            .write_response_header_ref(&response_100)
-            .await
-            .unwrap();
-        let mut response_200 = ResponseHeader::build(StatusCode::OK, None).unwrap();
-        response_200.append_header("Foo", "Bar").unwrap();
-        http_stream.update_resp_headers = false;
-        http_stream
-            .write_response_header_ref(&response_200)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn write_informational_100_not_ignored_if_expect_continue() {
-        let input = b"GET / HTTP/1.1\r\nExpect: 100-continue\r\n\r\n";
-        let output = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nFoo: Bar\r\n\r\n";
-
-        let mock_io = Builder::new().read(&input[..]).write(output).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        http_stream.ignore_info_resp = true;
-        // 100 Continue is not ignored due to Expect: 100-continue on request
-        let response_100 = ResponseHeader::build(StatusCode::CONTINUE, None).unwrap();
-        http_stream
-            .write_response_header_ref(&response_100)
-            .await
-            .unwrap();
-        let mut response_200 = ResponseHeader::build(StatusCode::OK, None).unwrap();
-        response_200.append_header("Foo", "Bar").unwrap();
-        http_stream.update_resp_headers = false;
-        http_stream
-            .write_response_header_ref(&response_200)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn write_informational_1xx_ignored_if_expect_continue() {
-        let input = b"GET / HTTP/1.1\r\nExpect: 100-continue\r\n\r\n";
-        let output = b"HTTP/1.1 200 OK\r\nFoo: Bar\r\n\r\n";
-
-        let mock_io = Builder::new().read(&input[..]).write(output).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        http_stream.ignore_info_resp = true;
-        // 102 Processing is ignored
-        let response_102 = ResponseHeader::build(StatusCode::PROCESSING, None).unwrap();
-        http_stream
-            .write_response_header_ref(&response_102)
-            .await
-            .unwrap();
-        let mut response_200 = ResponseHeader::build(StatusCode::OK, None).unwrap();
-        response_200.append_header("Foo", "Bar").unwrap();
-        http_stream.update_resp_headers = false;
-        http_stream
-            .write_response_header_ref(&response_200)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn write_101_switching_protocol() {
-        let read_wire = b"GET / HTTP/1.1\r\nUpgrade: websocket\r\n\r\n";
-        let wire = b"HTTP/1.1 101 Switching Protocols\r\nFoo: Bar\r\n\r\n";
-        let wire_body = b"nPAYLOAD";
-        let mock_io = Builder::new()
-            .read(read_wire)
-            .write(wire)
-            .write(wire_body)
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        let mut response_101 =
-            ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, None).unwrap();
-        response_101.append_header("Foo", "Bar").unwrap();
-        http_stream
-            .write_response_header_ref(&response_101)
-            .await
-            .unwrap();
-        assert_eq!(http_stream.body_writer.body_mode, BodyMode::UntilClose(0));
-
-        let n = http_stream.write_body(wire_body).await.unwrap().unwrap();
-        assert_eq!(wire_body.len(), n);
-        assert_eq!(http_stream.body_writer.body_mode, BodyMode::UntilClose(n));
-
-        // this write should be ignored
-        let response_502 = ResponseHeader::build(StatusCode::BAD_GATEWAY, None).unwrap();
-        http_stream
-            .write_response_header_ref(&response_502)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn write_body_cl() {
-        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
-        let wire_header = b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n";
-        let wire_body = b"a";
-        let mock_io = Builder::new()
-            .read(read_wire)
-            .write(wire_header)
-            .write(wire_body)
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        let mut new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
-        new_response.append_header("Content-Length", "1").unwrap();
-        http_stream.update_resp_headers = false;
-        http_stream
-            .write_response_header_ref(&new_response)
-            .await
-            .unwrap();
-        assert_eq!(
-            http_stream.body_writer.body_mode,
-            BodyMode::ContentLength(1, 0)
-        );
-        let n = http_stream.write_body(wire_body).await.unwrap().unwrap();
-        assert_eq!(wire_body.len(), n);
-        let n = http_stream.finish_body().await.unwrap().unwrap();
-        assert_eq!(wire_body.len(), n);
-    }
-
-    #[tokio::test]
-    async fn body_bytes_sent_excludes_response_header() {
-        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
-        let wire_header = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
-        let wire_body = b"hello";
-        let mock_io = Builder::new()
-            .read(read_wire)
-            .write(wire_header)
-            .write(wire_body)
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        let mut new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
-        new_response.append_header("Content-Length", "5").unwrap();
-        http_stream.update_resp_headers = false;
-        http_stream
-            .write_response_header(Box::new(new_response))
-            .await
-            .unwrap();
-        assert_eq!(http_stream.body_bytes_sent(), 0);
-        http_stream.write_body(wire_body).await.unwrap();
-        assert_eq!(http_stream.body_bytes_sent(), wire_body.len());
-    }
-
-    #[tokio::test]
-    async fn write_body_http10() {
-        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
-        let wire_header = b"HTTP/1.1 200 OK\r\n\r\n";
-        let wire_body = b"a";
-        let mock_io = Builder::new()
-            .read(read_wire)
-            .write(wire_header)
-            .write(wire_body)
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        let new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
-        http_stream.update_resp_headers = false;
-        http_stream
-            .write_response_header_ref(&new_response)
-            .await
-            .unwrap();
-        assert_eq!(http_stream.body_writer.body_mode, BodyMode::UntilClose(0));
-        let n = http_stream.write_body(wire_body).await.unwrap().unwrap();
-        assert_eq!(wire_body.len(), n);
-        let n = http_stream.finish_body().await.unwrap().unwrap();
-        assert_eq!(wire_body.len(), n);
-    }
-
-    #[tokio::test]
-    async fn write_body_chunk() {
-        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
-        let wire_header = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-        let wire_body = b"1\r\na\r\n";
-        let wire_end = b"0\r\n\r\n";
-        let mock_io = Builder::new()
-            .read(read_wire)
-            .write(wire_header)
-            .write(wire_body)
-            .write(wire_end)
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        let mut new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
-        new_response
-            .append_header("Transfer-Encoding", "chunked")
-            .unwrap();
-        http_stream.update_resp_headers = false;
-        http_stream
-            .write_response_header_ref(&new_response)
-            .await
-            .unwrap();
-        assert_eq!(
-            http_stream.body_writer.body_mode,
-            BodyMode::ChunkedEncoding(0)
-        );
-        let n = http_stream.write_body(b"a").await.unwrap().unwrap();
-        assert_eq!(b"a".len(), n);
-        let n = http_stream.finish_body().await.unwrap().unwrap();
-        assert_eq!(b"a".len(), n);
-    }
-
-    #[tokio::test]
-    async fn read_with_illegal() {
-        init_log();
-        let input1 = b"GET /a?q=b c HTTP/1.1\r\n";
-        let input2 = b"Host: pingora.org\r\nContent-Length: 3\r\n\r\n";
-        let input3 = b"abc";
-        let mock_io = Builder::new()
-            .read(&input1[..])
-            .read(&input2[..])
-            .read(&input3[..])
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        assert_eq!(http_stream.get_path(), &b"/a?q=b%20c"[..]);
-        let res = http_stream.read_body().await.unwrap().unwrap();
-        assert_eq!(res, BufRef::new(0, 3));
-        assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(3));
-        assert_eq!(input3, http_stream.get_body(&res));
-    }
-
-    #[test]
-    fn escape_illegal() {
-        init_log();
-        // in query string
-        let input = BytesMut::from(
-            &b"GET /a?q=<\"b c\"> HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 3\r\n\r\n"[..],
-        );
-        let output = escape_illegal_request_line(&input).unwrap();
-        assert_eq!(
-            &output,
-            &b"GET /a?q=%3C%22b%20c%22%3E HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 3\r\n\r\n"[..]
-        );
-
-        // in path
-        let input = BytesMut::from(
-            &b"GET /a:\"bc\" HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 3\r\n\r\n"[..],
-        );
-        let output = escape_illegal_request_line(&input).unwrap();
-        assert_eq!(
-            &output,
-            &b"GET /a:%22bc%22 HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 3\r\n\r\n"[..]
-        );
-
-        // empty uri, unable to parse
-        let input =
-            BytesMut::from(&b"GET  HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 3\r\n\r\n"[..]);
-        assert!(escape_illegal_request_line(&input).is_none());
-    }
-
-    #[tokio::test]
-    async fn test_write_body_buf() {
-        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
-        let write_expected = b"HTTP/1.1 200 OK\r\nFoo: Bar\r\n\r\n";
-        let mock_io = Builder::new().read(read_wire).write(write_expected).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        let mut new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
-        new_response.append_header("Foo", "Bar").unwrap();
-        http_stream.update_resp_headers = false;
-        http_stream
-            .write_response_header_ref(&new_response)
-            .await
-            .unwrap();
-        let written = http_stream.write_body_buf().await.unwrap();
-        assert!(written.is_none());
-    }
-
-    #[tokio::test]
-    #[should_panic(expected = "There is still data left to write.")]
-    async fn test_write_body_buf_write_timeout() {
-        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
-        let wire1 = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n";
-        let wire2 = b"abc";
-        let mock_io = Builder::new()
-            .read(read_wire)
-            .write(wire1)
-            .wait(Duration::from_millis(500))
-            .write(wire2)
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        http_stream.write_timeout = Some(Duration::from_millis(100));
-        let mut new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
-        new_response.append_header("Content-Length", "3").unwrap();
-        http_stream.update_resp_headers = false;
-        http_stream
-            .write_response_header_ref(&new_response)
-            .await
-            .unwrap();
-        http_stream.body_write_buf = BytesMut::from(&b"abc"[..]);
-        let res = http_stream.write_body_buf().await;
-        assert_eq!(res.unwrap_err().etype(), &WriteTimedout);
-    }
-
-    #[tokio::test]
-    async fn test_write_continue_resp() {
-        let read_wire = b"GET / HTTP/1.1\r\n\r\n";
-        let write_expected = b"HTTP/1.1 100 Continue\r\n\r\n";
-        let mock_io = Builder::new().read(read_wire).write(write_expected).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-        http_stream.write_continue_response().await.unwrap();
-    }
-
-    #[test]
-    fn test_get_write_timeout() {
-        let mut http_stream = HttpSession::new(Box::new(Builder::new().build()));
-        let expected = Duration::from_secs(5);
-
-        http_stream.set_write_timeout(Some(expected));
-        assert_eq!(Some(expected), http_stream.write_timeout(50));
-    }
-
-    #[test]
-    fn test_get_write_timeout_none() {
-        let http_stream = HttpSession::new(Box::new(Builder::new().build()));
-        assert!(http_stream.write_timeout(50).is_none());
-    }
-
-    #[test]
-    fn test_get_write_timeout_min_send_rate_zero() {
-        let mut http_stream = HttpSession::new(Box::new(Builder::new().build()));
-        http_stream.set_min_send_rate(Some(0));
-        assert!(http_stream.write_timeout(50).is_none());
-
-        let mut http_stream = HttpSession::new(Box::new(Builder::new().build()));
-        http_stream.set_min_send_rate(None);
-        assert!(http_stream.write_timeout(50).is_none());
-    }
-
-    #[test]
-    fn test_get_write_timeout_min_send_rate_overrides_write_timeout() {
-        let mut http_stream = HttpSession::new(Box::new(Builder::new().build()));
-        let expected = Duration::from_millis(29800);
-
-        http_stream.set_write_timeout(Some(Duration::from_secs(60)));
-        http_stream.set_min_send_rate(Some(5000));
-
-        assert_eq!(Some(expected), http_stream.write_timeout(149000));
-    }
-
-    #[test]
-    fn test_get_write_timeout_min_send_rate_max_zero_buf() {
-        let mut http_stream = HttpSession::new(Box::new(Builder::new().build()));
-        let expected = Duration::from_secs(1);
-
-        http_stream.set_min_send_rate(Some(1));
-        assert_eq!(Some(expected), http_stream.write_timeout(0));
-    }
-
-    #[tokio::test]
-    async fn test_te_and_cl_disables_keepalive() {
-        // When both Transfer-Encoding and Content-Length are present,
-        // we must disable keepalive per RFC 9112 Section 6.1
-        // https://datatracker.ietf.org/doc/html/rfc9112#section-6.1-15
-        let input = b"POST / HTTP/1.1\r\n\
-Host: pingora.org\r\n\
-Transfer-Encoding: chunked\r\n\
-Content-Length: 10\r\n\
-\r\n\
-5\r\n\
-hello\r\n\
-0\r\n\
-\r\n";
-        let mock_io = Builder::new().read(&input[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-
-        // Keepalive should be disabled
-        assert_eq!(http_stream.keepalive_timeout, KeepaliveStatus::Off);
-
-        // Content-Length header should have been removed
-        assert!(!http_stream
-            .req_header()
-            .headers
-            .contains_key(CONTENT_LENGTH));
-
-        // Transfer-Encoding should still be present
-        assert!(http_stream
-            .req_header()
-            .headers
-            .contains_key(TRANSFER_ENCODING));
-    }
-
-    #[tokio::test]
-    async fn test_http10_request_with_transfer_encoding_rejected() {
-        // HTTP/1.0 requests MUST NOT contain Transfer-Encoding
-        let input = b"POST / HTTP/1.0\r\n\
-Host: pingora.org\r\n\
-Transfer-Encoding: chunked\r\n\
-\r\n\
-5\r\n\
-hello\r\n\
-0\r\n\
-\r\n";
-        let mock_io = Builder::new().read(&input[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        let result = http_stream.read_request().await;
-
-        // Should be rejected with InvalidHTTPHeader error
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.etype(), &InvalidHTTPHeader);
-        assert!(err.to_string().contains("Transfer-Encoding"));
-    }
-
-    #[tokio::test]
-    async fn test_http10_request_without_transfer_encoding_accepted() {
-        // HTTP/1.0 requests without Transfer-Encoding should be accepted
-        let input = b"POST / HTTP/1.0\r\n\
-Host: pingora.org\r\n\
-Content-Length: 5\r\n\
-\r\n\
-hello";
-        let mock_io = Builder::new().read(&input[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        let result = http_stream.read_request().await;
-
-        // Should succeed
-        assert!(result.is_ok());
-        assert_eq!(http_stream.req_header().version, http::Version::HTTP_10);
-    }
-
-    #[tokio::test]
-    async fn test_http11_request_with_transfer_encoding_accepted() {
-        // HTTP/1.1 with Transfer-Encoding should be accepted (contrast with HTTP/1.0)
-        let input = b"POST / HTTP/1.1\r\n\
-Host: pingora.org\r\n\
-Transfer-Encoding: chunked\r\n\
-\r\n\
-5\r\n\
-hello\r\n\
-0\r\n\
-\r\n";
-        let mock_io = Builder::new().read(&input[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        let result = http_stream.read_request().await;
-
-        // Should succeed
-        assert!(result.is_ok());
-        assert_eq!(http_stream.req_header().version, http::Version::HTTP_11);
-    }
-
-    #[tokio::test]
-    async fn test_request_multiple_transfer_encoding_headers() {
-        init_log();
-        // Multiple TE headers should be treated as comma-separated
-        let input = b"POST / HTTP/1.1\r\n\
-Host: pingora.org\r\n\
-Transfer-Encoding: gzip\r\n\
-Transfer-Encoding: chunked\r\n\
-\r\n\
-5\r\n\
-hello\r\n\
-0\r\n\
-\r\n";
-
-        let mock_io = Builder::new().read(&input[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-
-        // Should correctly identify chunked encoding from last header
-        assert!(http_stream.is_chunked_encoding());
-
-        // Verify body can be read correctly
-        let body = http_stream.read_body_bytes().await.unwrap();
-        assert_eq!(body.unwrap().as_ref(), b"hello");
-    }
-
-    #[tokio::test]
-    async fn test_request_multiple_te_headers_chunked_not_last() {
-        init_log();
-        // Chunked in first header but not last - should NOT be chunked
-        // Only the final Transfer-Encoding determines if body is chunked
-        let input = b"POST / HTTP/1.1\r\n\
-Host: pingora.org\r\n\
-Transfer-Encoding: chunked\r\n\
-Transfer-Encoding: identity\r\n\
-Content-Length: 5\r\n\
-\r\n";
-
-        let mock_io = Builder::new().read(&input[..]).build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        // should fail validation
-        http_stream.read_request().await.unwrap_err();
-    }
-
-    #[tokio::test]
-    async fn test_no_more_reuses_explicitly_disables_reuse() {
-        init_log();
-        let wire_req = b"GET /test HTTP/1.1\r\n\r\n";
-        let wire_header = b"HTTP/1.1 200 OK\r\n\r\n";
-        let mock_io = Builder::new()
-            .read(&wire_req[..])
-            .write(wire_header)
-            .build();
-        let mut http_session = HttpSession::new(Box::new(mock_io));
-
-        // Setting the number of keepalive reuses here overrides the keepalive
-        // setting below
-        http_session.set_keepalive_reuses_remaining(Some(0));
-
-        http_session.read_request().await.unwrap();
-
-        let new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
-        http_session.update_resp_headers = false;
-        http_session
-            .write_response_header(Box::new(new_response))
-            .await
-            .unwrap();
-
-        assert_eq!(http_session.body_writer.body_mode, BodyMode::UntilClose(0));
-
-        http_session.finish_body().await.unwrap().unwrap();
-
-        http_session.set_keepalive(Some(100));
-        let reused = http_session.reuse().await.unwrap();
-        assert!(reused.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_close_delimited_response_explicitly_disables_reuse() {
-        init_log();
-        let wire_req = b"GET /test HTTP/1.1\r\n\r\n";
-        let wire_header = b"HTTP/1.1 200 OK\r\n\r\n";
-        let mock_io = Builder::new()
-            .read(&wire_req[..])
-            .write(wire_header)
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.read_request().await.unwrap();
-
-        let new_response = ResponseHeader::build(StatusCode::OK, None).unwrap();
-        http_stream.update_resp_headers = false;
-        http_stream
-            .write_response_header(Box::new(new_response))
-            .await
-            .unwrap();
-
-        assert_eq!(http_stream.body_writer.body_mode, BodyMode::UntilClose(0));
-
-        http_stream.finish_body().await.unwrap().unwrap();
-
-        let reused = http_stream.reuse().await.unwrap();
-        assert!(reused.is_none());
-    }
-
-    #[test]
-    fn test_connection_user_context_set_and_take() {
-        let mock_io = Builder::new().build();
-        let mut session = HttpSession::new(Box::new(mock_io));
-
-        // Initially no context
-        assert!(session.take_connection_user_context().is_none());
-
-        // Set a context
-        session.set_connection_user_context(Some(Box::new(42u64)));
-
-        // Take it back
-        let ctx = session.take_connection_user_context();
-        assert!(ctx.is_some());
-        let val = ctx.unwrap().downcast::<u64>().unwrap();
-        assert_eq!(*val, 42u64);
-
-        // After take, it's gone
-        assert!(session.take_connection_user_context().is_none());
-    }
-
-    #[test]
-    fn test_connection_user_context_set_none_clears() {
-        let mock_io = Builder::new().build();
-        let mut session = HttpSession::new(Box::new(mock_io));
-
-        session.set_connection_user_context(Some(Box::new("hello".to_string())));
-        session.set_connection_user_context(None);
-        assert!(session.take_connection_user_context().is_none());
-    }
-}
+#[path = "server_tests_stream.rs"]
+mod tests_stream;
 
 #[cfg(test)]
 mod test_sync {
@@ -3291,438 +2281,8 @@ mod test_sync {
 }
 
 #[cfg(test)]
-mod test_proxy_tasks {
-    use super::*;
-    use http::StatusCode;
-    use std::future::IntoFuture;
-    use tokio_test::io::{Builder, Mock};
-
-    fn init_log() {
-        let _ = env_logger::builder().is_test(true).try_init();
-    }
-
-    // An upper limit for any read within any test to prevent tests from hanging forever if
-    // an internal read call never returns, etc.
-    const TEST_MAX_WAIT_FOR_READ: Duration = Duration::from_secs(3);
-
-    // The duration of 600 seconds is chosen to be "effectively forever" for the purpose of testing
-    const TEST_FOREVER_DURATION: Duration = Duration::from_secs(600);
-
-    // The read_timeout to use, when we want to test that a read operation times out
-    const TEST_READ_TIMEOUT: Duration = Duration::from_secs(1);
-
-    #[derive(Debug)]
-    struct ReadBlockedForeverError;
-
-    // Returns a client stream that will "never" send any bytes / return from a read operation
-    fn mocked_blocking_headers_forever_stream() -> Box<Mock> {
-        Box::new(Builder::new().wait(TEST_FOREVER_DURATION).build())
-    }
-
-    fn mocked_blocking_body_forever_stream() -> Box<Mock> {
-        let http1 = b"GET / HTTP/1.1\r\n";
-        let http2 = b"Host: pingora.example\r\nContent-Length: 3\r\n\r\n";
-        Box::new(
-            Builder::new()
-                .read(&http1[..])
-                .read(&http2[..])
-                .wait(TEST_FOREVER_DURATION)
-                .build(),
-        )
-    }
-
-    // Helper function to test a read operation with a tokio timeout
-    // to prevent tests from hanging forever in case of a bug
-    async fn test_read_with_tokio_timeout<F, T>(
-        read_future: F,
-    ) -> Result<Result<T, Box<Error>>, ReadBlockedForeverError>
-    where
-        F: IntoFuture<Output = Result<T, Box<Error>>>,
-    {
-        let read_result = tokio::time::timeout(TEST_MAX_WAIT_FOR_READ, read_future).await;
-        read_result.map_err(|_| ReadBlockedForeverError)
-    }
-
-    #[tokio::test]
-    async fn test_read_http_request_headers_timeout_for_read_request() {
-        // confirm that a `read_timeout` of `None` would've waited "indefinitely"
-        let mut http_stream = HttpSession::new(mocked_blocking_headers_forever_stream());
-        http_stream.read_timeout = None;
-        let res = test_read_with_tokio_timeout(http_stream.read_request()).await;
-        assert!(res.is_err()); // test timeout occurred, and not any internal Pingora timeout
-
-        // confirm that the `read_timeout` is respected
-        let mut http_stream = HttpSession::new(mocked_blocking_headers_forever_stream());
-        http_stream.read_timeout = Some(TEST_READ_TIMEOUT);
-        let res = test_read_with_tokio_timeout(http_stream.read_request()).await;
-        assert!(res.is_ok());
-        assert_eq!(res.unwrap().unwrap_err().etype(), &ReadTimedout);
-    }
-
-    #[tokio::test]
-    async fn test_read_http_body_timeout_for_read_body_bytes() {
-        // confirm that a `read_timeout` of `None` would've waited "indefinitely"
-        let mut http_stream = HttpSession::new(mocked_blocking_body_forever_stream());
-        http_stream.read_timeout = None;
-        http_stream.read_request().await.unwrap();
-        let res = test_read_with_tokio_timeout(http_stream.read_body_bytes()).await;
-        assert!(res.is_err()); // test timeout occurred, and not any internal Pingora timeout
-
-        // confirm that the `read_timeout` is respected
-        let mut http_stream = HttpSession::new(mocked_blocking_body_forever_stream());
-        http_stream.read_timeout = Some(TEST_READ_TIMEOUT);
-        http_stream.read_request().await.unwrap();
-        let res = test_read_with_tokio_timeout(http_stream.read_body_bytes()).await;
-        assert!(res.is_ok());
-        assert_eq!(res.unwrap().unwrap_err().etype(), &ReadTimedout);
-    }
-
-    #[tokio::test]
-    async fn test_send_proxy_task_and_write() {
-        init_log();
-
-        // We need to know exact bytes that will be written
-        // "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
-        let expected_header = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
-        let expected_body = b"hello";
-
-        let mock_io = Builder::new()
-            .write(expected_header)
-            .write(expected_body)
-            .build();
-
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.update_resp_headers = false; // Disable automatic headers
-
-        // Queue header task
-        let mut header = ResponseHeader::build(StatusCode::OK, Some(5)).unwrap();
-        header.insert_header("Content-Length", "5").unwrap();
-        http_stream.send_proxy_task(HttpTask::Header(Box::new(header), false));
-
-        // Queue body task
-        http_stream.send_proxy_task(HttpTask::Body(Some(Bytes::from("hello")), true));
-
-        // Write all tasks
-        let end_stream = http_stream.write_proxy_tasks().await.unwrap();
-        assert!(end_stream);
-    }
-
-    #[tokio::test]
-    async fn test_proxy_task_with_timeout() {
-        init_log();
-
-        let expected_header = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
-        let expected_body = b"hello";
-
-        let mock_io = Builder::new()
-            .write(expected_header)
-            .write(expected_body)
-            .build();
-
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.update_resp_headers = false;
-        http_stream.write_timeout = Some(Duration::from_secs(1)); // Set write timeout
-
-        // Queue tasks
-        let mut header = ResponseHeader::build(StatusCode::OK, Some(5)).unwrap();
-        header.insert_header("Content-Length", "5").unwrap();
-        http_stream.send_proxy_task(HttpTask::Header(Box::new(header), false));
-        http_stream.send_proxy_task(HttpTask::Body(Some(Bytes::from("hello")), true));
-
-        // Verify initial state
-        assert_eq!(
-            http_stream.body_bytes_sent(),
-            0,
-            "Should start with 0 bytes sent"
-        );
-
-        // Write all tasks with timeout
-        let end_stream = http_stream.write_proxy_tasks().await.unwrap();
-        assert!(end_stream);
-
-        // Verify body bytes were counted correctly (not double counted)
-        assert_eq!(
-            http_stream.body_bytes_sent(),
-            5,
-            "Should count exactly 5 bytes (application level), not double counted"
-        );
-    }
-
-    // Test that write_proxy_tasks is cancel-safe: if the future is dropped mid-execution,
-    // unwritten tasks should remain in the queue.
-    #[tokio::test]
-    async fn test_proxy_task_cancel_safety() {
-        init_log();
-
-        let expected_header = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-        // First chunk: "5\r\nhello\r\n"
-        let expected_chunk1 = b"5\r\nhello\r\n";
-
-        // Create a mock IO that will write the header and first chunk,
-        // but will block indefinitely on the second chunk
-        let mock_io = Builder::new()
-            .write(expected_header)
-            .write(expected_chunk1)
-            .wait(Duration::from_secs(999)) // This will cause timeout
-            .build();
-
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.update_resp_headers = false;
-        http_stream.write_timeout = Some(Duration::from_millis(100));
-
-        // Queue 3 tasks: header + 2 body chunks
-        let mut header = ResponseHeader::build(StatusCode::OK, None).unwrap();
-        header
-            .insert_header("Transfer-Encoding", "chunked")
-            .unwrap();
-        http_stream.send_proxy_task(HttpTask::Header(Box::new(header), false));
-        http_stream.send_proxy_task(HttpTask::Body(Some(Bytes::from("hello")), false));
-        http_stream.send_proxy_task(HttpTask::Body(Some(Bytes::from("world")), true));
-
-        // Verify we have 3 tasks queued
-        assert_eq!(http_stream.proxy_task_state.tasks.len(), 3);
-
-        // Try to write all tasks - this should timeout while writing the second body chunk
-        let result = http_stream.write_proxy_tasks().await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().etype(), &WriteTimedout);
-
-        // With the refactored cancel-safe design:
-        // - First task (header) was written successfully and removed from queue
-        // - Second task (first body "hello") was removed and sent to BodyWriter, write succeeded, state cleared
-        // - Third task (second body "world") was removed and sent to BodyWriter, timed out mid-write
-        // - The in-progress write state is tracked in current_writer, NOT in the queue
-        assert_eq!(
-            http_stream.proxy_task_state.tasks.len(),
-            0,
-            "Queue should be empty - tasks are owned by writers once sent"
-        );
-
-        // The task being written should be tracked in current_writer
-        assert!(
-            matches!(
-                http_stream.proxy_task_state.current_writer,
-                Some(ProxyTaskWriter::WritingBody(_))
-            ),
-            "Should be mid-write of body task - writer owns the 'world' task state"
-        );
-
-        // Verify body_bytes_sent only counts the successfully written "hello" (5 bytes)
-        // not the timed-out "world"
-        assert_eq!(
-            http_stream.body_bytes_sent(),
-            5,
-            "Should only count the 5 bytes from 'hello', not the incomplete 'world' write"
-        );
-
-        // On next call to write_proxy_tasks(), Step 1 will resume the "world" write
-    }
-
-    use crate::protocols::http::v1::test_util::FlushTrackingMock;
-
-    // Test that write_continue_response can be called before write_proxy_tasks
-    // and both work correctly together.
-    #[tokio::test]
-    async fn test_continue_response_before_proxy_tasks() {
-        init_log();
-
-        // Expected bytes written:
-        // 1. 100 Continue response
-        // 2. 200 OK response header
-        // 3. Body data
-        let expected_continue = b"HTTP/1.1 100 Continue\r\n\r\n";
-        let expected_header = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
-        let expected_body = b"hello";
-
-        let mock_io = Builder::new()
-            .write(expected_continue)
-            .write(expected_header)
-            .write(expected_body)
-            .build();
-
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.update_resp_headers = false; // Disable automatic headers
-
-        // First, write the 100 Continue response
-        http_stream.write_continue_response().await.unwrap();
-
-        // Verify that 100 Continue was recorded
-        assert!(
-            http_stream.response_written().is_some(),
-            "100 Continue should be recorded in response_written"
-        );
-        assert_eq!(
-            http_stream.response_written().unwrap().status,
-            StatusCode::CONTINUE,
-            "Should have recorded 100 Continue"
-        );
-
-        // Now queue the actual response using proxy tasks
-        let mut header = ResponseHeader::build(StatusCode::OK, Some(5)).unwrap();
-        header.insert_header("Content-Length", "5").unwrap();
-        http_stream.send_proxy_task(HttpTask::Header(Box::new(header), false));
-        http_stream.send_proxy_task(HttpTask::Body(Some(Bytes::from("hello")), true));
-
-        // Write all proxy tasks
-        let end_stream = http_stream.write_proxy_tasks().await.unwrap();
-        assert!(end_stream, "Should indicate end of stream");
-
-        // Verify final response is 200 OK, not 100 Continue
-        assert_eq!(
-            http_stream.response_written().unwrap().status,
-            StatusCode::OK,
-            "Final response should be 200 OK, overwriting 100 Continue"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_head_response_with_content_length_flushes() {
-        init_log();
-
-        // HEAD request line + headers
-        let request = b"HEAD / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        let expected_header = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
-
-        let mock_io = Builder::new().read(request).write(expected_header).build();
-        let (flush_mock, flush_count) = FlushTrackingMock::new(mock_io);
-        let mut http_stream = HttpSession::new(Box::new(flush_mock));
-        http_stream.update_resp_headers = false;
-
-        // Read the HEAD request
-        http_stream.read_request().await.unwrap();
-        assert_eq!(http_stream.get_method(), Some(&Method::HEAD));
-
-        // Queue header with Content-Length (body will be empty for HEAD)
-        let mut header = ResponseHeader::build(StatusCode::OK, Some(2)).unwrap();
-        header.insert_header("Content-Length", "100").unwrap();
-        http_stream.send_proxy_task(HttpTask::Header(Box::new(header), true));
-
-        let flush_before = FlushTrackingMock::flush_count(&flush_count);
-        let end_stream = http_stream.write_proxy_tasks().await.unwrap();
-        let flush_after = FlushTrackingMock::flush_count(&flush_count);
-
-        assert!(end_stream, "HEAD response should be end of stream");
-        assert!(
-            flush_after > flush_before,
-            "Should flush after writing HEAD response header with Content-Length \
-             (body_writer.finished() is true). Got flush_before={flush_before}, \
-             flush_after={flush_after}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_204_response_with_content_length_flushes() {
-        init_log();
-
-        let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        let expected_header = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
-
-        let mock_io = Builder::new().read(request).write(expected_header).build();
-        let (flush_mock, flush_count) = FlushTrackingMock::new(mock_io);
-        let mut http_stream = HttpSession::new(Box::new(flush_mock));
-        http_stream.update_resp_headers = false;
-
-        http_stream.read_request().await.unwrap();
-
-        let mut header = ResponseHeader::build(StatusCode::NO_CONTENT, Some(2)).unwrap();
-        header.insert_header("Content-Length", "0").unwrap();
-        http_stream.send_proxy_task(HttpTask::Header(Box::new(header), true));
-
-        let flush_before = FlushTrackingMock::flush_count(&flush_count);
-        let end_stream = http_stream.write_proxy_tasks().await.unwrap();
-        let flush_after = FlushTrackingMock::flush_count(&flush_count);
-
-        assert!(end_stream, "204 response should be end of stream");
-        assert!(
-            flush_after > flush_before,
-            "Should flush after writing 204 response header with Content-Length \
-             (body_writer.finished() is true). Got flush_before={flush_before}, \
-             flush_after={flush_after}"
-        );
-    }
-
-    #[tokio::test]
-    #[should_panic(
-        expected = "Unexpected UpgradedBody task received on un-upgraded downstream session"
-    )]
-    async fn test_upgraded_body_on_non_upgraded_session_panics() {
-        init_log();
-
-        let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        let expected_header = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-        // UpgradedBody on a non-upgraded session should panic before writing,
-        // but if the bug exists, BodyWriter would encode it as a chunk:
-        let expected_chunk = b"5\r\nhello\r\n";
-        let expected_finish = b"0\r\n\r\n";
-
-        let mock_io = Builder::new()
-            .read(request)
-            .write(expected_header)
-            // If the panic check is missing, the body gets written as a chunk
-            .write(expected_chunk)
-            .write(expected_finish)
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.update_resp_headers = false;
-
-        http_stream.read_request().await.unwrap();
-        assert!(
-            !http_stream.was_upgraded(),
-            "Session should NOT be upgraded"
-        );
-
-        // Queue a normal header
-        let mut header = ResponseHeader::build(StatusCode::OK, Some(2)).unwrap();
-        header
-            .insert_header("Transfer-Encoding", "chunked")
-            .unwrap();
-        http_stream.send_proxy_task(HttpTask::Header(Box::new(header), false));
-
-        // Queue an UpgradedBody task on a non-upgraded session — should panic
-        http_stream.send_proxy_task(HttpTask::UpgradedBody(Some(Bytes::from("hello")), true));
-
-        // This should panic before/during the body write
-        let _ = http_stream.write_proxy_tasks().await;
-    }
-
-    #[tokio::test]
-    #[should_panic(expected = "Unexpected Body task received on upgraded downstream session")]
-    async fn test_body_on_upgraded_session_panics() {
-        init_log();
-
-        // Upgrade request
-        let request =
-            b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
-        // 101 Switching Protocols response
-        let expected_header =
-            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
-        // If the panic check is missing, Body data would be written raw (close-delimited)
-        let expected_body = b"hello";
-
-        let mock_io = Builder::new()
-            .read(request)
-            .write(expected_header)
-            .write(expected_body)
-            .build();
-        let mut http_stream = HttpSession::new(Box::new(mock_io));
-        http_stream.update_resp_headers = false;
-
-        http_stream.read_request().await.unwrap();
-
-        // Queue 101 header to complete the upgrade
-        let mut header = ResponseHeader::build(StatusCode::SWITCHING_PROTOCOLS, Some(3)).unwrap();
-        header.insert_header("Upgrade", "websocket").unwrap();
-        header.insert_header("Connection", "Upgrade").unwrap();
-        http_stream.send_proxy_task(HttpTask::Header(Box::new(header), false));
-
-        // Queue a regular Body task on what will be an upgraded session — should panic
-        http_stream.send_proxy_task(HttpTask::Body(Some(Bytes::from("hello")), true));
-
-        // This should panic (after writing the header, session becomes upgraded,
-        // then the Body task should be rejected)
-        let _ = http_stream.write_proxy_tasks().await;
-    }
-}
+#[path = "server_test_proxy_tasks.rs"]
+mod test_proxy_tasks;
 
 #[cfg(test)]
 mod test_overread {
@@ -3946,588 +2506,9 @@ mod test_abort_on_close {
 }
 
 #[cfg(test)]
-mod test_pipelining {
-    //! Tests for HTTP/1.1 request pipelining support (RFC 9112 §9.3.2).
-    //!
-    //! Pipelining is an opt-in behavior: when enabled via
-    //! [`HttpSession::set_pipelining_enabled`], the session tolerates
-    //! overread bytes on reuse (they belong to the next request) and a new
-    //! session can have them fed in via [`HttpSession::set_pipelined_prefix`].
-    //!
-    //! When disabled (default), overread bytes cause [`HttpSession::reuse`]
-    //! to return `Ok(None)` so the connection closes — the historical
-    //! behavior preserved for callers that do not opt in.
+#[path = "server_test_pipelining.rs"]
+mod test_pipelining;
 
-    use super::*;
-    use rstest::rstest;
-    use tokio_test::io::Builder;
-
-    fn init_log() {
-        let _ = env_logger::builder().is_test(true).try_init();
-    }
-
-    /// Default state: pipelining is off.
-    #[tokio::test]
-    async fn pipelining_disabled_by_default() {
-        init_log();
-        let mock_io = Builder::new().build();
-        let s = HttpSession::new(Box::new(mock_io));
-        assert!(!s.pipelining_enabled());
-    }
-
-    /// Toggling the pipelining flag is round-trippable.
-    #[tokio::test]
-    async fn set_pipelining_enabled_toggles() {
-        init_log();
-        let mock_io = Builder::new().build();
-        let mut s = HttpSession::new(Box::new(mock_io));
-        assert!(!s.pipelining_enabled());
-        s.set_pipelining_enabled(true);
-        assert!(s.pipelining_enabled());
-        s.set_pipelining_enabled(false);
-        assert!(!s.pipelining_enabled());
-    }
-
-    /// When pipelining is disabled (default), overread bytes must cause
-    /// reuse to return `None`. Pipelining opt-in must not regress that
-    /// compatibility behavior.
-    #[rstest]
-    #[case(true)] // pipelining explicitly off
-    #[case(false)] // pipelining flag never set
-    #[tokio::test]
-    async fn reuse_rejects_overread_when_pipelining_disabled(#[case] explicit_off: bool) {
-        init_log();
-        let request =
-            b"GET / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 0\r\n\r\npipelined_next";
-        let mock_io = Builder::new().read(request).build();
-        let mut s = HttpSession::new(Box::new(mock_io));
-        if explicit_off {
-            s.set_pipelining_enabled(false);
-        }
-        s.read_request().await.unwrap();
-        // Overread is captured when body reading initializes — poll the
-        // body to trigger the init_content_length path.
-        let _ = s.read_body_bytes().await.unwrap();
-        assert!(s.body_reader.has_bytes_overread());
-        let reused = s.reuse().await.unwrap();
-        assert!(
-            reused.is_none(),
-            "reuse must return None without pipelining"
-        );
-    }
-
-    /// When pipelining is enabled and overread bytes are present,
-    /// reuse returns both the stream and the extracted prefix.
-    #[tokio::test]
-    async fn reuse_allows_overread_when_pipelining_enabled() {
-        init_log();
-        let request =
-            b"GET / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 0\r\n\r\npipelined_next";
-        let mock_io = Builder::new().read(request).build();
-        let mut s = HttpSession::new(Box::new(mock_io));
-        s.set_pipelining_enabled(true);
-        s.read_request().await.unwrap();
-        let _ = s.read_body_bytes().await.unwrap();
-        assert!(s.body_reader.has_bytes_overread());
-
-        let reused = s.reuse().await.unwrap().expect("connection reusable");
-        let (_stream, prefix) = reused.into_parts();
-        let prefix = prefix.expect("overread must be returned as pipelined prefix");
-        assert_eq!(prefix.as_ref(), b"pipelined_next");
-    }
-
-    /// Same-read pipelining with no prior body poll still extracts the prefix.
-    #[tokio::test]
-    async fn reuse_extracts_prefix_without_body_poll() {
-        init_log();
-        let req1 = b"GET /one HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
-        let req2 = b"GET /two HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
-        let mut combined = Vec::with_capacity(req1.len() + req2.len());
-        combined.extend_from_slice(req1);
-        combined.extend_from_slice(req2);
-
-        let mock_io = Builder::new().read(&combined).build();
-        let mut a = HttpSession::new(Box::new(mock_io));
-        a.set_pipelining_enabled(true);
-        a.read_request().await.unwrap();
-        assert_eq!(a.req_header().uri.path(), "/one");
-
-        let reused = a.reuse().await.unwrap().expect("connection reusable");
-        let (stream, prefix) = reused.into_parts();
-        let prefix = prefix.expect("pipelined prefix must be extracted during reuse");
-        assert_eq!(prefix.as_ref(), req2);
-
-        let mut b = HttpSession::new(stream);
-        b.set_pipelining_enabled(true);
-        b.set_pipelined_prefix(prefix);
-        b.read_request()
-            .await
-            .unwrap()
-            .expect("pipelined request must parse");
-        assert_eq!(b.req_header().uri.path(), "/two");
-    }
-
-    /// Content-Length: 0 has the same extraction requirement as absent length.
-    #[tokio::test]
-    async fn reuse_extracts_content_length_zero_prefix_without_body_poll() {
-        init_log();
-        let req1 = b"GET /one HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 0\r\n\r\n";
-        let req2 = b"GET /two HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 0\r\n\r\n";
-        let mut combined = Vec::with_capacity(req1.len() + req2.len());
-        combined.extend_from_slice(req1);
-        combined.extend_from_slice(req2);
-
-        let mock_io = Builder::new().read(&combined).build();
-        let mut a = HttpSession::new(Box::new(mock_io));
-        a.set_pipelining_enabled(true);
-        a.read_request().await.unwrap();
-        assert_eq!(a.req_header().uri.path(), "/one");
-
-        let reused = a.reuse().await.unwrap().expect("connection reusable");
-        let (_stream, prefix) = reused.into_parts();
-        let prefix = prefix.expect("pipelined prefix must be extracted during reuse");
-        assert_eq!(prefix.as_ref(), req2);
-    }
-
-    /// The new session parses the pipelined prefix as the start of a
-    /// request without issuing any stream read — the mock_io allows no
-    /// reads, so if read_request() tried to pull from the stream it would
-    /// panic. This is the essential pipelining property: a prefix that
-    /// already contains a complete request is parsed without waiting for
-    /// additional bytes.
-    #[tokio::test]
-    async fn read_request_consumes_complete_prefix_without_stream_read() {
-        init_log();
-        let prefix = b"GET /two HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 0\r\n\r\n";
-        // Mock IO that would panic on any read — ensures the parse is
-        // wholly satisfied by the pipelined prefix.
-        let mock_io = Builder::new().build();
-        let mut s = HttpSession::new(Box::new(mock_io));
-        s.set_pipelined_prefix(BytesMut::from(&prefix[..]));
-        let n = s
-            .read_request()
-            .await
-            .unwrap()
-            .expect("request must parse from prefix alone");
-        assert!(n > 0);
-        assert_eq!(s.req_header().uri.path(), "/two");
-    }
-
-    /// When the prefix is only the beginning of a request, read_request()
-    /// continues to read from the stream to complete the header.
-    #[tokio::test]
-    async fn read_request_falls_through_to_stream_for_partial_prefix() {
-        init_log();
-        let prefix = b"GET /two HTTP/1.1\r\nHost: ";
-        let rest = b"pingora.org\r\nContent-Length: 0\r\n\r\n";
-        let mock_io = Builder::new().read(rest).build();
-        let mut s = HttpSession::new(Box::new(mock_io));
-        s.set_pipelined_prefix(BytesMut::from(&prefix[..]));
-        let n = s
-            .read_request()
-            .await
-            .unwrap()
-            .expect("request must parse across prefix + stream");
-        assert!(n > 0);
-        assert_eq!(s.req_header().uri.path(), "/two");
-    }
-
-    /// Body-pump path: request 2's bytes arrive in a SEPARATE read
-    /// after request 1 has been fully consumed. The proxy's body-pump
-    /// loop polls the downstream socket via
-    /// [`HttpSession::read_body_or_idle`]`(true)` while request 1's
-    /// response is still being written. The idle branch at
-    /// `read_body_or_idle` currently raises
-    /// `ConnectError("Sent data after end of body")` when the idle
-    /// read returns > 0 bytes — which is exactly the shape pipelining
-    /// traffic takes when requests span TCP segment boundaries.
-    ///
-    /// This covers the two-segment pipelining case: request 2's bytes
-    /// arrive during the proxy's idle poll, not during request 1's body
-    /// read. The reuse() overread path (already covered by the tests
-    /// above) never fires because request 2's bytes were never in
-    /// `body_buf_overread` to begin with.
-    ///
-    /// When pipelining is enabled on the session, this branch must
-    /// NOT raise `ConnectError`. Instead, the byte(s) read by
-    /// `idle()` must be stashed so the reuse() path can hand them
-    /// to the next session via the standard `take_body_overread`
-    /// extractor. `idle()` uses a 1-byte probe buffer, so the
-    /// overread surface will typically hold 1 byte per idle poll —
-    /// the remaining bytes of request 2 stay on the underlying
-    /// stream and are read by the next session's `read_request`
-    /// (which seeds itself with the pipelined prefix and continues
-    /// reading from the stream to complete the header).
-    #[tokio::test]
-    async fn idle_read_stashes_bytes_when_pipelining_enabled() {
-        init_log();
-        let req1 = b"GET /one HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 0\r\n\r\n";
-        // Only the first byte of req2 is queued — the idle-branch
-        // read in `read_body_or_idle` uses a 1-byte probe buffer,
-        // so that's all it will consume. The rest of req2 would
-        // live on the kernel socket buffer in real traffic and be
-        // drained by the next session.
-        let req2_first = b"G";
-
-        // No `.wait(...)` between the two reads — we want the
-        // second read to be immediately available once the first
-        // consumer polls. `tokio-test::io::Builder` delivers reads
-        // one poll at a time regardless, which is what models a
-        // TCP segment boundary for our purposes.
-        let mock_io = Builder::new().read(&req1[..]).read(&req2_first[..]).build();
-
-        let mut s = HttpSession::new(Box::new(mock_io));
-        s.set_pipelining_enabled(true);
-
-        // Consume request 1 fully. Body is zero-length so body_done
-        // is true; no overread is captured in body_buf_overread
-        // because req2's bytes were NOT in the same read as req1.
-        s.read_request().await.unwrap();
-        assert_eq!(s.req_header().uri.path(), "/one");
-        let _ = s.read_body_bytes().await.unwrap();
-        assert!(s.is_body_done());
-        assert!(
-            !s.body_reader.has_bytes_overread(),
-            "precondition: req2 must arrive in a separate read, not as overread on req1"
-        );
-
-        // This is the proxy's body-pump poll. Post-fix, the idle
-        // branch reads the byte, pushes it to the body reader's
-        // overread surface, and stays pending — signaling the
-        // body-pump `select!` loop that the downstream has no more
-        // body activity to wait on (the loop exits via its other
-        // branches when the upstream response completes).
-        //
-        // We assert the *causal* invariant, not a wall-clock one:
-        // poll the future repeatedly, yielding between polls to
-        // let the mock I/O stack drain, until either (a) it
-        // resolves (which is a failure — it MUST stay pending) or
-        // (b) we observe enough bookkeeping progress to know the
-        // idle read has completed. The proxy_tasks channel via
-        // `proxy_tasks_rx` isn't wired in this test, so "enough
-        // progress" is signaled by tracking `poll_count` alone;
-        // the actual overread presence is asserted after the
-        // future is dropped.
-        //
-        // Scope the future in an async block so its borrow on `s`
-        // ends when we exit the block — the body-reader check
-        // needs a fresh borrow.
-        {
-            let fut = s.read_body_or_idle(true);
-            tokio::pin!(fut);
-            // Drive the future forward a bounded number of times.
-            // Under the fix it will always stay Pending; a broken
-            // fix resolves Ready in the first few polls.
-            for _ in 0..10 {
-                match futures::poll!(fut.as_mut()) {
-                    std::task::Poll::Pending => {
-                        tokio::task::yield_now().await;
-                    }
-                    std::task::Poll::Ready(Err(e)) => panic!(
-                        "read_body_or_idle(true) must not raise an error when \
-                         pipelining is enabled and the idle read returns > 0 bytes \
-                         (those bytes are the start of pipelined request 2, not \
-                         illegal trailing body). Got error: {e:?}"
-                    ),
-                    std::task::Poll::Ready(Ok(body)) => panic!(
-                        "read_body_or_idle(true) must stay pending after stashing \
-                         pipelined bytes (the body-pump `select!` exits via its \
-                         other branches). Got body: {body:?}"
-                    ),
-                }
-            }
-            // Future still pending — exit the scope, which drops
-            // `fut` and releases the mutable borrow on `s`.
-        }
-
-        // The byte must be extractable as overread, so the
-        // standard reuse() + HttpPersistentSettings pipeline can
-        // hand it to the next session.
-        let overread = s
-            .take_body_overread()
-            .expect("pipelined request 2 byte must be retrievable as overread");
-        assert_eq!(
-            overread.as_ref(),
-            req2_first,
-            "stashed bytes must be the idle-read probe byte from request 2"
-        );
-    }
-
-    /// Symmetric to the test above: pipelining OFF means the idle
-    /// branch still raises `ConnectError` as it did pre-patch. This
-    /// preserves upstream behavior for non-adopters.
-    #[tokio::test]
-    async fn idle_read_still_raises_when_pipelining_disabled() {
-        init_log();
-        let req1 = b"GET /one HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 0\r\n\r\n";
-        // Single byte of req2 — idle-branch read uses a 1-byte probe
-        // buffer, error path fires, mock is fully drained.
-        let req2_first = b"G";
-
-        let mock_io = Builder::new().read(&req1[..]).read(&req2_first[..]).build();
-
-        let mut s = HttpSession::new(Box::new(mock_io));
-        // Leave pipelining at the default (off).
-        s.read_request().await.unwrap();
-        let _ = s.read_body_bytes().await.unwrap();
-        assert!(s.is_body_done());
-
-        let err = s
-            .read_body_or_idle(true)
-            .await
-            .expect_err("pipelining off: idle read > 0 must raise ConnectError");
-        assert_eq!(
-            *err.etype(),
-            pingora_error::ErrorType::ConnectError,
-            "non-adopter callers must still see ConnectError on surplus idle bytes"
-        );
-    }
-
-    /// End-to-end: session A finishes with overread, bytes are extracted,
-    /// session B consumes them via set_pipelined_prefix and parses the
-    /// pipelined request without reading from the (empty) stream.
-    #[tokio::test]
-    async fn pipelined_request_chain_end_to_end() {
-        init_log();
-
-        // Session A: read request 1 with pipelined request 2 bytes appended.
-        let req1 = b"GET /one HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 0\r\n\r\n";
-        let req2 = b"GET /two HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 0\r\n\r\n";
-        let mut combined = Vec::with_capacity(req1.len() + req2.len());
-        combined.extend_from_slice(req1);
-        combined.extend_from_slice(req2);
-
-        let mock_io_a = Builder::new().read(&combined).build();
-        let mut a = HttpSession::new(Box::new(mock_io_a));
-        a.set_pipelining_enabled(true);
-        a.read_request().await.unwrap();
-        assert_eq!(a.req_header().uri.path(), "/one");
-        // Poll the body to trigger init_content_length which captures
-        // the bytes past Content-Length: 0 as overread.
-        let _ = a.read_body_bytes().await.unwrap();
-        assert!(a.body_reader.has_bytes_overread());
-
-        let overread = a.take_body_overread().expect("overread present");
-
-        // Session B: construct with an empty stream (pipelined prefix is
-        // everything we need), feed the overread, parse the next request.
-        let mock_io_b = Builder::new().build();
-        let mut b = HttpSession::new(Box::new(mock_io_b));
-        b.set_pipelining_enabled(true);
-        b.set_pipelined_prefix(overread);
-        b.read_request()
-            .await
-            .unwrap()
-            .expect("pipelined request must parse");
-        assert_eq!(b.req_header().uri.path(), "/two");
-    }
-
-    #[tokio::test]
-    async fn bodyless_pipeline_transfers_prefix_without_copying() {
-        init_log();
-        let req1 = b"GET /one HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
-        let req2 = b"GET /two HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
-        let mut prefix = BytesMut::with_capacity(req1.len() + req2.len());
-        prefix.extend_from_slice(req1);
-        prefix.extend_from_slice(req2);
-        let base = prefix.as_ptr();
-
-        let mock_io = Builder::new().build();
-        let mut session = HttpSession::new(Box::new(mock_io));
-        session.set_pipelining_enabled(true);
-        session.set_pipelined_prefix(prefix);
-        session.read_request().await.unwrap();
-
-        let reused = session.reuse().await.unwrap().expect("connection reusable");
-        let (_, prefix) = reused.into_parts();
-        let prefix = prefix.expect("second request remains buffered");
-        assert_eq!(prefix.as_ptr(), unsafe { base.add(req1.len()) });
-        assert_eq!(prefix.as_ref(), req2);
-    }
-
-    #[tokio::test]
-    async fn content_length_pipeline_transfers_prefix_without_copying() {
-        init_log();
-        let req1 = b"POST /one HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 4\r\n\r\nbody";
-        let req2 = b"GET /two HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
-        let mut prefix = BytesMut::with_capacity(req1.len() + req2.len());
-        prefix.extend_from_slice(req1);
-        prefix.extend_from_slice(req2);
-        let base = prefix.as_ptr();
-
-        let mock_io = Builder::new().build();
-        let mut session = HttpSession::new(Box::new(mock_io));
-        session.set_pipelining_enabled(true);
-        session.set_pipelined_prefix(prefix);
-        session.read_request().await.unwrap();
-
-        let reused = session.reuse().await.unwrap().expect("connection reusable");
-        let (_, prefix) = reused.into_parts();
-        let prefix = prefix.expect("second request remains buffered");
-        assert_eq!(prefix.as_ptr(), unsafe { base.add(req1.len()) });
-        assert_eq!(prefix.as_ref(), req2);
-    }
-
-    #[tokio::test]
-    async fn chunked_pipeline_with_trailers_transfers_prefix_without_copying() {
-        init_log();
-        let req1 = b"POST /one HTTP/1.1\r\nHost: pingora.org\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\nX-Test: one\r\n\r\n";
-        let req2 = b"GET /two HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
-        let mut prefix = BytesMut::with_capacity(req1.len() + req2.len());
-        prefix.extend_from_slice(req1);
-        prefix.extend_from_slice(req2);
-        let base = prefix.as_ptr();
-
-        let mock_io = Builder::new().build();
-        let mut session = HttpSession::new(Box::new(mock_io));
-        session.set_pipelining_enabled(true);
-        session.set_pipelined_prefix(prefix);
-        session.read_request().await.unwrap();
-
-        let reused = session.reuse().await.unwrap().expect("connection reusable");
-        let (_, prefix) = reused.into_parts();
-        let prefix = prefix.expect("second request remains buffered");
-        assert_eq!(prefix.as_ptr(), unsafe { base.add(req1.len()) });
-        assert_eq!(prefix.as_ref(), req2);
-    }
-
-    #[tokio::test]
-    async fn escaped_uri_pipeline_does_not_copy_following_requests() {
-        init_log();
-        let req1 = b"GET /one?q=a b HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
-        let req2 = b"GET /two HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
-        let mut prefix = BytesMut::with_capacity(req1.len() + req2.len());
-        prefix.extend_from_slice(req1);
-        prefix.extend_from_slice(req2);
-        let req2_ptr = unsafe { prefix.as_ptr().add(req1.len()) };
-
-        let mock_io = Builder::new().build();
-        let mut session = HttpSession::new(Box::new(mock_io));
-        session.set_pipelining_enabled(true);
-        session.set_pipelined_prefix(prefix);
-        session.read_request().await.unwrap();
-        assert_eq!(session.get_path(), b"/one?q=a%20b");
-
-        let reused = session.reuse().await.unwrap().expect("connection reusable");
-        let (_, prefix) = reused.into_parts();
-        let prefix = prefix.expect("second request remains buffered");
-        assert_eq!(prefix.as_ptr(), req2_ptr);
-        assert_eq!(prefix.as_ref(), req2);
-    }
-
-    /// `do_read_chunked_body` splits the post-last-chunk tail to the front of the body buffer,
-    /// and `do_read_chunked_body_final` may then need several reads to find the end of the
-    /// trailer section. Only the first of those passes may reuse the split buffer; the later
-    /// ones reset it for fresh IO. This drives both passes with a pipelined request behind the
-    /// trailers to prove neither the trailers nor the queued request are lost.
-    #[tokio::test]
-    async fn chunked_trailers_across_reads_keep_pipelined_request() {
-        init_log();
-        let req1_head =
-            b"POST /one HTTP/1.1\r\nHost: pingora.org\r\nTransfer-Encoding: chunked\r\n\r\n";
-        // Ends mid trailer section: the final CRLF that terminates it is still on the wire.
-        let req1_tail = b"1\r\na\r\n0\r\nX-Test: one\r\n";
-        let req2 = b"GET /two HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
-        let mut rest = BytesMut::from(&b"\r\n"[..]);
-        rest.extend_from_slice(req2);
-
-        let mut prefix = BytesMut::with_capacity(req1_head.len() + req1_tail.len());
-        prefix.extend_from_slice(req1_head);
-        prefix.extend_from_slice(req1_tail);
-
-        let mock_io = Builder::new().read(&rest).build();
-        let mut session = HttpSession::new(Box::new(mock_io));
-        session.set_pipelining_enabled(true);
-        session.set_pipelined_prefix(prefix);
-        session.read_request().await.unwrap();
-        assert_eq!(session.req_header().uri.path(), "/one");
-
-        let mut body = BytesMut::new();
-        while let Some(chunk) = session.read_body_bytes().await.unwrap() {
-            body.extend_from_slice(&chunk);
-        }
-        assert_eq!(body.as_ref(), b"a");
-
-        let reused = session.reuse().await.unwrap().expect("connection reusable");
-        let (stream, prefix) = reused.into_parts();
-        let prefix = prefix.expect("second request remains buffered");
-        assert_eq!(prefix.as_ref(), req2);
-
-        let mut next = HttpSession::new(stream);
-        next.set_pipelining_enabled(true);
-        next.set_pipelined_prefix(prefix);
-        next.read_request()
-            .await
-            .unwrap()
-            .expect("pipelined request must parse");
-        assert_eq!(next.req_header().uri.path(), "/two");
-    }
-
-    /// The URI-escape path detaches everything past the first CRLFCRLF, but httparse also
-    /// accepts bare LF line endings, so the real header can end earlier than that. The detached
-    /// suffix must be stitched back behind the leftover bytes, otherwise the queued request is
-    /// silently dropped (or, worse, mis-attributed) instead of being served.
-    #[tokio::test]
-    async fn escaped_uri_with_bare_lf_keeps_all_pipelined_bytes() {
-        init_log();
-        let req1 = b"GET /one?q=a b HTTP/1.1\nHost: pingora.org\n\n";
-        let req2 = b"GET /two HTTP/1.1\r\nHost: pingora.org\r\n\r\n";
-        let mut prefix = BytesMut::with_capacity(req1.len() + req2.len());
-        prefix.extend_from_slice(req1);
-        prefix.extend_from_slice(req2);
-
-        let mock_io = Builder::new().build();
-        let mut session = HttpSession::new(Box::new(mock_io));
-        session.set_pipelining_enabled(true);
-        session.set_pipelined_prefix(prefix);
-        session.read_request().await.unwrap();
-        assert_eq!(session.get_path(), b"/one?q=a%20b");
-
-        let reused = session.reuse().await.unwrap().expect("connection reusable");
-        let (stream, prefix) = reused.into_parts();
-        let prefix = prefix.expect("second request remains buffered");
-        assert_eq!(prefix.as_ref(), req2);
-
-        let mut next = HttpSession::new(stream);
-        next.set_pipelining_enabled(true);
-        next.set_pipelined_prefix(prefix);
-        next.read_request()
-            .await
-            .unwrap()
-            .expect("pipelined request must parse");
-        assert_eq!(next.req_header().uri.path(), "/two");
-    }
-
-    #[tokio::test]
-    async fn long_bodyless_pipeline_keeps_one_allocation() {
-        init_log();
-        const REQUESTS: usize = 256;
-        let requests: Vec<_> = (0..REQUESTS)
-            .map(|i| format!("GET /{i} HTTP/1.1\r\nHost: pingora.org\r\n\r\n"))
-            .collect();
-        let mut prefix = BytesMut::with_capacity(requests.iter().map(String::len).sum());
-        for request in &requests {
-            prefix.extend_from_slice(request.as_bytes());
-        }
-        let mut expected_ptr = prefix.as_ptr();
-        let mock_io = Builder::new().build();
-        let mut stream: Stream = Box::new(mock_io);
-
-        for (i, request) in requests.iter().enumerate() {
-            assert_eq!(prefix.as_ptr(), expected_ptr);
-            let mut session = HttpSession::new(stream);
-            session.set_pipelining_enabled(true);
-            session.set_pipelined_prefix(prefix);
-            session.read_request().await.unwrap();
-            assert_eq!(session.req_header().uri.path(), format!("/{i}"));
-
-            let reused = session.reuse().await.unwrap().expect("connection reusable");
-            let (next_stream, next_prefix) = reused.into_parts();
-            stream = next_stream;
-            expected_ptr = unsafe { expected_ptr.add(request.len()) };
-            prefix = next_prefix.unwrap_or_default();
-        }
-
-        assert!(prefix.is_empty());
-    }
-}
+#[cfg(test)]
+#[path = "server_test_early_body_buffer.rs"]
+mod test_early_body_buffer;
