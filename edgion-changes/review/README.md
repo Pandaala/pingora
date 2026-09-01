@@ -21,6 +21,9 @@ The `status` inside each record is authoritative.
   upstream's alpha `SavedBody -> InputBody` conversion erases capture state;
   the fork does not locally replace the public API and Edgion has no current
   pipe consumer.
+- [Composite H1 response transfer coding](http1/h1-response-composite-transfer-coding-h2.md):
+  upstream dechunks only the final coding before an H2 relay removes the
+  remaining metadata; the fork does not carry a local transfer-coding decoder.
 - [H2 CI enforcement](h2-grpc/h2-ci-contract-enforcement-out-of-scope.md)
   (`wont-fix` in the originating workflow): CI is a separate fork task and a
   blanket ban on ignored H2 tests is invalid.

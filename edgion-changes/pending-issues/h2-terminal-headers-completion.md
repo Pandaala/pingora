@@ -38,8 +38,9 @@ may validate the header block.
 ## Tracking references
 
 - Edgion audit finding: `H2-004-trailer-api-permanent-latch.md`.
-- Decoder prerequisite: `H2-001-decoder-trailer-validation.md`.
-- Sibling fork record: [h2-trailer-validation.md](h2-trailer-validation.md).
+- Decoder prerequisite: [h2-trailer-validation.md](h2-trailer-validation.md),
+  with the accepted ownership policy in
+  [`review/upstream-limitations.md`](../review/upstream-limitations.md).
 
 ## Upstream references
 
