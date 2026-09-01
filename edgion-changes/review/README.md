@@ -24,6 +24,9 @@ The `status` inside each record is authoritative.
 - [Composite H1 response transfer coding](http1/h1-response-composite-transfer-coding-h2.md):
   upstream dechunks only the final coding before an H2 relay removes the
   remaining metadata; the fork does not carry a local transfer-coding decoder.
+- [Aborted `MemCache` streaming fills](cache/memcache-aborted-fill-clean-eof.md):
+  sender closure without a successful terminal state is exposed as clean EOF
+  by the inherited test-only storage; Edgion does not enable response caching.
 - [H2 CI enforcement](h2-grpc/h2-ci-contract-enforcement-out-of-scope.md)
   (`wont-fix` in the originating workflow): CI is a separate fork task and a
   blanket ban on ignored H2 tests is invalid.
