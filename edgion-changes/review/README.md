@@ -88,6 +88,9 @@ The `status` inside each record is authoritative.
 - [Bounded response-head commit barrier design](response-head-commit-barrier-design.md):
   accepted Phase 4 v1 scope, state machine, ownership, budgets, deadlines,
   protocol/cache boundary, and delivery slices.
+- [Body relay architecture assessment](body-relay-architecture-assessment.md):
+  historical phases 1-4 design assessment; the accepted direction is fully
+  implemented and the canonical current flow lives in `architecture/`.
 - [Private protocol test extraction](test-module-extraction.md): twelve large
   H1/H2/proxy suites moved to behavior-grouped sibling modules without changing
   test identities, visibility, ignored coverage, or Cargo target topology.
@@ -104,9 +107,6 @@ The `status` inside each record is authoritative.
 
 ## Open review findings
 
-- [Body relay architecture assessment](body-relay-architecture-assessment.md):
-  adopt a thin semantic station with separate request/response lanes; keep
-  protocol pumps, entity-cache policy, and Edgion storage/AI policy outside it.
 - [2026-08-28 fork feature and malformed-input audit](fork-feature-malformed-input-audit-2026-08-28.md),
   including the discovery provenance for the resolved custom-upstream
   abandonment and idle-watch corrections.

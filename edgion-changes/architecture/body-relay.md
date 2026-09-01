@@ -10,10 +10,11 @@ including the optional bounded response-head commit barrier.
 Pingora `af9e1ac057c6` contains the generic phase 1-4 relay and response-head
 barrier mechanisms. Edgion `feature-08-30` at `f31d0169da97` contains the
 production consumer integration and selects the full Pingora commit from the
-fork's `edgion_v3` git source. The current Edgion worktree adds configuration-
-to-wire regression coverage and a shared test-only global-state lock; those
-uncommitted test changes do not alter the production architecture described
-here.
+fork's `edgion_v3` git source. The configuration-to-wire regression coverage
+and shared test-only global-state lock that were uncommitted during the
+2026-08-31 validation were later committed in Edgion `9830fb2a`. These are
+provenance facts, not a claim that an arbitrary current sibling checkout or
+lockfile has been revalidated; capture both revisions before relying on them.
 
 The architecture has two directional lanes rather than one universal relay:
 
@@ -646,7 +647,15 @@ Pingora:
 - `pingora-proxy/src/proxy_cache.rs`
 - `pingora-proxy/src/pump_termination.rs`
 - `pingora-proxy/src/proxy_common.rs`
-- `pingora-core/src/protocols/http/body_buffer.rs`
+- `pingora-core/src/protocols/http/body_buffer.rs` (compatibility facade and
+  `FixedBuffer`)
+- `pingora-core/src/protocols/http/request_body_buffer.rs` (registered-buffer
+  contract, state, and built-in implementation)
+- `pingora-core/src/protocols/http/v1/server_request_body_replay.rs`
+- `pingora-core/src/protocols/http/v2/server_request_body_replay.rs`
+- `pingora-core/src/protocols/http/v1/server.rs` and
+  `pingora-core/src/protocols/http/v2/server.rs` (session state and transport
+  capture/replay lifecycle)
 
 Edgion:
 
@@ -669,5 +678,5 @@ Edgion:
 - [Response-body streaming contract](../features/response-body-streaming.md)
 - [Response trailer contract](../features/response-trailers.md)
 - [Response processor ownership decision](../review/response-processor-driver-ownership.md)
-- [Remaining body-relay work](../pending-issues/body-relay-refactor.md)
+- [Historical body-relay refactor and closure record](../pending-issues/body-relay-refactor.md)
 - [Known upstream limitations](../review/upstream-limitations.md)

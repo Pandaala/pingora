@@ -1,5 +1,20 @@
 # Verification matrix
 
+## Live baseline gate
+
+Before treating any snapshot below as evidence for a current checkout, record
+all of the following separately:
+
+- Pingora `HEAD` and tracked worktree state;
+- sibling Edgion `HEAD` and tracked worktree state;
+- the Pingora source declared by Edgion's manifest; and
+- the exact Pingora revision resolved by Edgion's lockfile.
+
+A local path patch, nearby sibling checkout, old command result, or clean
+worktree does not prove which revision is locked or deployed. If the captured
+state differs from a snapshot, rerun the relevant commands and add a new dated
+snapshot instead of relabeling old evidence as current.
+
 ## Self-contained checks
 
 Run from the repository root:
@@ -81,9 +96,9 @@ audits should record a pre-change hash if byte-for-byte restoration matters.
 0.4.19. The dependency itself declares Rust 1.63, so raising the h2 minimum does
 not raise this workspace's Rust 1.85 MSRV.
 
-## Validation snapshot
+## Historical validation snapshots
 
-### Authoritative ws3 `feature-08-30` local-source run
+### 2026-08-31 ws3 `feature-08-30` local-source run
 
 The final ws3 consumer run on 2026-08-31 used Edgion
 `f31d0169da977853723c3d3e63a7ea5bf332e9ee` (`feature-08-30`) plus the
@@ -124,8 +139,9 @@ TinyUFO, and the remaining fork packages.
   `cargo check --workspace --all-targets --offline --locked` then passed with
   the normal git-pinned sources.
 
-The snapshots below are retained as historical migration evidence. This
-feature-08-30 ws3 run is authoritative for the current consumer worktree.
+The snapshots below are retained as historical migration evidence. This run is
+authoritative only for the revisions and worktree contents recorded above; it
+does not validate a later Pingora or Edgion checkout.
 
 ### Earlier ws3 `feature-06-24` migration run
 

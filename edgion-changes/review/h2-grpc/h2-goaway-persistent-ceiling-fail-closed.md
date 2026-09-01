@@ -1,7 +1,7 @@
 ---
 name: h2-goaway-persistent-ceiling-fail-closed
 description: Use when reviewing Pingora's upstream H2 END_STREAM wire observer around GOAWAY handling, stream eligibility after a connection teardown, or malformed/illegal GOAWAY frames.
-status: implemented-pending-project-checks
+status: fixed
 finding_id: H2-005
 closed: 2026-08-27
 ---
@@ -99,7 +99,7 @@ the surviving set.
 
 ## Regression coverage
 
-In `pingora-core/src/protocols/http/v2/end_stream_watch.rs`:
+In `pingora-core/src/protocols/http/v2/end_stream_watch_tests.rs`:
 
 - `final_contract_goaway_declared_lengths_zero_through_seven_poison_the_scanner`
   — declared lengths 0..=7 at every read split point, each followed by a later
@@ -115,6 +115,14 @@ In `pingora-core/src/protocols/http/v2/end_stream_watch.rs`:
   `goaway_keeps_streams_at_or_below_last_stream_id`,
   `goaway_last_stream_id_is_reassembled_and_masked`,
   `final_contract_eof_in_a_goaway_payload_poisons_the_scanner` (H2-002).
+
+## Closure evidence
+
+Implemented in Pingora `a4a255a`. Final project verification passed the watcher
+suite (54 passed, 8 intentionally ignored characterization cases),
+`pingora-proxy --lib` (194 passed, 2 ignored), and the focused H2 reset, stall,
+and cache/reuse targets (8, 4, and 8 passed). No H2-005-specific project check
+remains; see the [verification matrix](../../verification/test-matrix.md).
 
 ## Re-evaluation triggers
 

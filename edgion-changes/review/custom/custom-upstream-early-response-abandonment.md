@@ -112,136 +112,33 @@ The four shared-config integration targets used the documented temporary
 no-source-bind adaptation because this macOS host lacks the `127.0.0.2`
 loopback alias. The tracked configuration was restored unchanged afterward.
 
-## Third reopened review and closure evidence
+## Correction chronology
 
-A whole-stack review found that the writer-rejection regression test treated
-request-body `Data` hook count as writer-attempt count. H1 may legitimately
-produce an empty `Data` callback, which reaches the hook before the custom pump
-skips the empty writer call. The test now asserts the invariant directly — one
-final `Abandoned`, no other terminal event — and records the real writer attempt
-separately. The same review also synchronized the custom server trait's idle
-contract with the `ServerSession` wrapper documentation.
+- The initial closure at Pingora `849adea` used a logging deadline as evidence.
+  A deeper review showed that this was not deterministic, so the custom-message
+  fixture was changed to observe polling directly and to order the terminal
+  response before its linger.
+- A broad `is_reading()` guard stopped the unwanted post-response body poll,
+  but also removed intentional idle watching after natural completion and for
+  initially bodyless requests. The corrected local `can_poll()` latch retained
+  idle monitoring without reopening body polling after `Abandoned`.
+- The first corrected test treated request-body `Data` callback count as the
+  number of writer attempts. H1 may emit a legal empty `Data` callback that the
+  custom pump suppresses before the writer, so writer attempts gained a separate
+  observation.
+- The final correction at Pingora `ff5f045` plus `45d8375` moved all
+  lifecycle cases to one terminal-event helper. It requires exactly one final
+  event of the expected kind and permits only `Data` before it, while allowing
+  parser-dependent H1 `Data` cardinality. The formerly flaky H1
+  early-response and completed-upload controls passed 30 consecutive runs,
+  writer rejection passed 20, and the 50-case custom harness plus the project
+  matrix passed.
 
-A fresh read-only subagent returned LGTM after checking assertion soundness,
-writer-attempt isolation, idle-contract consistency, and the unchanged
-production state machine. The previously flaky test passed 20 consecutive
-runs, and the full 50-case custom harness passed.
-
-Repository checks passed on 2026-08-28 at Pingora `ff5f045` plus the working
-tree correction:
-
-- `cargo fmt --all -- --check` and `git diff --check`;
-- both required `cargo check` configurations;
-- `pingora-core --lib`: 721 passed, 17 ignored;
-- `pingora-core --lib --features connection_filter`: 726 passed, 17 ignored;
-- the boringssl PROXY-before-TLS filter: 2 passed;
-- `pingora-proxy --lib`: 114 passed;
-- `test_request_body_seam`: 54 passed;
-- `test_upstream_response_body_sink`: 50 passed;
-- `test_terminal_body_dispatch`: 9 passed;
-- `test_h2_upstream_no_error_reset`: 8 passed;
-- `test_h2_upstream_stalled_after_response`: 3 passed; and
-- `test_h2_upstream_cache_and_reuse`: 7 passed.
-
-As documented in the project matrix, the four shared-config integration
-targets used a temporary no-source-bind configuration because this macOS host
-lacks the `127.0.0.2` loopback alias. The tracked configuration was restored
-unchanged afterward.
-
-## Superseded second reopened closure evidence
-
-A later two-subagent review found that guarding the whole arm with
-`is_reading()` also removed the intentional downstream idle watcher after
-natural `Complete` or an initially bodyless request. The local-latch correction
-restores that watcher without reopening body polling after `Abandoned`.
-
-The custom-to-custom negative assertion now observes post-response poll calls,
-not a logging deadline. Against the overbroad guard, the reliable failure is an
-extra body poll; lifecycle timing is not used as deterministic evidence.
-
-A fresh read-only subagent reviewed the final state, including select races,
-natural completion, bodyless requests, abandonment, successful custom idle
-returns, writer errors, upgrades, cache fill, custom-message lifetime, H1 FIN,
-H2 reset, and test isolation, then returned LGTM. Reverse validation also
-confirmed that both new idle-watch tests fail with the overbroad `is_reading()`
-guard and pass with the corrected `can_poll()` plus local latch.
-
-Repository checks passed on 2026-08-28 at Pingora `ff5f045` plus the working
-tree fix:
-
-- `cargo fmt --all -- --check` and `git diff --check`;
-- both required `cargo check` configurations;
-- `pingora-core --lib`: 721 passed, 17 ignored;
-- `pingora-core --lib --features connection_filter`: 726 passed, 17 ignored;
-- the boringssl PROXY-before-TLS filter: 2 passed;
-- `pingora-proxy --lib`: 114 passed;
-- `test_request_body_seam`: 54 passed;
-- `test_upstream_response_body_sink`: 50 passed;
-- `test_terminal_body_dispatch`: 9 passed;
-- `test_h2_upstream_no_error_reset`: 8 passed;
-- `test_h2_upstream_stalled_after_response`: 3 passed; and
-- `test_h2_upstream_cache_and_reuse`: 7 passed.
-
-On macOS, the exact shared configuration first reproduced the documented
-`127.0.0.2` loopback-alias prerequisite as `EADDRNOTAVAIL`. The four affected
-integration targets passed after temporarily removing only that source-bind;
-the tracked configuration was restored unchanged afterward.
-
-## Superseded first reopened closure evidence
-
-A deeper independent review invalidated the initial closure evidence: the H1
-and H2 downstream tests could not exercise the broader `can_poll()` behavior
-of a custom downstream. Its original closure description incorrectly treated a
-one-second logging deadline as deterministic; the corrected evidence above
-uses direct out-of-band poll observation.
-
-Fresh independent review initially found a low-risk timing window in the new
-fixture. The custom-message stream was changed to wait deterministically for
-the terminal response before its 100ms linger; the reviewer then returned
-LGTM after checking the latest code and running the focused case five times.
-
-Repository checks passed on 2026-08-28 at Pingora `849adea` plus the working
-tree fix:
-
-- `cargo fmt --all -- --check` and `git diff --check`;
-- both required `cargo check` configurations;
-- `pingora-core --lib`: 721 passed, 17 ignored;
-- `pingora-core --lib --features connection_filter`: 726 passed, 17 ignored;
-- the boringssl PROXY-before-TLS filter: 2 passed;
-- `pingora-proxy --lib`: 114 passed;
-- `test_request_body_seam`: 54 passed;
-- `test_upstream_response_body_sink`: 48 passed;
-- `test_terminal_body_dispatch`: 9 passed in the required isolated rerun after
-  a parallel fixed-port collision;
-- `test_h2_upstream_no_error_reset`: 8 passed;
-- `test_h2_upstream_stalled_after_response`: 3 passed; and
-- `test_h2_upstream_cache_and_reuse`: 7 passed.
-
-The separately owned writer error propagation issue is resolved in
-[`custom-writer-error-context.md`](custom-writer-error-context.md); it was not
-part of this terminal-latch correction.
-
-## Superseded initial closure evidence
-
-Independent review: LGTM, with all helper callers, state transitions, writer
-failure paths, custom-message cleanup, and H1/H2 reuse semantics checked.
-
-Repository checks passed on 2026-08-28 at Pingora `849adea` plus the working
-tree fix:
-
-- `cargo fmt --all -- --check` and `git diff --check`;
-- both required `cargo check` configurations;
-- `pingora-core --lib`: 721 passed, 17 ignored;
-- `pingora-core --lib --features connection_filter`: 726 passed, 17 ignored;
-- the boringssl PROXY-before-TLS filter: 2 passed;
-- `pingora-proxy --lib`: 114 passed;
-- `test_request_body_seam`: 54 passed;
-- `test_upstream_response_body_sink`: 47 passed;
-- `test_terminal_body_dispatch`: 9 passed;
-- `test_h2_upstream_no_error_reset`: 8 passed;
-- `test_h2_upstream_stalled_after_response`: 3 passed; and
-- `test_h2_upstream_cache_and_reuse`: 7 passed.
-
+The fourth-review matrix above is the canonical closure evidence. Earlier full
+matrices were superseded by these corrections and are intentionally not
+repeated. The separately owned writer-root-cause preservation fix was committed
+as Pingora `4dd9ce2` and remains documented in
+[custom-writer-error-context.md](custom-writer-error-context.md).
 ## Revisit triggers
 
 - The custom pump gains support for request-body `Terminate`, non-`Ordinary`

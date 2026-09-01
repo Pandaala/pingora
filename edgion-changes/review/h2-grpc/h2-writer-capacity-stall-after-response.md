@@ -1,7 +1,7 @@
 ---
 name: h2-writer-capacity-stall-after-response
 description: Use when reviewing Pingora's h2 upstream request-body pump around a write blocked on flow control, a `write_timeout` that fires after the origin answered, or any claim that a stalled upload should fail the exchange.
-status: implemented-pending-project-checks
+status: fixed
 finding_id: H2-007
 closed: 2026-08-27
 ---
@@ -123,6 +123,14 @@ apply).
 - "Default `peer.options.write_timeout` to a non-`None` value instead" —
   changes a public default for every write, including those with no wire
   evidence, and still produces the 502 this decision rejects.
+
+## Closure evidence
+
+Implemented in Pingora `0dc2714`. Final project verification passed
+`pingora-proxy --lib` (194 passed, 2 ignored), the watcher suite (54 passed,
+8 intentionally ignored characterization cases), and the focused H2 reset,
+stall, and cache/reuse targets (8, 4, and 8 passed). No H2-007-specific project
+check remains; see the [verification matrix](../../verification/test-matrix.md).
 
 ## Re-evaluation triggers
 

@@ -123,22 +123,24 @@ The merged implementation intentionally differs from that source patch:
   the existing fork contract by delegating that terminal event to legacy body
   filters with `end_of_stream = true`.
 
-## Edgion consumer handoff
+## Historical Edgion consumer handoff
 
-The inspected Edgion checkout is commit
-`83408c11dedb81eab8504d85edfb0fcc061c9e7f`. Its committed lockfile still
-selects Pingora `57f6183c...`; the ws4 ExtProc worktree contains uncommitted
-consumers of all typed hooks and `response_trailers_supported`. After this
-Pingora work is committed, Edgion must pin the complete Pingora dependency
-family to one immutable merged revision, remove temporary path patches,
-regenerate `Cargo.lock`, and run its source-policy guard plus the ExtProc unit
-and official-Go integration suites.
+The original migration inspection used Edgion
+`83408c11dedb81eab8504d85edfb0fcc061c9e7f`, whose committed lockfile selected
+Pingora `57f6183c...`, plus an uncommitted ws4 ExtProc worktree. An isolated
+copy compiled against the then-current Pingora worktree with
+`cargo check -p edgion-gateway --lib`, demonstrating that the typed trailer
+consumer contract compiled at that historical boundary.
 
-An isolated copy of that uncommitted Edgion worktree was compiled against this
-working tree with `cargo check -p edgion-gateway --lib`; the ExtProc trailer
-consumer contract compiled successfully. Reaching that check also exposed
-three independent baseline-migration items that must be carried by Edgion, not
-this Pingora feature:
+This is no longer an action list for the current consumer. Edgion later
+committed the production relay integration as `f31d0169da97`, and its recorded
+2026-08-31 lock selected Pingora `af9e1ac057c6`. Before making a current claim,
+capture the live Edgion `HEAD`, tracked worktree state, manifest source, and
+lock-resolved Pingora revision as required by the
+[verification matrix](../verification/test-matrix.md).
+
+The historical check exposed three independent migration items owned by
+Edgion rather than this Pingora feature:
 
 - this branch publishes the Pingora family as `0.8.0`, while the old Edgion
   lock selects `0.8.1`; Edgion must update the whole family atomically;
@@ -150,7 +152,7 @@ this Pingora feature:
   `ResponseHeader.status`; the isolated check changed that one line to
   `ResponseHeader::set_status`. This is unrelated to ExtProc trailers.
 
-The Rustls-only check additionally reaches an existing Edgion conditional-
+The Rustls-only check additionally reached an existing Edgion conditional-
 compilation problem in `header_cert_auth`, whose imports assume the BoringSSL
 TLS facade. No files or lock entries in the ws4 Edgion worktree were changed by
 this validation.

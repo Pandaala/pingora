@@ -1,8 +1,9 @@
 ---
 name: h2-end-stream-observer-read-terminal-poison
 description: Use when reviewing Pingora's upstream H2 END_STREAM wire observer around read errors, partial EOF, or evidence publication before a complete DATA frame reaches h2.
-status: implemented-pending-project-checks
+status: fixed
 finding_id: H2-002
+closed: 2026-08-28
 ---
 
 # H2 END_STREAM observer read terminal poison
@@ -57,6 +58,14 @@ The EOF tests cover every incomplete frame-header split, every incomplete
 GOAWAY payload position, plain terminal DATA payload splits, and padding-only
 terminal DATA after an already delivered body. Every case also verifies that a
 later registration cannot publish evidence.
+
+## Closure evidence
+
+Implemented in Pingora `a0ada7a`. Final project verification passed the watcher
+suite (54 passed, 8 intentionally ignored characterization cases),
+`pingora-proxy --lib` (194 passed, 2 ignored), and the focused H2 reset, stall,
+and cache/reuse targets (8, 4, and 8 passed). No H2-002-specific project check
+remains; see the [verification matrix](../../verification/test-matrix.md).
 
 ## Historical note
 

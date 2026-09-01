@@ -1,7 +1,7 @@
 ---
 name: h2-local-reset-invalidates-shared-evidence
 description: Use when reviewing Pingora's upstream H2 END_STREAM wire observer around locally reset streams, RST_STREAM ordering, or whether dropping a pending-map entry is enough to withdraw wire evidence.
-status: implemented-pending-project-checks
+status: fixed
 finding_id: H2-006
 closed: 2026-08-27
 ---
@@ -88,6 +88,14 @@ The middle three pin the flag gate independently of the map removal, so
 re-introducing "removal is enough" fails them. The call-site ORDERING is not
 covered by an executable test — it is inherently a race window — and is held by
 the `note_local_reset` contract comment plus this entry.
+
+## Closure evidence
+
+Implemented in Pingora `a4a255a`. Final project verification passed the watcher
+suite (54 passed, 8 intentionally ignored characterization cases),
+`pingora-proxy --lib` (194 passed, 2 ignored), and the focused H2 reset, stall,
+and cache/reuse targets (8, 4, and 8 passed). No H2-006-specific project check
+remains; see the [verification matrix](../../verification/test-matrix.md).
 
 ## Provenance
 

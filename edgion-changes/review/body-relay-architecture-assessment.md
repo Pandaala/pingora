@@ -3,11 +3,13 @@
 ## Status and baseline
 
 Architecture assessment completed on 2026-08-30. The recommendation is an
-accepted design direction. Its first behavior-preserving request-event
-extraction, request-scoped relay plan, and Edgion response-processor ownership
-are now implemented; bounded head commit is not. The canonical current flow,
+accepted and fully implemented design direction: request-event extraction,
+the request-scoped relay plan, Edgion response-processor ownership, and the
+bounded response-head commit barrier are complete. This file is a historical
+assessment, not an actionable-work owner. The canonical current flow,
 ownership, and invariant matrix is
-[`architecture/body-relay.md`](../architecture/body-relay.md). The remaining actionable work is tracked by
+[`architecture/body-relay.md`](../architecture/body-relay.md); implementation
+and closure history is retained in
 [`pending-issues/body-relay-refactor.md`](../pending-issues/body-relay-refactor.md).
 
 The “Current architecture” sections below preserve the assessment-time
@@ -538,9 +540,9 @@ stable tests and measurements.
    intentionally remains Edgion-owned: moving it into Pingora now would require
    unrelated pump outcome plumbing because downstream writes and logging occur
    outside `ResponsePipelineState`.
-6. **Add bounded response-head commit.** Implement only with independent hard
-   limits, deterministic failure policy, cache tests, and H1/H2/custom behavior
-   defined explicitly.
+6. **Add bounded response-head commit (implemented).** The completed barrier
+   has independent hard limits, deterministic failure policy, cache tests, and
+   explicit H1/H2/custom behavior.
 7. **Delete redundant latches and hooks.** Do this last, after executable
    equivalence and Edgion integration evidence.
 
@@ -549,7 +551,7 @@ record explicitly names a contract change.
 
 ## Required invariants and test matrix
 
-The relay work is incomplete until tests cover:
+The relay closure matrix covered:
 
 - downstream H1/H2/custom and upstream H1/H2/custom combinations;
 - pass-through, complete request capture/replay, streamed request mutation, and

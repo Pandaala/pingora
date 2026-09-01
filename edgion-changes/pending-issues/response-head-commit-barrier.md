@@ -16,8 +16,10 @@ Ownership: cross-repository.
 
 Implementation provenance: Pingora
 `af9e1ac057c6ed454b5348beb34e14df1d435410`; Edgion baseline
-`f31d0169da977853723c3d3e63a7ea5bf332e9ee` on `feature-08-30`, plus
-uncommitted configuration-to-wire regression coverage.
+`f31d0169da977853723c3d3e63a7ea5bf332e9ee` on `feature-08-30`. The
+configuration-to-wire regression coverage that was uncommitted during closure
+was later committed in Edgion `9830fb2a`. A later sibling checkout must be
+captured and validated separately.
 
 ## Canonical records
 
@@ -114,8 +116,9 @@ cache-hit Hold, multiple claimants, and fail-open Hold remain unsupported.
 These entries describe the verified cross-repository architecture. Pingora
 `af9e1ac057c6ed454b5348beb34e14df1d435410` contains the generic mechanism;
 Edgion `f31d0169da977853723c3d3e63a7ea5bf332e9ee` contains the production
-consumer integration. The remaining Edgion worktree delta strengthens tests
-and documentation rather than completing a missing production mechanism.
+consumer integration. The Edgion worktree delta present at closure time
+strengthened tests and documentation rather than completing a missing
+production mechanism; it was subsequently committed as `9830fb2a`.
 
 ## Current local implementation map
 

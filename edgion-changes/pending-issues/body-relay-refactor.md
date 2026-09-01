@@ -2,11 +2,11 @@
 
 ## Status
 
-Completed parent refactor for phases 1-3. The bounded response-head commit work
-has been split into
+Completed parent refactor for phases 1-3; the overall relay program reached
+phase 4 through the separately owned bounded response-head commit work in
 [`response-head-commit-barrier.md`](response-head-commit-barrier.md) with an
-independently reviewed design. This record retains migration history and phase
-1-3 evidence; it no longer owns actionable work.
+independently reviewed design and is now resolved. This record retains
+migration and closure history; it no longer owns actionable work.
 
 Origin: body buffering/streaming architecture assessment on 2026-08-30.
 Baseline: Pingora `44dbef281584f6ef4412fd44eea07dd56c5ae630` and Edgion
@@ -38,7 +38,8 @@ are canonicalized in
 The original rationale, rejected alternatives, target boundary, and migration
 history are retained in
 [`review/body-relay-architecture-assessment.md`](../review/body-relay-architecture-assessment.md).
-The linked Phase 4 pending record owns remaining action and closure status.
+The linked Phase 4 record owns its completed implementation and closure
+history.
 
 ## Completed phase 1
 
@@ -166,11 +167,11 @@ suite at 3301 passed / 2 ignored.
 
 ## Phase 4 handoff
 
-The bounded response-head commit barrier is now a separate change with an
-accepted design and action record:
+The bounded response-head commit barrier was delivered as a separate change
+with an accepted design and resolved implementation record:
 
 - [design](../review/response-head-commit-barrier-design.md)
-- [implementation pending](response-head-commit-barrier.md)
+- [implementation and closure](response-head-commit-barrier.md)
 
 ## Required closure evidence
 
@@ -190,9 +191,9 @@ accepted design and action record:
 - The assessment is updated if implementation evidence changes its boundary or
   migration order.
 
-Completing phases 1-3 did not close the response-head barrier. Its concrete API,
-acceptance tests, and remaining work now live in the linked Phase 4 design and
-pending records above.
+Phase 4 is closed. Its concrete API and acceptance evidence live in the linked
+feature, design, and closure records; this historical parent record carries no
+remaining action.
 
 ## Revisit triggers
 

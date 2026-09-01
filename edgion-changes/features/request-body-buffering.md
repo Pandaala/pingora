@@ -62,10 +62,16 @@ replay. See the
 
 ## Implementation concentration
 
-- `pingora-core/src/protocols/http/request_body_buffer.rs`: buffer contract and built-in implementation.
+- `pingora-core/src/protocols/http/body_buffer.rs`: compatibility facade and
+  `FixedBuffer`.
+- `pingora-core/src/protocols/http/request_body_buffer.rs`: registered-buffer
+  contract, state, and built-in implementation.
 - `pingora-core/src/protocols/http/server.rs`: protocol-neutral session API.
-- `pingora-core/src/protocols/http/v1/server.rs`: capture, replay and lifecycle.
-- `pingora-core/src/protocols/http/v2/server.rs`: H2 capture, replay and lifecycle.
+- `pingora-core/src/protocols/http/v1/server_request_body_replay.rs` and
+  `v2/server_request_body_replay.rs`: registration, freeze, readiness, and
+  replay-activation APIs.
+- `pingora-core/src/protocols/http/v1/server.rs` and `v2/server.rs`: session
+  fields plus transport capture, poison, drain, release, and replay reads.
 - `pingora-proxy/src/proxy_h1.rs` and `proxy_h2.rs`: rewind before each attempt.
 
 ## Tests
