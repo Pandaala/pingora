@@ -103,6 +103,8 @@ This phase is triggered after an upstream response header/body/trailer is receiv
 
 This phase is to modify or process response headers, body, or trailers before sending to downstream. Note that this phase is called _prior_ to HTTP caching and therefore any changes made here will affect the response stored in the HTTP cache.
 
+`upstream_response_header_filter_event()` exposes whether the final response header ended the stream. `upstream_response_body_filter_event()` exposes typed data, pre-trailer terminal, and trailer-free terminal events. For a trailered response, the typed terminal event runs first, followed by the awaited trailer filter, then downstream filters and writing. The response remains chunk-streamed throughout these callbacks.
+
 ### `response_filter()/response_body_filter()/response_trailer_filter()`
 This phase is triggered after a response header/body/trailer is ready to send to downstream.
 

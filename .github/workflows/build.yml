@@ -86,6 +86,12 @@ jobs:
         if: matrix.toolchain != '1.85.0'
         run: cargo test --verbose --lib --bins --tests --no-fail-fast
 
+      - name: Run Edgion fork-critical tests explicitly
+        if: matrix.toolchain == '1.97.1'
+        run: |
+          cargo test -p pingora-core --lib --features boringssl test_listen_tls_proxy_protocol
+          cargo test -p pingora-proxy --test test_h2_upstream_stalled_after_response
+
       # Need to run doc tests separately.
       # (https://github.com/rust-lang/cargo/issues/6669)
       - name: Run cargo doc test
