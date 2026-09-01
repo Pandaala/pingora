@@ -28,14 +28,14 @@ use pingora_timeout::timeout;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::ready;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 use crate::protocols::http::authority::{
     has_ambiguous_port_suffix, raw_target_authority, validate_request_authority_fields,
     RawTargetAuthority,
 };
-use crate::protocols::http::body_buffer::FixedBuffer;
+use crate::protocols::http::body_buffer::{FixedBuffer, RegisteredRequestBodyBuffer};
 use crate::protocols::http::date::get_cached_date;
 use crate::protocols::http::v1::client::{
     http_req_header_to_wire, request_target_has_forbidden_byte,
@@ -45,8 +45,23 @@ use crate::protocols::http::HttpTask;
 use crate::protocols::{Digest, SocketAddr, Stream};
 use crate::server::ShutdownWatch;
 use crate::{Error, ErrorType, OrErr, Result};
+#[path = "server_request_body_replay.rs"]
+mod request_body_replay;
 
 const BODY_BUF_LIMIT: usize = 1024 * 64;
+
+/// The default downstream request-body read timeout, matching the HTTP/1
+/// server session's own default (`v1::server::HttpSession::new`).
+///
+/// A default is what makes the bound real: nothing in `pingora-core` or
+/// `pingora-proxy` calls [`HttpSession::set_read_timeout`], so an opt-in bound
+/// would leave every consumer that does not set one -- including pingora's own
+/// server apps -- with an unbounded H2 body read, while the same application
+/// over HTTP/1 is protected. Applications with legitimately idle uploads
+/// (long-idle client-streaming gRPC) raise or clear it per request with
+/// [`HttpSession::set_read_timeout`]; CONNECT tunnels are exempt by
+/// construction, see [`HttpSession::body_read_timeout`].
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 type H2Connection<S> = server::Connection<S, Bytes>;
 
@@ -266,10 +281,62 @@ impl Future for Idle<'_> {
     }
 }
 
+/// Whether an `h2` error observed *after* the request body already reached EOF
+/// is a benign way for the client to end the stream rather than a read failure.
+///
+/// The request is complete at this point, so none of these mean the bytes we
+/// read are suspect:
+/// - GOAWAY with `NO_ERROR`: graceful connection shutdown.
+/// - RST_STREAM with `NO_ERROR`: RFC 9113 §8.1's "stop sending the request
+///   body without breaking the response" signal, sent by a client that has
+///   already finished its body.
+/// - RST_STREAM with `CANCEL`: the client no longer wants the response (a
+///   browser navigating away is the common case). Surfacing it as a read error
+///   would fail the request AND -- because both proxy pumps convert it with
+///   `into_down()` -- close and re-dial an otherwise healthy pooled upstream
+///   connection, once per client cancel. The upstream request has already been
+///   sent by the time this runs, so nothing is saved by failing hard here; a
+///   later write to the cancelled stream still fails and is classified on its
+///   own merits.
+///
+/// Mirrors the client-side classification in
+/// [`crate::protocols::http::v2::client::Http2Session::read_trailers`].
+fn benign_post_eof_stream_end(e: &h2::Error) -> bool {
+    (e.is_go_away() || e.is_reset())
+        && e.is_remote()
+        && matches!(
+            e.reason(),
+            Some(h2::Reason::NO_ERROR) | Some(h2::Reason::CANCEL)
+        )
+}
+
+/// The non-zero `content-length` a message declares, if any.
+///
+/// `0` is deliberately mapped to `None`: on HTTP/2 `content-length: 0` promises
+/// zero DATA payload bytes but says nothing about END_STREAM, so a request that
+/// declares it may still legitimately close its stream later (design 4.3). Were
+/// it treated as "fully received" the moment the message is created, every such
+/// request would be classified as complete before the transport ever said so,
+/// which is exactly the distinction the rest of this module preserves.
+pub(crate) fn declared_body_length(headers: &http::HeaderMap) -> Option<usize> {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        // Digits only, staying at least as strict as h2's own `parse_u64`,
+        // which rejects `+5` and surrounding whitespace and kills such a stream
+        // with PROTOCOL_ERROR before it reaches here. `usize::parse` is laxer,
+        // so reject any non-digit byte first. An empty value has no digits and
+        // yields `None`, exactly as before.
+        .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|len| *len > 0)
+}
+
 /// HTTP/2 server session
 pub struct HttpSession {
     request_header: RequestHeader,
     request_body_reader: RecvStream,
+    request_headers_end_stream: bool,
     send_response: SendResponse<Bytes>,
     send_response_body: Option<SendStream<Bytes>>,
     // Remember what has been written
@@ -283,12 +350,82 @@ pub struct HttpSession {
     body_sent: usize,
     // buffered request body for retry logic
     retry_buffer: Option<FixedBuffer>,
+    // early body capture hook for upstream replay
+    early_body_buffer: Option<RegisteredRequestBodyBuffer>,
+    // Set right before awaiting an `early_body_buffer` capture/finish and cleared
+    // once the await returns Ok. A body-read future dropped mid-await
+    // (select!/timeout cancellation) leaves it set: the chunk was already
+    // consumed from the stream, so the buffered body is incomplete and any
+    // further body read or replay must fail closed.
+    early_body_capture_poisoned: bool,
+    // Set when `drain_request_body` discards a registered `early_body_buffer`.
+    // The body bytes are gone from both the stream and the buffer, so a later
+    // replay attempt must fail closed instead of silently forwarding a bodyless
+    // request upstream.
+    early_body_buffer_discarded: bool,
+    // Set when the session drops a captured or fully replayed `early_body_buffer`
+    // after the response was committed downstream (no further retry is possible then).
+    // A later replay attempt indicates a broken retry decision upstream of this
+    // session and must fail closed instead of silently forwarding a bodyless
+    // request.
+    early_body_buffer_released: bool,
+    /// Prevent request-body source changes after the proxy freezes its
+    /// request-scoped relay plan.
+    request_body_configuration_frozen: bool,
+    // Whether actual request trailer fields were received. Set once the
+    // request body reader reaches EOF and its trailers are polled.
+    request_trailers_present: bool,
+    // Latched once the TRANSPORT said the request body ended: END_STREAM on the
+    // HEADERS frame, or `RecvStream::is_end_stream()` observed at any body poll.
+    //
+    // It is latched rather than recomputed so the accepted-header fact and a
+    // clean body poll remain monotonic across later errors and dependency
+    // state-machine changes. Supported h2 0.4.19 preserves received END_STREAM
+    // across reset, but Pingora's request-body contract does not depend on that
+    // private representation.
+    request_body_eof: bool,
+    // Source (iii) of the same end-of-body proof: a declared `content-length`
+    // that has been fully received. Stored as the declared length (only when
+    // non-zero, see `request_body_length_satisfied`) and compared against
+    // `body_read`.
+    //
+    // This independently proves a fixed-length request once every declared
+    // byte was delivered, including natural DATA(END_STREAM)-then-reset
+    // orderings.
+    request_body_declared_len: Option<usize>,
+    // Whether `trailers()` has already been awaited for this request. The
+    // post-EOF branch of `read_body_bytes()` can be reached more than once
+    // (e.g. an idling pump keeps polling); re-awaiting would report `None`
+    // the second time and clear an already-established trailer fact.
+    trailers_polled: bool,
     // digest to record underlying connection info
     digest: Arc<Digest>,
     /// The write timeout which will be applied to writing response body.
     /// The timeout is reset on every write. This is not a timeout on the overall duration of the
     /// response.
     pub write_timeout: Option<Duration>,
+    // The read timeout applied to each downstream request-body read. The
+    // timeout is reset on every received chunk, so it bounds a stalled upload
+    // without limiting the overall duration of a progressing one (the same
+    // per-read semantics as the HTTP/1 `read_timeout`).
+    read_timeout: Option<Duration>,
+    // Absolute deadline of the CURRENT request-body read, i.e. "the client has
+    // been silent since this instant plus `read_timeout`".
+    //
+    // The bound is a DEADLINE and not a per-call duration on purpose. Every
+    // caller of `read_body_bytes` in this repo polls it from a `tokio::select!`
+    // branch (see `proxy_h1::bidirection_1to2` / `proxy_h2::bidirection_down_to_up`),
+    // where any OTHER branch becoming ready -- an upstream response chunk, a
+    // cache task, a custom message -- completes the select and DROPS this
+    // future. A duration recomputed per call would restart from zero on the
+    // next loop iteration, so a client that stalls forever against an upstream
+    // that speaks even once per timeout period would never be released: the
+    // exact DoS this bound exists to close. Carrying the deadline on the
+    // session makes cancellation unable to rearm it.
+    //
+    // Cleared ONLY by transport progress (a non-empty DATA payload, or
+    // END_STREAM), never by a cancelled read. See `read_body_bytes`.
+    read_deadline: Option<Instant>,
     // How long to wait when draining (discarding) request body
     total_drain_timeout: Option<Duration>,
 }
@@ -363,6 +500,35 @@ fn invalid_request_authority(request: &RequestHeader) -> bool {
         }
     }
 }
+
+// The replay tests below predate `H2Accept` and only create valid requests.
+// Keep their focus on body-state behavior while still exercising the current
+// accept API; an unexpected rejected stream fails loudly instead of being
+// treated as a session.
+#[cfg(test)]
+impl std::ops::Deref for H2Accept {
+    type Target = HttpSession;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Session(session) => session,
+            Self::Rejected => panic!("test request was unexpectedly rejected"),
+        }
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for H2Accept {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Session(session) => session,
+            Self::Rejected => panic!("test request was unexpectedly rejected"),
+        }
+    }
+}
+
+#[cfg(test)]
+use self::invalid_request_authority as authority_host_mismatch;
 
 fn account_malformed_stream(malformed_streams: &mut usize) -> Result<()> {
     *malformed_streams += 1;
@@ -439,6 +605,8 @@ impl HttpSession {
         };
 
         let (request_header, request_body_reader) = req.into_parts();
+        let request_headers_end_stream = request_body_reader.is_end_stream();
+        let request_body_declared_len = declared_body_length(&request_header.headers);
         let request_header: RequestHeader = request_header.into();
 
         // Depending on how the request URI is parsed, control bytes
@@ -496,8 +664,20 @@ impl HttpSession {
             body_read: 0,
             body_sent: 0,
             retry_buffer: None,
+            early_body_buffer: None,
+            early_body_capture_poisoned: false,
+            early_body_buffer_discarded: false,
+            early_body_buffer_released: false,
+            request_body_configuration_frozen: false,
+            request_trailers_present: false,
+            request_headers_end_stream,
+            request_body_eof: request_headers_end_stream,
+            request_body_declared_len,
+            trailers_polled: false,
             digest,
             write_timeout: None,
+            read_timeout: Some(DEFAULT_READ_TIMEOUT),
+            read_deadline: None,
             total_drain_timeout: None,
         })))
     }
@@ -518,31 +698,231 @@ impl HttpSession {
         &mut self.request_header
     }
 
+    /// Whether the request body is provably complete, from ANY source the peer
+    /// cannot retract.
+    ///
+    /// This is the guard on treating a stream end as benign rather than as a
+    /// truncated read, and it is deliberately broader than
+    /// [`Self::is_body_done`]:
+    /// - (i) END_STREAM on the HEADERS frame and (ii) `is_end_stream()` observed
+    ///   at a body poll are both latched into `request_body_eof`;
+    /// - (iii) a declared, non-zero `content-length` whose bytes have all been
+    ///   read is computed here.
+    ///
+    /// Source (iii) is what covers the natural wire ordering -- peer writes
+    /// DATA(END_STREAM) then RST_STREAM, and we poll only afterwards -- in which
+    /// `h2` hands over the final chunk with the END_STREAM evidence already
+    /// overwritten by the reset, so (i) and (ii) can never fire.
+    ///
+    /// RESIDUAL GAP, deliberate and load-bearing: a request that declares NO
+    /// `content-length` (or declares `content-length: 0`) and whose peer resets
+    /// the stream before we poll the final DATA frame has no surviving proof
+    /// that its body is whole, so the reset still surfaces as a read error. That
+    /// is the correct failure direction -- the alternative would be to guess,
+    /// and a wrong guess forwards a TRUNCATED request body upstream as if it
+    /// were complete. Do NOT "fix" this by dropping the guard and classifying
+    /// every benign-looking reset as EOF; the negative-direction tests
+    /// (`test_mid_body_reset_is_still_a_read_error`) exist to keep that from
+    /// happening quietly.
+    fn request_body_complete(&self) -> bool {
+        self.request_body_eof
+            || self
+                .request_body_declared_len
+                .is_some_and(|len| self.body_read >= len)
+    }
+
+    /// The idle bound that applies to the next request-body chunk read, or
+    /// `None` when this session's body reads are deliberately unbounded.
+    ///
+    /// CONNECT is exempt. For a tunnel the "request body" IS the client-to-peer
+    /// uplink, and a long idle period on it is ordinary rather than abusive: an
+    /// idle SSH session, or a WebSocket over extended CONNECT (RFC 8441, which
+    /// also uses `:method = CONNECT`, so this one check covers both) whose
+    /// traffic happens to run server-to-client only. Applying the bound would
+    /// tear such tunnels down at exactly the moment they are behaving
+    /// correctly. The same check guards the request-body buffer registrations
+    /// below.
+    fn body_read_timeout(&self) -> Option<Duration> {
+        if self.request_header.method == http::Method::CONNECT {
+            return None;
+        }
+        self.read_timeout
+    }
+
     /// Read request body bytes. `None` when there is no more body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
-        // TODO: timeout
-        let data = self.request_body_reader.data().await.transpose().or_err(
-            ErrorType::ReadError,
-            "while reading downstream request body",
-        )?;
+        if self.early_body_capture_poisoned {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                "request body capture failed or was cancelled mid-chunk; buffered body is incomplete",
+            );
+        }
+        let polled = match self.body_read_timeout() {
+            Some(t) => {
+                // Resume the deadline of the read this one continues; only
+                // transport progress clears it (see `read_deadline`). A read
+                // whose deadline already passed still gets one poll: the data
+                // may already be buffered, and answering a ready chunk with a
+                // timeout would be wrong.
+                let now = Instant::now();
+                let deadline = *self.read_deadline.get_or_insert(now + t);
+                let remaining = deadline.saturating_duration_since(now);
+                match timeout(remaining, self.request_body_reader.data()).await {
+                    Ok(data) => data,
+                    Err(_) => {
+                        // A body the TRANSPORT has promised is empty
+                        // (`Content-Length: 0`) has no bytes left to lose, so
+                        // there is nothing for this timeout to protect: the
+                        // client owes us only an END_STREAM that H2 does not
+                        // require it to have sent yet (design 4.3). Failing the
+                        // exchange here would 4xx a request that is otherwise
+                        // complete -- and would do it for an entirely ordinary
+                        // client whose upstream simply had nothing more to say.
+                        // Finish the read side instead; it is the same
+                        // conclusion `proxy_common::downstream_body_read_is_futile`
+                        // reaches for this shape, just reached from the read
+                        // side and without waiting on the response.
+                        //
+                        // No trailer poll and no capture finish here, unlike
+                        // the EOF branch below: the data section has NOT ended,
+                        // so `trailers()` would park forever, and a registered
+                        // capture buffer cannot coexist with an empty body
+                        // (`set_request_body_buffer` rejects it, and
+                        // `is_body_empty()` is false while one is registered).
+                        if self.is_body_empty() {
+                            debug!(
+                                "downstream request body read timed out after {t:?} on a body \
+                                 declared empty; finishing the read side instead of failing the \
+                                 request"
+                            );
+                            self.request_body_eof = true;
+                            return Ok(None);
+                        }
+                        return Error::e_explain(
+                            ErrorType::ReadTimedout,
+                            format!("while reading downstream request body, timeout: {t:?}"),
+                        );
+                    }
+                }
+            }
+            None => self.request_body_reader.data().await,
+        };
+        let data = match polled.transpose() {
+            Ok(data) => data,
+            Err(e) => {
+                // Once the request body is complete, a client ending the
+                // stream is not a read failure -- see
+                // `benign_post_eof_stream_end`. h2 surfaces the RST_STREAM
+                // here rather than from `trailers()` when it arrives before
+                // the EOF is polled, so the classification belongs on both.
+                if self.request_body_complete() && benign_post_eof_stream_end(&e) {
+                    None
+                } else {
+                    return Err(e).or_err(
+                        ErrorType::ReadError,
+                        "while reading downstream request body",
+                    );
+                }
+            }
+        };
         if let Some(data) = data.as_ref() {
+            // Rearm the idle bound only on real progress. An EMPTY DATA frame
+            // without END_STREAM is legal, costs the peer 9 bytes, consumes
+            // NO flow-control window (h2 `proto::streams::recv::recv_data`
+            // credits the window back for a zero-length payload) and trips no
+            // flood counter, so treating it as progress would hand an attacker
+            // a free, unlimited rearm -- and `body_read` never advances, so no
+            // byte-count body-size limit catches it either. END_STREAM is
+            // progress even with a zero-length payload: it ends the body.
+            if !data.is_empty() || self.request_body_reader.is_end_stream() {
+                self.read_deadline = None;
+            }
             self.body_read += data.len();
             if let Some(buffer) = self.retry_buffer.as_mut() {
                 buffer.write_to_buffer(data);
             }
+            // Release flow control before the (cancellable) capture await: the
+            // bytes are already consumed from the stream either way, and doing
+            // it here keeps a cancelled capture from leaking this chunk's
+            // flow-control window.
             let _ = self
                 .request_body_reader
                 .flow_control()
                 .release_capacity(data.len());
+            if let Some(buffer) = self.early_body_buffer.as_mut() {
+                // Poison across the await: if this future is dropped mid-await
+                // the flag stays set and the session fails closed from then on.
+                self.early_body_capture_poisoned = true;
+                buffer.capture(data).await?;
+                self.early_body_capture_poisoned = false;
+            }
+            if self.request_body_reader.is_end_stream() {
+                self.request_body_eof = true;
+                if let Some(buffer) = self.early_body_buffer.as_mut() {
+                    self.early_body_capture_poisoned = true;
+                    buffer.finish_capture().await?;
+                    self.early_body_capture_poisoned = false;
+                }
+            }
+        } else {
+            self.read_deadline = None;
+            self.request_body_eof = true;
+            // Establish the trailer fact exactly once: it is never cleared
+            // again within this request.
+            if !self.trailers_polled {
+                // Latched BEFORE the await, which is safe only because the await
+                // cannot be cancelled mid-poll here: `data()` returns `None`
+                // (this `else` branch) exclusively after END_STREAM was
+                // observed, at which point the trailers -- or the stream error
+                // -- are already queued in h2, so `trailers()` is immediately
+                // Ready and completes within this poll. Were it ever pending,
+                // cancellation between this store and the await completing would
+                // lose the trailer fact forever. Re-verify this invariant if the
+                // h2 dependency is upgraded; if it no longer holds, latch after a
+                // successful await instead (as `send_body_to2` in proxy_h2.rs
+                // does for the same hazard).
+                self.trailers_polled = true;
+                let trailers = match self.request_body_reader.trailers().await {
+                    Ok(trailers) => trailers,
+                    Err(e) => {
+                        if benign_post_eof_stream_end(&e) {
+                            None
+                        } else {
+                            return Err(e).or_err(
+                                ErrorType::ReadError,
+                                "while reading downstream request trailers",
+                            );
+                        }
+                    }
+                };
+                self.request_trailers_present = trailers.is_some_and(|fields| !fields.is_empty());
+            }
+            if let Some(buffer) = self.early_body_buffer.as_mut() {
+                self.early_body_capture_poisoned = true;
+                buffer.finish_capture().await?;
+                self.early_body_capture_poisoned = false;
+            }
         }
         Ok(data)
     }
 
+    // A `RequestBodyBuffer::write` is async and cannot run in a poll context.
+    // Fail closed when capture/replay is registered instead of silently returning
+    // bytes that bypass the buffer.
+    //
+    // NOTE: this does NOT apply `read_timeout` -- it is a plain poll with no
+    // timer of its own, so a caller that drives the request body through here
+    // is responsible for its own idle bound (`read_body_bytes` is the bounded
+    // entry point). There is no in-tree consumer today; add the bound here
+    // before adding one.
     #[doc(hidden)]
     pub fn poll_read_body_bytes(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Bytes, h2::Error>>> {
+        if self.early_body_buffer.is_some() {
+            return Poll::Ready(Some(Err(h2::Reason::INTERNAL_ERROR.into())));
+        }
         let data = match ready!(self.request_body_reader.poll_data(cx)).transpose() {
             Ok(data) => data,
             Err(err) => return Poll::Ready(Some(Err(err))),
@@ -553,9 +933,16 @@ impl HttpSession {
             self.request_body_reader
                 .flow_control()
                 .release_capacity(data.len())?;
+            // Latch source (ii) here as well: this poll consumes the same
+            // evidence `read_body_bytes` does, and a later reset would
+            // otherwise destroy it (see `request_body_eof`).
+            if self.request_body_reader.is_end_stream() {
+                self.request_body_eof = true;
+            }
             return Poll::Ready(Some(Ok(data)));
         }
 
+        self.request_body_eof = true;
         Poll::Ready(None)
     }
 
@@ -572,8 +959,20 @@ impl HttpSession {
     /// Drain the request body. `Ok(())` when there is no (more) body to read.
     // NOTE for h2 it may be worth allowing cancellation of the stream via reset.
     pub async fn drain_request_body(&mut self) -> Result<()> {
-        if self.is_body_done() {
+        // `is_body_empty()` is checked here (and deliberately NOT in
+        // `is_body_done()`, which must stay the pure transport fact): a
+        // request declaring `Content-Length: 0` promises zero DATA bytes, so
+        // there is nothing to drain even if END_STREAM has not arrived yet.
+        // Without this bound, and with `total_drain_timeout` defaulting to
+        // `None`, draining such a request would await forever.
+        if self.is_body_done() || self.is_body_empty() {
             return Ok(());
+        }
+        // Draining discards the remaining body — incompatible with capture-for-replay,
+        // so drop any early body buffer first and remember the discard so a later
+        // replay attempt fails closed (see the v1 counterpart for rationale).
+        if self.early_body_buffer.take().is_some() {
+            self.early_body_buffer_discarded = true;
         }
         match self.total_drain_timeout {
             Some(t) => match timeout(t, self.do_drain_request_body()).await {
@@ -585,6 +984,29 @@ impl HttpSession {
             },
             None => self.do_drain_request_body().await,
         }
+    }
+
+    /// Sets the downstream read timeout. This will trigger if the next
+    /// request-body chunk cannot be read within `timeout`.
+    ///
+    /// The bound is an INTER-CHUNK idle bound, not a bound on the overall
+    /// upload: it is rearmed by every DATA payload that carries at least one
+    /// byte (and by END_STREAM), so a slow but progressing upload is never
+    /// limited in total duration, while a client that stops sending is
+    /// released after one `timeout` of silence. An empty DATA frame is not
+    /// progress and does not rearm it.
+    ///
+    /// Defaults to 60s, matching the HTTP/1 server session. CONNECT requests
+    /// (including extended CONNECT) are exempt regardless of what is set here;
+    /// their "body" is a tunnel uplink on which idling is normal. Pass `None`
+    /// to make the reads unbounded.
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.read_timeout = timeout;
+    }
+
+    /// Get the read timeout.
+    pub fn get_read_timeout(&self) -> Option<Duration> {
+        self.read_timeout
     }
 
     /// Sets the downstream write timeout. This will trigger if we're unable
@@ -659,7 +1081,32 @@ impl HttpSession {
         self.response_written = Some(header);
         self.send_response_body = Some(body_writer);
         self.ended = self.ended || end;
+        // Committing the response ends any possibility of an upstream retry; a
+        // captured or fully replayed body buffer is dead weight for the rest of the response
+        // (which may be long-lived, e.g. SSE / gRPC streaming).
+        self.maybe_release_early_body_buffer();
         Ok(())
+    }
+
+    /// Drop the registered early body buffer once it can no longer be needed:
+    /// capture completed without replay, or replay reached EOF, AND the response
+    /// header was committed downstream. Before the response commits, a retry may
+    /// still rewind and replay the buffer; while replay is in progress, the
+    /// current attempt is still reading it. Called from each place where a release
+    /// condition can become true. The `early_body_buffer_released` flag makes any
+    /// later replay attempt fail closed (see `begin_request_body_replay`). Unlike
+    /// HTTP/1, `response_written` here is only ever a non-informational header
+    /// (1xx are not sent on the h2 path), so its presence alone means committed.
+    fn maybe_release_early_body_buffer(&mut self) {
+        if self.response_written.is_some()
+            && self
+                .early_body_buffer
+                .as_ref()
+                .is_some_and(RegisteredRequestBodyBuffer::is_ready_or_replay_done)
+        {
+            self.early_body_buffer = None;
+            self.early_body_buffer_released = true;
+        }
     }
 
     /// Write response body to the client. See [Self::write_response_header] for how to use `end`.
@@ -864,21 +1311,75 @@ impl HttpSession {
     }
 
     /// Whether there is no more body to read
+    ///
+    /// Reports the LATCHED transport fact (`request_body_eof`, sources (i) and
+    /// (ii)) rather than the live `is_end_stream()`, so that a peer resetting a
+    /// stream it already ended cannot flip this back to `false`. The live value
+    /// is still consulted so that an END_STREAM which arrived without us polling
+    /// is picked up immediately.
+    ///
+    /// Deliberately does NOT consult source (iii) (`content-length` satisfied,
+    /// see [`Self::request_body_complete`]): the callers of this function stop
+    /// reading the request body once it returns `true`, and an H2 request may
+    /// legally send TRAILERS after a complete, `content-length`-declared body.
+    /// Ending the read there would silently drop those trailers and skip the
+    /// trailer hook. Source (iii) exists to classify a stream END, which is a
+    /// strictly later event, so nothing is lost by the narrower rule here.
     pub fn is_body_done(&self) -> bool {
-        // Check no body in request
-        // Also check we hit end of stream
-        self.is_body_empty() || self.request_body_reader.is_end_stream()
+        if self
+            .early_body_buffer
+            .as_ref()
+            .is_some_and(RegisteredRequestBodyBuffer::is_replaying)
+        {
+            return false;
+        }
+        self.request_body_eof || self.request_body_reader.is_end_stream()
     }
 
     /// Whether there is any body to read. true means there no body in request.
+    ///
+    /// While an early request body buffer is registered, the effective body is whatever
+    /// the buffer replays, which may be a non-empty rewrite of a zero-byte original
+    /// (e.g. HEADERS without END_STREAM followed by an empty END_STREAM DATA frame).
+    /// Report non-empty then, so upstream framing decisions (H2 END_STREAM on HEADERS)
+    /// keep the stream open until replay reaches EOF.
+    ///
+    /// Like [`Self::is_body_done`] this reads the LATCHED end-of-stream fact,
+    /// never the live `is_end_stream()`: a bodyless request (END_STREAM on
+    /// HEADERS, e.g. a plain `GET`) whose client then resets the stream must not
+    /// stop reporting itself as bodyless. A retractable answer here defeats the
+    /// anti-smuggling coercion in `pingora-proxy`'s `safe_disposition`, which
+    /// keys on "this request has no body at all".
     pub fn is_body_empty(&self) -> bool {
+        if self.early_body_buffer.is_some() {
+            return false;
+        }
         self.body_read == 0
-            && (self.request_body_reader.is_end_stream()
+            && (self.request_body_eof
+                || self.request_body_reader.is_end_stream()
                 || self
                     .request_header
                     .headers
                     .get(header::CONTENT_LENGTH)
                     .is_some_and(|cl| cl.as_bytes() == b"0"))
+    }
+
+    /// Whether the initial HEADERS frame carried END_STREAM.
+    pub fn request_headers_end_stream(&self) -> bool {
+        self.request_headers_end_stream
+    }
+
+    /// Whether actual request trailer fields were received.
+    ///
+    /// This is meaningful after `read_body_bytes()` returns EOF.
+    pub fn request_trailers_present(&self) -> bool {
+        self.request_trailers_present
+    }
+
+    /// Whether the response body writer has already been ended (END_STREAM
+    /// sent). `false` while a response is still being streamed.
+    pub fn response_body_finished(&self) -> bool {
+        self.ended
     }
 
     pub fn retry_buffer_truncated(&self) -> bool {
@@ -914,6 +1415,18 @@ impl HttpSession {
     /// Similar to `read_body_bytes()` but will be pending after Ok(None) is returned,
     /// until the client closes the connection
     pub async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
+        if let Some(registered) = self.early_body_buffer.as_mut() {
+            if registered.is_replaying() {
+                let chunk = registered.next_chunk().await?;
+                if chunk.is_none() {
+                    // Replay EOF. If the response was already committed downstream
+                    // (upstream responded before replay finished), the buffer can
+                    // never be needed again — drop it now.
+                    self.maybe_release_early_body_buffer();
+                }
+                return Ok(chunk);
+            }
+        }
         if no_body_expected || self.is_body_done() {
             let reason = self.idle().await?;
             Error::e_explain(
@@ -2091,3 +2604,7 @@ mod test {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "server_tests.rs"]
+mod replay_test;

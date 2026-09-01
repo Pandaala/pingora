@@ -116,6 +116,13 @@ pub trait Session: Send + Sync + Unpin + 'static {
 
     fn is_body_empty(&mut self) -> bool;
 
+    /// Read the next request-body chunk, or watch the downstream session after
+    /// its body is complete.
+    ///
+    /// Once `no_body_expected` is true or this session has returned body EOF,
+    /// the future must remain pending until the downstream terminates, then
+    /// return an error describing that termination. It must not return a
+    /// successful `None` or body chunk while acting as the idle watcher.
     async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>>;
 
     fn body_bytes_sent(&self) -> usize;
@@ -133,6 +140,13 @@ pub trait Session: Send + Sync + Unpin + 'static {
     fn pseudo_raw_h1_request_header(&self) -> Bytes;
 
     fn enable_retry_buffering(&mut self);
+
+    /// Whether this custom downstream implements the native retry buffer
+    /// methods. The default is fail-closed so optional custom sessions never
+    /// reach placeholder implementations that panic.
+    fn retry_buffering_supported(&self) -> bool {
+        false
+    }
 
     fn retry_buffer_truncated(&self) -> bool;
 
@@ -297,6 +311,10 @@ impl Session for () {
 
     fn enable_retry_buffering(&mut self) {
         unreachable!("server session: enable_retry_bufferings")
+    }
+
+    fn retry_buffering_supported(&self) -> bool {
+        false
     }
 
     fn retry_buffer_truncated(&self) -> bool {

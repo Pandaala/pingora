@@ -14,6 +14,7 @@
 
 //! HTTP server session APIs
 
+use super::body_buffer::RequestBodyBuffer;
 use super::custom::server::Session as SessionCustom;
 use super::error_resp;
 use super::subrequest::server::HttpSession as SessionSubrequest;
@@ -25,7 +26,7 @@ use crate::protocols::{Digest, SocketAddr, Stream};
 use bytes::{Bytes, BytesMut};
 use http::HeaderValue;
 use http::{header::AsHeaderName, HeaderMap};
-use pingora_error::{Error, Result};
+use pingora_error::{Error, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::any::Any;
 use std::time::Duration;
@@ -222,6 +223,15 @@ impl Session {
         }
     }
 
+    /// Finalize downstream response framing facts before same-batch trailer
+    /// hooks run. Native trailer-capable transports need no planning latch.
+    pub fn prepare_response_header(&mut self, resp: &mut ResponseHeader) -> Result<()> {
+        match self {
+            Self::H1(s) => s.prepare_response_header(resp),
+            Self::H2(_) | Self::Subrequest(_) | Self::Custom(_) => Ok(()),
+        }
+    }
+
     /// Write the response body to client
     pub async fn write_response_body(&mut self, data: Bytes, end: bool) -> Result<()> {
         if data.is_empty() && !end {
@@ -252,10 +262,22 @@ impl Session {
     /// Write the response trailers to client
     pub async fn write_response_trailers(&mut self, trailers: HeaderMap) -> Result<()> {
         match self {
-            Self::H1(_) => Ok(()), // TODO: support trailers for h1
+            Self::H1(s) => {
+                s.write_trailers(&trailers).await?;
+                Ok(())
+            }
             Self::H2(s) => s.write_trailers(trailers),
             Self::Subrequest(s) => s.write_trailers(Some(Box::new(trailers))).await,
             Self::Custom(s) => s.write_trailers(trailers).await,
+        }
+    }
+
+    /// Whether the committed or planned downstream response can represent
+    /// trailers.
+    pub fn response_trailers_supported(&self) -> bool {
+        match self {
+            Self::H1(s) => s.response_trailers_supported(),
+            Self::H2(_) | Self::Subrequest(_) | Self::Custom(_) => true,
         }
     }
 
@@ -375,11 +397,15 @@ impl Session {
     /// Sets the downstream read timeout. This will trigger if we're unable
     /// to read from the stream after `timeout`.
     ///
-    /// This is a noop for h2.
+    /// For h2 this bounds each request-body chunk read; the timeout is rearmed
+    /// by every chunk that carries at least one byte, so a progressing upload
+    /// is never limited in overall duration, while a stalled one is released
+    /// after one `timeout` of silence. h2 CONNECT tunnels are exempt. Both
+    /// protocols default to 60s.
     pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
         match self {
             Self::H1(s) => s.set_read_timeout(timeout),
-            Self::H2(_) => {}
+            Self::H2(s) => s.set_read_timeout(timeout),
             Self::Subrequest(s) => s.set_read_timeout(timeout),
             Self::Custom(c) => c.set_read_timeout(timeout),
         }
@@ -389,7 +415,7 @@ impl Session {
     pub fn get_read_timeout(&self) -> Option<Duration> {
         match self {
             Self::H1(s) => s.get_read_timeout(),
-            Self::H2(_) => None,
+            Self::H2(s) => s.get_read_timeout(),
             Self::Subrequest(s) => s.get_read_timeout(),
             Self::Custom(s) => s.get_read_timeout(),
         }
@@ -649,12 +675,51 @@ impl Session {
     }
 
     /// Whether there is no request body
+    ///
+    /// While an early request body buffer is registered this reports non-empty
+    /// regardless of the original payload size: the effective body is whatever the
+    /// buffer replays, possibly a non-empty rewrite of a zero-byte original.
     pub fn is_body_empty(&mut self) -> bool {
         match self {
             Self::H1(s) => s.is_body_empty(),
             Self::H2(s) => s.is_body_empty(),
             Self::Subrequest(s) => s.is_body_empty(),
             Self::Custom(s) => s.is_body_empty(),
+        }
+    }
+
+    /// Whether the downstream transport ended the request on its initial
+    /// headers. Unsupported session types return `None`.
+    pub fn request_headers_end_stream(&mut self) -> Option<bool> {
+        match self {
+            Self::H1(s) => Some(s.request_headers_end_stream()),
+            Self::H2(s) => Some(s.request_headers_end_stream()),
+            Self::Subrequest(_) | Self::Custom(_) => None,
+        }
+    }
+
+    /// Whether the downstream request contained actual trailer fields.
+    ///
+    /// This is meaningful after a body read reports EOF. Unsupported session
+    /// types return `None`.
+    pub fn request_trailers_present(&mut self) -> Option<bool> {
+        match self {
+            Self::H1(s) => Some(s.request_trailers_present()),
+            Self::H2(s) => Some(s.request_trailers_present()),
+            Self::Subrequest(_) | Self::Custom(_) => None,
+        }
+    }
+
+    /// Whether the downstream response body writer has already been finished.
+    ///
+    /// `Some(false)` means a response is committed but still unfinished, so
+    /// [`Self::finish_body`] still has work to do. Unsupported session types
+    /// return `None`.
+    pub fn response_body_finished(&self) -> Option<bool> {
+        match self {
+            Self::H1(s) => Some(s.response_body_finished()),
+            Self::H2(s) => Some(s.response_body_finished()),
+            Self::Subrequest(_) | Self::Custom(_) => None,
         }
     }
 
@@ -676,12 +741,102 @@ impl Session {
         }
     }
 
+    /// Whether this downstream can provide Pingora's native retry buffer.
+    pub fn retry_buffering_supported(&self) -> bool {
+        match self {
+            Self::H1(_) | Self::H2(_) | Self::Subrequest(_) => true,
+            Self::Custom(s) => s.retry_buffering_supported(),
+        }
+    }
+
     pub fn get_retry_buffer(&self) -> Option<Bytes> {
         match self {
             Self::H1(s) => s.get_retry_buffer(),
             Self::H2(s) => s.get_retry_buffer(),
             Self::Subrequest(s) => s.get_retry_buffer(),
             Self::Custom(s) => s.get_retry_buffer(),
+        }
+    }
+
+    /// Register an app-supplied request body buffer (opt-in). Supported on the H1/H2
+    /// data plane only, and fails closed otherwise: silently succeeding on a
+    /// subrequest/custom session would let the app drain the body believing it will
+    /// be replayed, then forward the request bodyless. Also fails closed if the body
+    /// has already started being read (see the H1/H2 impls).
+    pub fn set_request_body_buffer(&mut self, buffer: Box<dyn RequestBodyBuffer>) -> Result<()> {
+        match self {
+            Self::H1(s) => s.set_request_body_buffer(buffer),
+            Self::H2(s) => s.set_request_body_buffer(buffer),
+            Self::Subrequest(_) | Self::Custom(_) => Error::e_explain(
+                ErrorType::InternalError,
+                "early request body buffering is not supported for subrequest/custom sessions",
+            ),
+        }
+    }
+
+    /// Register an already-finalized replay source for an empty downstream
+    /// request. Supported only on the H1/H2 data plane.
+    pub fn set_bodyless_request_replay_buffer(
+        &mut self,
+        buffer: Box<dyn RequestBodyBuffer>,
+    ) -> Result<()> {
+        match self {
+            Self::H1(s) => s.set_bodyless_request_replay_buffer(buffer),
+            Self::H2(s) => s.set_bodyless_request_replay_buffer(buffer),
+            Self::Subrequest(_) | Self::Custom(_) => Error::e_explain(
+                ErrorType::InternalError,
+                "request body replay buffering is not supported for subrequest/custom sessions",
+            ),
+        }
+    }
+
+    /// Whether an app-supplied request body buffer is registered.
+    pub fn request_body_buffer_registered(&self) -> bool {
+        match self {
+            Self::H1(s) => s.request_body_buffer_registered(),
+            Self::H2(s) => s.request_body_buffer_registered(),
+            Self::Subrequest(_) | Self::Custom(_) => false,
+        }
+    }
+
+    /// Freeze the application-configured request-body source for the rest of
+    /// this request. H1/H2 reject any later buffer registration.
+    pub fn freeze_request_body_configuration(&mut self) {
+        match self {
+            Self::H1(s) => s.freeze_request_body_configuration(),
+            Self::H2(s) => s.freeze_request_body_configuration(),
+            Self::Subrequest(_) | Self::Custom(_) => {}
+        }
+    }
+
+    /// Whether a registered replay source can currently be rewound.
+    pub fn request_body_buffer_replay_available(&self) -> bool {
+        match self {
+            Self::H1(s) => s.request_body_buffer_replay_available(),
+            Self::H2(s) => s.request_body_buffer_replay_available(),
+            Self::Subrequest(_) | Self::Custom(_) => false,
+        }
+    }
+
+    /// Whether a registered request body buffer is currently replaying. While
+    /// true, `read_body_or_idle` serves buffered chunks instead of reading the
+    /// client, so its errors are gateway-local (buffer impl or invariant), not
+    /// client failures.
+    pub fn request_body_buffer_replaying(&self) -> bool {
+        match self {
+            Self::H1(s) => s.request_body_buffer_replaying(),
+            Self::H2(s) => s.request_body_buffer_replaying(),
+            Self::Subrequest(_) | Self::Custom(_) => false,
+        }
+    }
+
+    /// Prepare a registered early body buffer as the body source for the next
+    /// upstream attempt. Returns `false` when no buffer is registered.
+    pub async fn begin_request_body_replay(&mut self) -> Result<bool> {
+        match self {
+            Self::H1(s) => s.begin_request_body_replay().await,
+            Self::H2(s) => s.begin_request_body_replay().await,
+            Self::Subrequest(_) | Self::Custom(_) => Ok(false),
         }
     }
 

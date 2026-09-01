@@ -34,6 +34,49 @@ use std::any::TypeId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Why a request-body event was delivered to an HTTP filter.
+///
+/// Both [`Complete`](Self::Complete) and [`Abandoned`](Self::Abandoned) are
+/// terminal for the current downstream-body delivery: only `Complete` means
+/// that the downstream transport's real end-of-stream was observed. A later
+/// upstream retry may replay buffered body events through the same hooks; the
+/// retry does not change whether the original downstream body completed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestBodyEvent {
+    /// A non-terminal request-body chunk.
+    Data,
+    /// The downstream request body ended normally.
+    Complete,
+    /// The proxy deliberately stopped reading the downstream request body.
+    ///
+    /// Any bytes delivered before this event are only a prefix. A filter must
+    /// not finalize a digest, audit record, or secondary request as though it
+    /// had observed the complete downstream body.
+    Abandoned,
+}
+
+impl RequestBodyEvent {
+    /// Whether this terminates the current downstream-body delivery sequence.
+    pub fn is_terminal(self) -> bool {
+        self != Self::Data
+    }
+
+    /// Whether the downstream transport's real end-of-stream was observed.
+    pub fn is_complete(self) -> bool {
+        self == Self::Complete
+    }
+}
+
+impl From<bool> for RequestBodyEvent {
+    fn from(end_of_stream: bool) -> Self {
+        if end_of_stream {
+            Self::Complete
+        } else {
+            Self::Data
+        }
+    }
+}
+
 /// The trait an HTTP traffic module needs to implement
 #[async_trait]
 pub trait HttpModule {
@@ -44,7 +87,7 @@ pub trait HttpModule {
     async fn request_body_filter(
         &mut self,
         _body: &mut Option<Bytes>,
-        _end_of_stream: bool,
+        _event: RequestBodyEvent,
     ) -> Result<()> {
         Ok(())
     }
@@ -210,10 +253,10 @@ impl HttpModuleCtx {
     pub async fn request_body_filter(
         &mut self,
         body: &mut Option<Bytes>,
-        end_of_stream: bool,
+        event: RequestBodyEvent,
     ) -> Result<()> {
         for filter in self.module_ctx.iter_mut() {
-            filter.request_body_filter(body, end_of_stream).await?;
+            filter.request_body_filter(body, event).await?;
         }
         Ok(())
     }
@@ -366,4 +409,6 @@ mod tests {
         assert_eq!(req.headers.get("my-filter").unwrap(), "2");
         assert!(req.headers.get("my-other-filter").is_none());
     }
+
+    include!("request_body_event_tests.rs");
 }
