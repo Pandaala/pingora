@@ -647,8 +647,26 @@ impl Ssl for Stream {}
 impl Peek for Stream {
     async fn try_peek(&mut self, buf: &mut [u8]) -> std::io::Result<bool> {
         use tokio::io::AsyncReadExt;
-        self.read_exact(buf).await?;
-        // rewind regardless of what is read
+        // Rewind on every exit, including the error paths. `read_exact` alone
+        // would drain the bytes it managed to read into `buf` and then return,
+        // discarding them: a peek that fails because the peer sent fewer bytes
+        // than requested would silently eat what it did send. Callers treat a
+        // failed peek as "not the protocol I was sniffing for" and keep serving
+        // the connection, so those bytes have to still be there.
+        let mut n = 0;
+        while n < buf.len() {
+            match self.read(&mut buf[n..]).await {
+                Ok(0) => {
+                    self.rewind(&buf[..n]);
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
+                Ok(r) => n += r,
+                Err(e) => {
+                    self.rewind(&buf[..n]);
+                    return Err(e);
+                }
+            }
+        }
         self.rewind(buf);
         Ok(true)
     }
@@ -871,8 +889,10 @@ impl AccumulatedDuration {
     }
 }
 
+// The rx-timestamp cases inside carry their own `target_os = "linux"` gate, so
+// gating the whole module too only hid the portable rewind/peek tests from every
+// other platform.
 #[cfg(test)]
-#[cfg(target_os = "linux")]
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -997,6 +1017,34 @@ mod tests {
         let mut buffer = vec![];
         stream.read_to_end(&mut buffer).await.unwrap();
         assert_eq!(buffer, message);
+    }
+
+    #[tokio::test]
+    async fn test_failed_peek_preserves_the_bytes_it_read() {
+        // A short read must not eat the data. Callers treat a failed peek as
+        // "not the protocol I was sniffing for" and go on serving the
+        // connection, so anything already sent has to survive.
+        let message = b"short";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream.write_all(message).await.unwrap();
+            drop(stream);
+        });
+
+        let mut stream: Stream = TcpStream::connect(addr).await.unwrap().into();
+
+        // Ask for more than will ever arrive.
+        let mut buf = [0u8; 12];
+        let err = stream.try_peek(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), tokio::io::ErrorKind::UnexpectedEof);
+
+        // The five bytes that did arrive are still readable.
+        let mut rest = vec![];
+        stream.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, message);
     }
 
     #[tokio::test]

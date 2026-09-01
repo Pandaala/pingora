@@ -74,7 +74,8 @@ pub mod tls;
 #[cfg(not(feature = "any_tls"))]
 pub use crate::tls::listeners as tls;
 
-use crate::protocols::{l4::socket::SocketAddr, tls::TlsRef, Stream};
+use crate::protocols::l4::proxy_protocol::ProxyProtocolTrust;
+use crate::protocols::{l4::proxy_protocol, l4::socket::SocketAddr, tls::TlsRef, Stream};
 
 #[cfg(unix)]
 use crate::server::ListenFds;
@@ -195,6 +196,14 @@ impl TransportStackBuilder {
             tls: self.tls.take().map(|tls| Arc::new(tls.build())),
             l4_buffer: self.l4_buffer,
             pre_tls_callback: self.pre_tls_callback.clone(),
+            proxy_protocol: self
+                .l4
+                .tcp_sock_opts()
+                .is_some_and(|opts| opts.proxy_protocol),
+            proxy_protocol_trusted: self
+                .l4
+                .tcp_sock_opts()
+                .and_then(|opts| opts.proxy_protocol_trusted_sources.clone()),
         })
     }
 }
@@ -283,6 +292,11 @@ pub(crate) struct TransportStack {
     tls: Option<Arc<Acceptor>>,
     l4_buffer: L4BufferSettings,
     pre_tls_callback: Option<PreTlsCallback>,
+    // expect a PROXY protocol header on every accepted connection
+    proxy_protocol: bool,
+    // when set, only these peers may speak PROXY protocol; others are served
+    // as ordinary direct connections
+    proxy_protocol_trusted: Option<Arc<dyn ProxyProtocolTrust>>,
 }
 
 impl TransportStack {
@@ -297,6 +311,8 @@ impl TransportStack {
             tls: self.tls.clone(),
             l4_buffer: self.l4_buffer,
             pre_tls_callback: self.pre_tls_callback.clone(),
+            proxy_protocol: self.proxy_protocol,
+            proxy_protocol_trusted: self.proxy_protocol_trusted.clone(),
         })
     }
 
@@ -310,11 +326,20 @@ pub(crate) struct UninitializedStream {
     tls: Option<Arc<Acceptor>>,
     l4_buffer: L4BufferSettings,
     pre_tls_callback: Option<PreTlsCallback>,
+    proxy_protocol: bool,
+    proxy_protocol_trusted: Option<Arc<dyn ProxyProtocolTrust>>,
 }
 
 impl UninitializedStream {
     pub async fn handshake(mut self) -> Result<Stream> {
         self.l4.set_buffer(self.l4_buffer);
+        // must happen before TLS: the PROXY header precedes the ClientHello
+        proxy_protocol::apply(
+            &mut self.l4,
+            self.proxy_protocol,
+            self.proxy_protocol_trusted.as_ref(),
+        )
+        .await?;
         if let Some(tls) = self.tls {
             // Process pre-TLS data if a callback is configured (e.g., PROXY protocol)
             if let Some(ref callback) = self.pre_tls_callback {
@@ -748,6 +773,8 @@ mod test {
         }
         server.await.unwrap();
     }
+
+    include!("proxy_protocol_tests.rs");
 
     #[cfg(feature = "connection_filter")]
     #[test]
