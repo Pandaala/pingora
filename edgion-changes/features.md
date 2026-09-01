@@ -55,7 +55,13 @@ verification snapshot are tracked in
    Body-EOS, Trailer, and Done; a real trailer receives
    `TerminalBeforeTrailers`, while an abort gets no synthetic clean terminal.
 4. Application termination is typed and non-retryable. A committed final
-   response cannot enter a second response or retry path.
+   response cannot enter a second response or retry path. If an `Abandoned`
+   request-body hook returns `Terminate` after the response pipeline selected
+   its final response and the pump independently qualified it complete, the
+   request side stops but that selected response still drains; selection alone
+   does not preserve an incomplete response, which is explicitly aborted
+   without a clean terminator. Only an application-owned local response uses
+   ordinary termination.
 5. Filtered bytes preserve order across live delivery, cache admission, and
    cache hit; compression finalizes before trailers, and framing metadata
    agrees with transformed body semantics.

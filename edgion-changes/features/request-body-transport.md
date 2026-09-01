@@ -90,7 +90,14 @@ once across all attempts for one downstream request.
 
 `RequestBodyAction::Terminate` stops the request as an application-selected
 outcome. It bypasses retry classification and generic `fail_to_proxy` response
-generation because the application owns the downstream response.
+generation because the application owns the downstream response. For
+`Abandoned` after Pingora's response pipeline has already selected a final
+response, applications must not write a local replacement. At abandonment
+sites where the protocol pump has independently qualified the response as
+complete, `Terminate` stops the request side while Pingora preserves the
+selected response. Pingora snapshots ownership before the hook; a local
+response written during the hook remains an ordinary application-owned
+termination.
 
 ## Upstream framing
 
@@ -154,6 +161,18 @@ settling the failed current AI predispatch reservation.
   batch helpers rather than duplicating inline loops.
 - When an upstream response completes and the upstream stops receiving, the
   application still receives one `Abandoned` event.
+- `request_relay_event` distinguishes ordinary application-owned termination
+  from qualified `Abandoned + Terminate` after pipeline response selection.
+  Response selection alone is insufficient: writer rejection and other
+  unqualified abandonment, a request-trailer termination, and a nonterminal request event that terminates
+  after response selection, use `AbortSelectedResponse`. H1 closes without a
+  final chunk, H2 resets the stream, and custom downstreams invoke their abort
+  boundary; no client can mistake the partial representation for a clean
+  success. H1, H2, and custom stop the request side for the qualified preserve
+  outcome without manufacturing request EOS or finalizing the response; queued
+  response tasks continue through their protocol-owned drain and cleanup path.
+  An H1 downstream is bounded-drained only to protect response delivery and is
+  then closed rather than pooled.
 - The custom pump dispatches that event independently from its `BodyWrite`:
   abandonment never calls `finish()`, because a deliberately truncated upload
   is not a clean custom-upstream request EOS. A mid-upload writer rejection
@@ -184,6 +203,7 @@ termination, bodyless contract violations and connection reuse.
 
 `pingora-proxy/src/request_relay_tests.rs` directly characterizes the shared
 semantic seam across H1/H2/custom: `Data(None)` normalization, `Abandoned`,
+selected-response preservation after abandonment termination,
 module-before-application ordering and mutation visibility, zero-copy `Bytes`
 handoff, typed versus fail-closed termination, custom trailer capability,
 trailer ordering/latching, hook error, cancellation before latch commit,

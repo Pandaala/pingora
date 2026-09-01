@@ -57,9 +57,9 @@ use pingora_core::{
 use pingora_error::Result;
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{
-    ProcessCustomSession, ProxyHttp, ProxyServiceBuilder, RangeType, RequestBodyEvent,
-    ResponseBodySink, Session, UpstreamResponseBodyEvent, RESPONSE_BODY_EMIT_BUDGET,
-    RESPONSE_BODY_EMIT_CHUNK_BUDGET,
+    ProcessCustomSession, ProxyHttp, ProxyServiceBuilder, RangeType, RequestBodyAction,
+    RequestBodyEvent, ResponseBodySink, Session, UpstreamResponseBodyEvent,
+    RESPONSE_BODY_EMIT_BUDGET, RESPONSE_BODY_EMIT_CHUNK_BUDGET,
 };
 use std::any::Any;
 use std::future::Future;
@@ -145,6 +145,10 @@ const CUSTOM_REJECT_LATER_WRITE_SCRIPT: &str = "reject-later-write";
 const CUSTOM_REJECT_WRITE_AND_ABANDON_FILTER_SCRIPT: &str = "reject-write-and-abandon-filter";
 const CUSTOM_REJECT_WRITE_WITH_COMPETING_RESPONSE_ERROR_SCRIPT: &str =
     "reject-write-with-competing-response-error";
+const CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_SCRIPT: &str =
+    "reject-write-after-selected-response";
+const CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_PATH: &str =
+    "/custom_reject_write_after_selected_response";
 const CUSTOM_COMPLETE_UPLOAD_SCRIPT: &str = "complete-upload";
 const CUSTOM_DOWNSTREAM_EARLY_RESPONSE_SCRIPT: &str = "custom-downstream-early-response";
 const CUSTOM_WAIT_FOR_H1_CLOSE_SCRIPT: &str = "wait-for-h1-close";
@@ -462,6 +466,13 @@ static CUSTOM_DOWNSTREAM_RESPONSE_CHANGED: Lazy<tokio::sync::Notify> =
     Lazy::new(tokio::sync::Notify::new);
 static CUSTOM_DOWNSTREAM_WRITER_FINISHES: AtomicUsize = AtomicUsize::new(0);
 static CUSTOM_DOWNSTREAM_WRITER_CLEANUPS: AtomicUsize = AtomicUsize::new(0);
+static CUSTOM_SELECTED_RESPONSE_HEAD_WRITTEN: AtomicBool = AtomicBool::new(false);
+static CUSTOM_SELECTED_RESPONSE_HEAD_CHANGED: Lazy<tokio::sync::Notify> =
+    Lazy::new(tokio::sync::Notify::new);
+static CUSTOM_SELECTED_RESPONSE_ABANDONS: AtomicUsize = AtomicUsize::new(0);
+static CUSTOM_SELECTED_RESPONSE_ABANDON_CHANGED: Lazy<tokio::sync::Notify> =
+    Lazy::new(tokio::sync::Notify::new);
+static CUSTOM_SELECTED_RESPONSE_FINISHES: AtomicUsize = AtomicUsize::new(0);
 static CUSTOM_COMPRESSED_TRAILERED_EOS_CALLS: AtomicUsize = AtomicUsize::new(0);
 static CUSTOM_WRITER_RACE_HOOK_PENDING: AtomicBool = AtomicBool::new(false);
 static CUSTOM_WRITER_RACE_HOOK_ENTERED: Lazy<tokio::sync::Notify> =
@@ -693,6 +704,7 @@ impl BodyWrite for NoopBodyWriter {
             (Some(CUSTOM_REJECT_FIRST_WRITE_SCRIPT), 1)
                 | (Some(CUSTOM_REJECT_LATER_WRITE_SCRIPT), 2)
                 | (Some(CUSTOM_REJECT_WRITE_AND_ABANDON_FILTER_SCRIPT), 1)
+                | (Some(CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_SCRIPT), 1)
                 | (
                     Some(CUSTOM_REJECT_WRITE_WITH_COMPETING_RESPONSE_ERROR_SCRIPT),
                     1,
@@ -833,7 +845,13 @@ impl CustomSession for HeaderOnlyCustomSession {
             .get(CUSTOM_REQUEST_BODY_SCRIPT_HEADER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        if self.request_body_script.is_some() {
+        if self.request_body_script.as_deref()
+            == Some(CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_SCRIPT)
+        {
+            self.response = ResponseHeader::build(200, None)?;
+            self.response
+                .insert_header(http::header::CONTENT_LENGTH, "4")?;
+        } else if self.request_body_script.is_some() {
             self.response = ResponseHeader::build(200, None)?;
             self.response
                 .insert_header(http::header::CONTENT_LENGTH, "0")?;
@@ -910,6 +928,17 @@ impl CustomSession for HeaderOnlyCustomSession {
     }
 
     async fn read_response_body(&mut self) -> Result<Option<Bytes>> {
+        if self.request_body_script.as_deref()
+            == Some(CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_SCRIPT)
+        {
+            while CUSTOM_SELECTED_RESPONSE_ABANDONS.load(Ordering::SeqCst) == 0 {
+                CUSTOM_SELECTED_RESPONSE_ABANDON_CHANGED.notified().await;
+            }
+            return pingora_error::Error::e_explain(
+                pingora_error::ErrorType::ReadError,
+                "scripted response teardown after downstream abandon",
+            );
+        }
         if self.terminal_upgrade {
             TERMINAL_UPGRADE_SESSION_READ_AFTER_EOS.store(true, Ordering::SeqCst);
             return Ok(None);
@@ -929,6 +958,11 @@ impl CustomSession for HeaderOnlyCustomSession {
     }
 
     fn response_finished(&self) -> bool {
+        if self.request_body_script.as_deref()
+            == Some(CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_SCRIPT)
+        {
+            return false;
+        }
         self.pending_body.is_empty()
             && !self.pending_trailers
             && (!self.upgraded || self.terminal_upgrade || self.body_eof_observed)
@@ -1020,6 +1054,27 @@ impl ProxyHttp for EmitProxy {
 
     fn new_ctx(&self) -> Self::CTX {
         EmitCtx::default()
+    }
+
+    async fn request_body_filter_action(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        event: RequestBodyEvent,
+        ctx: &mut Self::CTX,
+    ) -> Result<RequestBodyAction> {
+        self.request_body_filter(session, body, event, ctx).await?;
+        if event == RequestBodyEvent::Abandoned
+            && session.get_header_bytes(CUSTOM_REQUEST_BODY_SCRIPT_HEADER)
+                == CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_SCRIPT.as_bytes()
+        {
+            assert!(
+                session.response_head_selected_by_pipeline(),
+                "the custom writer must reject after the response head was selected"
+            );
+            return Ok(RequestBodyAction::Terminate);
+        }
+        Ok(RequestBodyAction::Continue)
     }
 
     async fn request_body_filter(
@@ -1654,6 +1709,39 @@ impl ScriptedCustomDownstream {
             drain_timeout: None,
         }
     }
+
+    fn selected_response_then_writer_rejection() -> Self {
+        let mut request = RequestHeader::build(
+            "POST",
+            CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_PATH.as_bytes(),
+            None,
+        )
+        .unwrap();
+        request
+            .insert_header(http::header::HOST, "localhost")
+            .unwrap();
+        request
+            .insert_header(http::header::CONTENT_LENGTH, "4")
+            .unwrap();
+        request
+            .insert_header(
+                CUSTOM_REQUEST_BODY_SCRIPT_HEADER,
+                CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_SCRIPT,
+            )
+            .unwrap();
+        Self {
+            request,
+            response: None,
+            body_reads: 0,
+            read_timeout: None,
+            write_timeout: None,
+            drain_timeout: None,
+        }
+    }
+
+    fn is_selected_response_writer_rejection(&self) -> bool {
+        self.request.uri.path() == CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_PATH
+    }
 }
 
 #[async_trait]
@@ -1680,6 +1768,10 @@ impl CustomServerSession for ScriptedCustomDownstream {
         end: bool,
     ) -> Result<()> {
         self.response = Some(*response);
+        if self.is_selected_response_writer_rejection() {
+            CUSTOM_SELECTED_RESPONSE_HEAD_WRITTEN.store(true, Ordering::SeqCst);
+            CUSTOM_SELECTED_RESPONSE_HEAD_CHANGED.notify_waiters();
+        }
         if end {
             CUSTOM_DOWNSTREAM_RESPONSE_DONE.store(true, Ordering::SeqCst);
             CUSTOM_DOWNSTREAM_RESPONSE_CHANGED.notify_waiters();
@@ -1709,6 +1801,10 @@ impl CustomServerSession for ScriptedCustomDownstream {
         for task in tasks {
             if let HttpTask::Header(response, _) = task {
                 self.response = Some(*response);
+                if self.is_selected_response_writer_rejection() {
+                    CUSTOM_SELECTED_RESPONSE_HEAD_WRITTEN.store(true, Ordering::SeqCst);
+                    CUSTOM_SELECTED_RESPONSE_HEAD_CHANGED.notify_waiters();
+                }
             }
         }
         if finished {
@@ -1752,11 +1848,21 @@ impl CustomServerSession for ScriptedCustomDownstream {
 
     async fn shutdown(&mut self, _code: u32, _ctx: &str) {}
 
+    async fn abandon(&mut self, _ctx: &str) {
+        if self.is_selected_response_writer_rejection() {
+            CUSTOM_SELECTED_RESPONSE_ABANDONS.fetch_add(1, Ordering::SeqCst);
+            CUSTOM_SELECTED_RESPONSE_ABANDON_CHANGED.notify_waiters();
+        }
+    }
+
     fn is_body_done(&mut self) -> bool {
         false
     }
 
     async fn finish(&mut self) -> Result<()> {
+        if self.is_selected_response_writer_rejection() {
+            CUSTOM_SELECTED_RESPONSE_FINISHES.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(())
     }
 
@@ -1765,6 +1871,11 @@ impl CustomServerSession for ScriptedCustomDownstream {
     }
 
     async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
+        if self.is_selected_response_writer_rejection() && self.body_reads == 0 {
+            while !CUSTOM_SELECTED_RESPONSE_HEAD_WRITTEN.load(Ordering::SeqCst) {
+                CUSTOM_SELECTED_RESPONSE_HEAD_CHANGED.notified().await;
+            }
+        }
         if CUSTOM_DOWNSTREAM_RESPONSE_DONE.load(Ordering::SeqCst) {
             CUSTOM_DOWNSTREAM_POST_RESPONSE_BODY_POLLS.fetch_add(1, Ordering::SeqCst);
         }
@@ -1849,6 +1960,7 @@ struct Harness {
     cache_proxy_port: u16,
     custom_proxy_port: u16,
     custom_downstream_proxy_port: u16,
+    custom_abort_downstream_proxy_port: u16,
 }
 
 impl Harness {
@@ -1874,14 +1986,18 @@ fn start_harness() -> Harness {
     let cache_proxy_port = reserve_port();
     let custom_proxy_port = reserve_port();
     let custom_downstream_proxy_port = reserve_port();
+    let custom_abort_downstream_proxy_port = reserve_port();
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
     let cache_proxy_addr = format!("127.0.0.1:{cache_proxy_port}");
     let custom_proxy_addr = format!("127.0.0.1:{custom_proxy_port}");
     let custom_downstream_proxy_addr = format!("127.0.0.1:{custom_downstream_proxy_port}");
+    let custom_abort_downstream_proxy_addr =
+        format!("127.0.0.1:{custom_abort_downstream_proxy_port}");
     let listen_addr = proxy_addr.clone();
     let cache_listen_addr = cache_proxy_addr.clone();
     let custom_listen_addr = custom_proxy_addr.clone();
     let custom_downstream_listen_addr = custom_downstream_proxy_addr.clone();
+    let custom_abort_downstream_listen_addr = custom_abort_downstream_proxy_addr.clone();
 
     thread::spawn(move || {
         let mut server = Server::new(None).unwrap();
@@ -1958,11 +2074,45 @@ fn start_harness() -> Harness {
         .build();
         custom_downstream_proxy_service.add_tcp(&custom_downstream_listen_addr);
 
+        let custom_abort_downstream_handler: ProcessCustomSession<
+            EmitProxy,
+            HeaderOnlyCustomConnector,
+        > = Arc::new(|proxy, _stream: Stream, shutdown: &ShutdownWatch| {
+            let shutdown = shutdown.clone();
+            Box::pin(async move {
+                proxy
+                    .process_new_http(
+                        ServerSession::new_custom(Box::new(
+                            ScriptedCustomDownstream::selected_response_then_writer_rejection(),
+                        )),
+                        &shutdown,
+                    )
+                    .await;
+                None
+            })
+        });
+        let mut custom_abort_downstream_options = pingora_core::apps::HttpServerOptions::default();
+        custom_abort_downstream_options.force_custom = true;
+        let mut custom_abort_downstream_proxy_service = ProxyServiceBuilder::new(
+            &server.configuration,
+            EmitProxy {
+                origin_port,
+                custom: true,
+                cache: false,
+                terminate_once_fired: AtomicBool::new(false),
+            },
+        )
+        .custom(HeaderOnlyCustomConnector, custom_abort_downstream_handler)
+        .server_options(custom_abort_downstream_options)
+        .build();
+        custom_abort_downstream_proxy_service.add_tcp(&custom_abort_downstream_listen_addr);
+
         let services: Vec<Box<dyn ServiceWithDependents>> = vec![
             Box::new(proxy_service),
             Box::new(cache_proxy_service),
             Box::new(custom_proxy_service),
             Box::new(custom_downstream_proxy_service),
+            Box::new(custom_abort_downstream_proxy_service),
         ];
         server.add_services(services);
         server.run_forever();
@@ -1975,6 +2125,7 @@ fn start_harness() -> Harness {
         &cache_proxy_addr,
         &custom_proxy_addr,
         &custom_downstream_proxy_addr,
+        &custom_abort_downstream_proxy_addr,
     ] {
         loop {
             if std::net::TcpStream::connect(addr).is_ok() {
@@ -1993,6 +2144,7 @@ fn start_harness() -> Harness {
         cache_proxy_port,
         custom_proxy_port,
         custom_downstream_proxy_port,
+        custom_abort_downstream_proxy_port,
     }
 }
 
@@ -3209,6 +3361,76 @@ async fn custom_early_response_stops_polling_a_custom_downstream() {
         CUSTOM_DOWNSTREAM_WRITER_CLEANUPS.load(Ordering::SeqCst),
         1,
         "the custom body writer did not follow its normal cleanup path"
+    );
+}
+
+#[tokio::test]
+async fn custom_writer_rejection_aborts_a_selected_incomplete_custom_response() {
+    let path = CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_PATH;
+    let script = CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_SCRIPT;
+    let harness = init();
+
+    // The readiness probe executes this deterministic custom session once.
+    // Wait for it to finish before resetting the observations for this request.
+    let _ = wait_for_custom_request_body_record(path).await;
+    CUSTOM_REQUEST_BODY_RECORDS.lock().unwrap().remove(path);
+    CUSTOM_REJECTED_WRITER_ATTEMPTS
+        .lock()
+        .unwrap()
+        .remove(script);
+    CUSTOM_SELECTED_RESPONSE_HEAD_WRITTEN.store(false, Ordering::SeqCst);
+    CUSTOM_SELECTED_RESPONSE_ABANDONS.store(0, Ordering::SeqCst);
+    CUSTOM_SELECTED_RESPONSE_FINISHES.store(0, Ordering::SeqCst);
+
+    let _io = TcpStream::connect(("127.0.0.1", harness.custom_abort_downstream_proxy_port))
+        .await
+        .unwrap();
+    let record = wait_for_custom_request_body_record(path).await;
+
+    assert!(
+        CUSTOM_SELECTED_RESPONSE_HEAD_WRITTEN.load(Ordering::SeqCst),
+        "the response head was not selected before the writer rejected request data"
+    );
+    assert_request_body_terminal_events(
+        &record.events,
+        RequestBodyEvent::Abandoned,
+        DataEventCount::Exactly(1),
+        script,
+    );
+    assert_eq!(
+        CUSTOM_REJECTED_WRITER_ATTEMPTS
+            .lock()
+            .unwrap()
+            .get(script)
+            .copied(),
+        Some(1),
+        "the fixture did not reject the first real writer attempt"
+    );
+    assert_eq!(
+        CUSTOM_SELECTED_RESPONSE_ABANDONS.load(Ordering::SeqCst),
+        1,
+        "the selected incomplete custom response was not explicitly abandoned exactly once"
+    );
+    assert_eq!(
+        CUSTOM_SELECTED_RESPONSE_FINISHES.load(Ordering::SeqCst),
+        0,
+        "the selected incomplete custom response was finished cleanly"
+    );
+    assert_eq!(record.logging_calls, 1);
+    assert_eq!(
+        record.error_type.as_ref(),
+        Some(&pingora_error::ErrorType::WriteError)
+    );
+    assert_eq!(
+        record.error_source.as_ref(),
+        Some(&pingora_error::ErrorSource::Upstream)
+    );
+    assert!(
+        record
+            .error_text
+            .as_deref()
+            .is_some_and(|text| text.contains("scripted custom request-body writer rejection")),
+        "the original custom writer error was not preserved: {record:?}"
     );
 }
 

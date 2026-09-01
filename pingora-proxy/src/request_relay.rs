@@ -472,7 +472,28 @@ impl RequestTerminationOrigin {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum RequestRelayOutcome {
     Continue(PreparedRequestEvent),
+    /// A response was selected before the hook, but the call site has not
+    /// qualified it complete. The protocol pump must abort downstream without
+    /// writing a clean response terminator.
+    AbortSelectedResponse,
+    /// The application returned `Terminate` for an `Abandoned` event after the
+    /// response pipeline had already selected the final response. The protocol
+    /// pump must stop the request side without finishing or replacing that
+    /// response, then continue draining the selected response.
+    PreserveSelectedResponse,
     Terminate(RequestTerminationOrigin),
+}
+
+/// Call-site proof attached to an `Abandoned` request-body event.
+///
+/// Response selection alone does not prove response completion: a writer
+/// rejection can abandon the request while the selected response is still
+/// incomplete. Only a pump branch that has independently qualified the whole
+/// response may preserve it when the application returns `Terminate`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AbandonmentResponsePolicy {
+    Abort,
+    PreserveSelected,
 }
 
 impl<SV, C> HttpProxy<SV, C>
@@ -490,8 +511,34 @@ where
         &self,
         protocol: RequestRelayProtocol,
         session: &mut Session,
+        body: Option<Bytes>,
+        event: RequestBodyEvent,
+        ctx: &mut SV::CTX,
+    ) -> Result<RequestRelayOutcome>
+    where
+        SV: Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        self.request_relay_event_with_abandonment_policy(
+            protocol,
+            session,
+            body,
+            event,
+            AbandonmentResponsePolicy::Abort,
+            ctx,
+        )
+        .await
+    }
+
+    /// Process one request-body event with an explicit response-completion fact
+    /// from the protocol pump's abandonment branch.
+    pub(crate) async fn request_relay_event_with_abandonment_policy(
+        &self,
+        protocol: RequestRelayProtocol,
+        session: &mut Session,
         mut body: Option<Bytes>,
         mut event: RequestBodyEvent,
+        abandonment_response_policy: AbandonmentResponsePolicy,
         ctx: &mut SV::CTX,
     ) -> Result<RequestRelayOutcome>
     where
@@ -514,6 +561,7 @@ where
                 .request_trailers_present()
                 .unwrap_or(false)
         {
+            let response_selected_before_hook = session.response_head_selected_by_pipeline();
             let action = self.inner.request_trailer_filter(session, ctx).await?;
 
             // Commit the latch only after a successful hook return. The pump
@@ -521,6 +569,9 @@ where
             // error must be allowed to run again on the next attempt.
             session.request_trailer_filter_fired = true;
             if action == RequestBodyAction::Terminate {
+                if response_selected_before_hook {
+                    return Ok(RequestRelayOutcome::AbortSelectedResponse);
+                }
                 return Ok(RequestRelayOutcome::Terminate(
                     RequestTerminationOrigin::TrailerFilter,
                 ));
@@ -532,12 +583,27 @@ where
             .request_body_filter(&mut body, event)
             .await?;
 
+        // Snapshot the owner before awaiting application code. A response that
+        // appears during the hook is the application's local terminate reply;
+        // one selected before the hook belongs to the response pipeline and
+        // must not be truncated by treating the same action as local-response
+        // completion.
+        let response_selected_before_hook = session.response_head_selected_by_pipeline();
         if self
             .inner
             .request_body_filter_action(session, &mut body, event, ctx)
             .await?
             == RequestBodyAction::Terminate
         {
+            if response_selected_before_hook {
+                if event == RequestBodyEvent::Abandoned
+                    && abandonment_response_policy == AbandonmentResponsePolicy::PreserveSelected
+                {
+                    session.mark_preserved_selected_response_after_request_termination();
+                    return Ok(RequestRelayOutcome::PreserveSelectedResponse);
+                }
+                return Ok(RequestRelayOutcome::AbortSelectedResponse);
+            }
             if !protocol.supports_termination() {
                 return Error::e_explain(
                     InternalError,

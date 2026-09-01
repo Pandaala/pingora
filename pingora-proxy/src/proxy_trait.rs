@@ -355,9 +355,14 @@ pub trait ProxyHttp {
     /// continue.
     ///
     /// Before returning [`RequestBodyAction::Terminate`] the application must
-    /// have finished the downstream response itself — either by writing a
-    /// local reply, or by observing an already-committed response and
-    /// abandoning. Pingora never writes a response on the terminate path; a
+    /// have finished an application-owned downstream response itself. For an
+    /// [`RequestBodyEvent::Abandoned`] delivered after the response pipeline
+    /// selected a final response, do not write a local replacement. If the
+    /// protocol pump has independently qualified that response as complete,
+    /// `Terminate` stops the request side while Pingora preserves and drains
+    /// the selected response. Otherwise Pingora explicitly aborts the selected
+    /// incomplete response without writing a clean body terminator. Pingora
+    /// never creates a response on the ordinary terminate path; a
     /// terminate with nothing written leaves the client with a bare connection
     /// close, and Pingora logs a warning when it detects that.
     ///
@@ -411,8 +416,11 @@ pub trait ProxyHttp {
     ///   yields no trailer event.
     ///
     /// The [`RequestBodyAction::Terminate`] contract is the same as for
-    /// [`Self::request_body_filter_action`]: the application must have
-    /// finished the downstream response before returning it.
+    /// [`Self::request_body_filter_action`]. A local response first written in
+    /// this hook is application-owned. If the response pipeline selected a
+    /// response before the hook, do not write a replacement: termination
+    /// explicitly aborts that unqualified incomplete response without a clean
+    /// body terminator.
     async fn request_trailer_filter(
         &self,
         _session: &mut Session,

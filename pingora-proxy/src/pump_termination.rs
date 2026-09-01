@@ -23,6 +23,53 @@ use log::{debug, warn};
 use pingora_cache::NoCacheReason;
 use pingora_error::{BError, Result};
 use std::future::Future;
+use std::time::Duration;
+
+/// How long a request body may be drained after a pump stops relaying it.
+pub(super) const ABANDONED_BODY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound the drain of a downstream request body the pump has stopped reading.
+///
+/// Closing an H1 socket while unread upload bytes remain can make the kernel
+/// reset the connection and discard a complete response the client has not yet
+/// read. A bounded drain avoids both that truncation risk and an unbounded task
+/// held by a client that never finishes uploading. Existing application limits
+/// win, and completed request bodies are a no-op.
+pub(super) fn bound_undrained_downstream_body(session: &mut Session) {
+    if session.as_mut().is_body_done() || session.as_mut().get_total_drain_timeout().is_some() {
+        return;
+    }
+    debug!(
+        "the upstream stopped receiving before the downstream request body ended; \
+         bounding the drain at {ABANDONED_BODY_DRAIN_TIMEOUT:?}"
+    );
+    session
+        .as_mut()
+        .set_total_drain_timeout(Some(ABANDONED_BODY_DRAIN_TIMEOUT));
+}
+
+/// Drain safely before enforcing H1 non-reuse after a selected response was
+/// preserved from application termination.
+///
+/// Response delivery finishes before this helper runs. Draining then avoids a
+/// reset that could erase queued response bytes, while returning `false` keeps
+/// the abandoned H1 connection out of the reusable pool. H2 and custom
+/// downstream connection ownership is unchanged.
+pub(super) async fn finalize_preserved_response_downstream_reuse(
+    session: &mut Session,
+    reuse_downstream: bool,
+) -> bool {
+    if !reuse_downstream
+        || !session.preserved_selected_response_after_request_termination()
+        || session.downstream_session.as_http1().is_none()
+    {
+        return reuse_downstream;
+    }
+
+    bound_undrained_downstream_body(session);
+    let _ = session.downstream_session.drain_request_body().await;
+    false
+}
 
 /// Whether polling the downstream request body again can only park forever.
 ///
@@ -78,6 +125,18 @@ pub(super) fn release_cache_on_terminate(session: &mut Session) {
     if session.cache.enabled() {
         session.cache.disable(NoCacheReason::InternalError);
     }
+}
+
+/// Abort a response selected before an application termination when the pump
+/// has not proved that response complete.
+///
+/// This deliberately does not call `finish_body`: H1 closes without a final
+/// chunk and H2 resets the stream, so the client cannot mistake a truncated
+/// representation for a clean success.
+pub(super) async fn abort_selected_response(session: &mut Session) {
+    session.set_keepalive(None);
+    release_cache_on_terminate(session);
+    session.downstream_session.shutdown().await;
 }
 
 /// The terminate contract requires the application to have finished the
@@ -224,6 +283,10 @@ pub(super) enum DownstreamRequestOutcome {
     /// is downstream connection reusability; the upstream connection/stream
     /// must not be reused.
     CompleteWithoutUpstreamReuse(bool),
+    /// The application terminated after a pipeline response was selected but
+    /// before the pump qualified it complete. Downstream was explicitly
+    /// aborted without a clean response terminator.
+    AbortSelectedResponse,
     /// Application termination: proxying of this request stops here. The
     /// application has already finished the downstream response.
     Terminate,
@@ -279,6 +342,9 @@ where
                 Ok(DownstreamRequestOutcome::Terminate) => {
                     DuplexPumpOutcome::ApplicationTerminate { upstream: None }
                 }
+                Ok(DownstreamRequestOutcome::AbortSelectedResponse) => {
+                    DuplexPumpOutcome::ApplicationTerminate { upstream: None }
+                }
                 Ok(DownstreamRequestOutcome::Complete(downstream_can_reuse)) => {
                     match upstream.await {
                         Ok(upstream) => DuplexPumpOutcome::Complete {
@@ -300,6 +366,11 @@ where
             match upstream_result {
                 Ok(upstream) => match downstream.await {
                     Ok(DownstreamRequestOutcome::Terminate) => {
+                        DuplexPumpOutcome::ApplicationTerminate {
+                            upstream: Some(upstream),
+                        }
+                    }
+                    Ok(DownstreamRequestOutcome::AbortSelectedResponse) => {
                         DuplexPumpOutcome::ApplicationTerminate {
                             upstream: Some(upstream),
                         }

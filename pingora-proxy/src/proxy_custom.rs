@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::request_relay::{RequestRelayOutcome, RequestRelayProtocol};
+use crate::request_relay::{AbandonmentResponsePolicy, RequestRelayOutcome, RequestRelayProtocol};
 use crate::response_pipeline::{ResponsePipelineState, ResponseProtocol};
 use futures::StreamExt;
 use pingora_core::{
@@ -29,7 +29,10 @@ use proxy_cache::ServeFromCache;
 use proxy_common::{
     no_downstream_body_to_read, DownstreamStateMachine, PipeState, ResponseStateMachine,
 };
-use pump_termination::{release_cache_on_terminate, DownstreamRequestOutcome};
+use pump_termination::{
+    abort_selected_response, finalize_preserved_response_downstream_reuse,
+    release_cache_on_terminate, DownstreamRequestOutcome,
+};
 use tokio::sync::oneshot;
 
 use super::*;
@@ -340,6 +343,7 @@ where
                 release_cache_on_terminate(session);
                 (false, false, None)
             }
+            Ok((DownstreamRequestOutcome::AbortSelectedResponse, _, _, _)) => (false, false, None),
             Err(e) => (false, false, Some(e)),
         }
     }
@@ -503,6 +507,7 @@ where
                 session,
                 Some(buffer),
                 RequestBodyEvent::from(downstream_state.is_done()),
+                AbandonmentResponsePolicy::Abort,
                 client_body,
                 ctx,
                 request_body_error,
@@ -546,6 +551,7 @@ where
                     session,
                     None,
                     RequestBodyEvent::Abandoned,
+                    AbandonmentResponsePolicy::PreserveSelected,
                     client_body,
                     ctx,
                     request_body_error,
@@ -610,6 +616,7 @@ where
                             session,
                             body,
                             event,
+                            AbandonmentResponsePolicy::Abort,
                             client_body,
                             ctx,
                             request_body_error,
@@ -889,6 +896,8 @@ where
                 }
             }
         }
+        reuse_downstream =
+            finalize_preserved_response_downstream_reuse(session, reuse_downstream).await;
         // Signal the upstream half that the downstream half completed cleanly before
         // dropping rx, so a resulting task-pipe closure is treated as benign.
         pipe_state.store(PipeState::DownstreamComplete as u8, Ordering::Release);
@@ -904,6 +913,7 @@ where
         session: &mut Session,
         data: Option<Bytes>,
         event: RequestBodyEvent,
+        abandonment_response_policy: AbandonmentResponsePolicy,
         client_body: &mut Box<dyn BodyWrite>,
         ctx: &mut SV::CTX,
         request_body_error: &mut Option<Box<Error>>,
@@ -913,10 +923,30 @@ where
         SV::CTX: Send + Sync,
     {
         let prepared = match self
-            .request_relay_event(RequestRelayProtocol::Custom, session, data, event, ctx)
+            .request_relay_event_with_abandonment_policy(
+                RequestRelayProtocol::Custom,
+                session,
+                data,
+                event,
+                abandonment_response_policy,
+                ctx,
+            )
             .await?
         {
             RequestRelayOutcome::Continue(prepared) => prepared,
+            RequestRelayOutcome::AbortSelectedResponse => {
+                abort_selected_response(session).await;
+                return Error::e_explain(
+                    InternalError,
+                    "request-body terminate aborted an incomplete selected response",
+                );
+            }
+            RequestRelayOutcome::PreserveSelectedResponse => {
+                // The selected response remains owned by the response pump.
+                // Abandonment is terminal for request-side state but is not a
+                // clean custom-upstream request EOS.
+                return Ok(true);
+            }
             RequestRelayOutcome::Terminate(_) => {
                 // Keep the pump-side safety boundary too: a future relay
                 // capability change must fail this data-plane request rather
@@ -962,7 +992,7 @@ where
                     *request_body_error = Some(writer_error);
                 }
                 if event == RequestBodyEvent::Data {
-                    if let Err(abandon_error) = self
+                    match self
                         .request_relay_event(
                             RequestRelayProtocol::Custom,
                             session,
@@ -972,10 +1002,20 @@ where
                         )
                         .await
                     {
-                        warn!(
-                            "request-body Abandoned hook failed after custom writer rejection: \
-                             {abandon_error}; preserving first error: {writer_error_text}"
-                        );
+                        Ok(RequestRelayOutcome::AbortSelectedResponse) => {
+                            abort_selected_response(session).await;
+                        }
+                        Ok(
+                            RequestRelayOutcome::Continue(_)
+                            | RequestRelayOutcome::PreserveSelectedResponse
+                            | RequestRelayOutcome::Terminate(_),
+                        ) => {}
+                        Err(abandon_error) => {
+                            warn!(
+                                "request-body Abandoned hook failed after custom writer rejection: \
+                                 {abandon_error}; preserving first error: {writer_error_text}"
+                            );
+                        }
                     }
                 }
                 // The durable slot owns the real error. This marker only stops

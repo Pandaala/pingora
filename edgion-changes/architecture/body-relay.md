@@ -205,7 +205,10 @@ source read / replay read
   -> downstream request modules
   -> ProxyHttp::request_body_filter_action
        Edgion: streamed handlers -> WAF -> observers -> mirror
-  -> Continue(filtered body + typed event) | Terminate(origin)
+  -> Continue(filtered body + typed event)
+     | PreserveSelectedResponse
+     | AbortSelectedResponse
+     | Terminate(application-owned response origin)
   -> protocol-specific empty suppression/bodyless validation/write
 ```
 
@@ -232,6 +235,16 @@ stream or connection cleanup, cache finalization, and reuse decisions.
   sequence.
 - An early upstream response stops an unfinished live upload and delivers
   `Abandoned` once.
+- A response selected by the response pipeline before that `Abandoned` hook
+  remains response-pump-owned only when the abandonment call site also proves
+  the response complete. If the hook then returns `Terminate`, the shared relay
+  reports `PreserveSelectedResponse`: each protocol pump ends request-side work
+  without calling response finalization, then drains the already-selected
+  response. Writer rejection, nonterminal termination, and other unqualified
+  selected-response cases report `AbortSelectedResponse`: the downstream
+  protocol closes or resets without a clean terminator. A response first
+  written inside the hook remains application-owned and follows ordinary
+  `Terminate` cleanup.
 - Retry replay is a new application delivery sequence, but request trailers
   remain request-scoped and at most once.
 - Capture/replay cancellation, poison, truncation, or release never becomes a

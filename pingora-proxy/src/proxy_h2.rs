@@ -19,11 +19,15 @@ use super::*;
 use crate::proxy_cache::ServeFromCache;
 use crate::proxy_common::*;
 use crate::pump_termination::{
-    downstream_body_read_is_futile, finish_terminated_response, join_bidirectional_pumps,
-    release_cache_on_terminate, warn_response_body_terminate_content_length_leak,
+    bound_undrained_downstream_body, downstream_body_read_is_futile,
+    finalize_preserved_response_downstream_reuse, finish_terminated_response,
+    join_bidirectional_pumps, release_cache_on_terminate,
+    warn_response_body_terminate_content_length_leak,
     warn_response_body_terminate_without_response, DownstreamRequestOutcome, DuplexPumpOutcome,
 };
-use crate::request_relay::{safe_upstream_disposition, validate_streamed_upstream_disposition};
+use crate::request_relay::{
+    safe_upstream_disposition, validate_streamed_upstream_disposition, AbandonmentResponsePolicy,
+};
 use crate::response_pipeline::{ResponsePipelineState, ResponseProtocol, ResponseTaskBatchOutcome};
 
 #[path = "proxy_h2_request_body.rs"]
@@ -34,9 +38,8 @@ use pingora_core::protocols::http::v2::client::Http2Session;
 #[cfg(test)]
 use pingora_core::protocols::http::v2::client::PeerEndStream;
 use request_body::{
-    apply_upstream_body_disposition, bound_undrained_downstream_body,
-    upstream_empty_data_end_stream, upstream_framing_body_empty, upstream_headers_end_stream,
-    UpstreamBodyOutcome, UpstreamBodyWrite,
+    apply_upstream_body_disposition, upstream_empty_data_end_stream, upstream_framing_body_empty,
+    upstream_headers_end_stream, UpstreamBodyOutcome, UpstreamBodyWrite,
 };
 #[cfg(test)]
 use request_body::{
@@ -694,6 +697,7 @@ where
                     session,
                     buffer,
                     RequestBodyEvent::from(downstream_state.is_done()),
+                    AbandonmentResponsePolicy::Abort,
                     client_body,
                     ctx,
                     &body_write,
@@ -709,6 +713,9 @@ where
                     restore_custom_message_reader(session, downstream_custom_message_reader.take());
                     return Ok(DownstreamRequestOutcome::Terminate);
                 }
+                UpstreamBodyOutcome::Downstream(
+                    DownstreamRequestOutcome::AbortSelectedResponse,
+                ) => return Ok(DownstreamRequestOutcome::AbortSelectedResponse),
                 // The replayed body could not be written because the upstream
                 // had already answered in full and reset the stream. Failing the
                 // request here would discard that response; the duplex loop
@@ -716,18 +723,26 @@ where
                 UpstreamBodyOutcome::UpstreamDoneReceiving {
                     terminal_event_delivered,
                 } => {
-                    if !terminal_event_delivered
-                        && self
+                    if !terminal_event_delivered {
+                        match self
                             .finish_downstream_body_side(session, client_body, ctx, &body_write)
                             .await?
-                    {
-                        session.set_keepalive(None);
-                        finish_terminated_response(session).await;
-                        restore_custom_message_reader(
-                            session,
-                            downstream_custom_message_reader.take(),
-                        );
-                        return Ok(DownstreamRequestOutcome::Terminate);
+                        {
+                            DownstreamRequestOutcome::Terminate => {
+                                session.set_keepalive(None);
+                                finish_terminated_response(session).await;
+                                restore_custom_message_reader(
+                                    session,
+                                    downstream_custom_message_reader.take(),
+                                );
+                                return Ok(DownstreamRequestOutcome::Terminate);
+                            }
+                            DownstreamRequestOutcome::AbortSelectedResponse => {
+                                return Ok(DownstreamRequestOutcome::AbortSelectedResponse);
+                            }
+                            DownstreamRequestOutcome::Complete(_)
+                            | DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(_) => {}
+                        }
                     }
                     upstream_stopped_receiving = true;
                     downstream_state.maybe_finished(true);
@@ -785,6 +800,7 @@ where
                         session,
                         None,
                         RequestBodyEvent::Abandoned,
+                        AbandonmentResponsePolicy::PreserveSelected,
                         client_body,
                         ctx,
                         &UpstreamBodyWrite {
@@ -798,6 +814,13 @@ where
                     finish_terminated_response(session).await;
                     restore_custom_message_reader(session, downstream_custom_message_reader.take());
                     return Ok(DownstreamRequestOutcome::Terminate);
+                }
+                if outcome
+                    == UpstreamBodyOutcome::Downstream(
+                        DownstreamRequestOutcome::AbortSelectedResponse,
+                    )
+                {
+                    return Ok(DownstreamRequestOutcome::AbortSelectedResponse);
                 }
                 // `UpstreamDoneReceiving` needs nothing extra here. The
                 // terminal event this branch exists to deliver has just been
@@ -885,6 +908,7 @@ where
                             session,
                             body,
                             RequestBodyEvent::from(is_body_done),
+                            AbandonmentResponsePolicy::Abort,
                             client_body,
                             ctx,
                             &body_write,
@@ -935,13 +959,33 @@ where
                         // the terminal event that taking the read side out of
                         // the loop would otherwise cost it.
                         Ok(UpstreamBodyOutcome::UpstreamDoneReceiving { terminal_event_delivered }) => {
-                            if !terminal_event_delivered
-                                && self.finish_downstream_body_side(session, client_body, ctx, &body_write).await?
-                            {
-                                session.set_keepalive(None);
-                                finish_terminated_response(session).await;
-                                restore_custom_message_reader(session, downstream_custom_message_reader.take());
-                                return Ok(DownstreamRequestOutcome::Terminate);
+                            if !terminal_event_delivered {
+                                match self
+                                    .finish_downstream_body_side(
+                                        session,
+                                        client_body,
+                                        ctx,
+                                        &body_write,
+                                    )
+                                    .await?
+                                {
+                                    DownstreamRequestOutcome::Terminate => {
+                                        session.set_keepalive(None);
+                                        finish_terminated_response(session).await;
+                                        restore_custom_message_reader(
+                                            session,
+                                            downstream_custom_message_reader.take(),
+                                        );
+                                        return Ok(DownstreamRequestOutcome::Terminate);
+                                    }
+                                    DownstreamRequestOutcome::AbortSelectedResponse => {
+                                        return Ok(
+                                            DownstreamRequestOutcome::AbortSelectedResponse,
+                                        );
+                                    }
+                                    DownstreamRequestOutcome::Complete(_)
+                                    | DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(_) => {}
+                                }
                             }
                             upstream_stopped_receiving = true;
                             downstream_state.maybe_finished(true);
@@ -955,6 +999,9 @@ where
                             restore_custom_message_reader(session, downstream_custom_message_reader.take());
                             return Ok(DownstreamRequestOutcome::Terminate);
                         },
+                        Ok(UpstreamBodyOutcome::Downstream(
+                            DownstreamRequestOutcome::AbortSelectedResponse,
+                        )) => return Ok(DownstreamRequestOutcome::AbortSelectedResponse),
                         Err(e)
                             if e.esource == ErrorSource::Upstream
                                 && matches!(e.etype, WriteTimedout) =>
@@ -1254,6 +1301,8 @@ where
                 }
             }
         }
+        reuse_downstream =
+            finalize_preserved_response_downstream_reuse(session, reuse_downstream).await;
         // Signal the upstream half that the downstream half completed cleanly before
         // dropping rx, so a resulting task-pipe closure is treated as benign.
         pipe_state.store(PipeState::DownstreamComplete as u8, Ordering::Release);

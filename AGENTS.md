@@ -89,6 +89,33 @@ TLS feature wiring, or observable termination/error behavior. At minimum check:
 Do not assume the sibling checkout is the revision in Edgion's lockfile or a
 deployed revision. Record both commits when a conclusion depends on versions.
 
+## Upstream synchronization
+
+Follow
+[`edgion-changes/maintenance/upstream-sync.md`](edgion-changes/maintenance/upstream-sync.md)
+for every adoption of Cloudflare Pingora `main`. These are hard gates:
+
+- Use only the official `upstream/main` as the upstream source. Keep local
+  `main` upstream-only and do not infer the upstream baseline from
+  `origin/main`.
+- Never synchronize with a dirty worktree or resolve the synchronization
+  directly on the published `edgion_v3` branch. Use a dated temporary sync
+  branch or disposable worktree while the published branch stays at its last
+  validated head.
+- Preserve the original migration base. For every published synchronization,
+  retain the old fork head with an immutable annotated tag and append the old
+  base, new upstream target, old and new fork heads, Edgion revision, and
+  verification result to the synchronization ledger. Never replace history
+  with a single "latest upstream commit" field.
+- Rebase or rebuild in feature order, inspect `git range-diff`, apply the
+  conflict and ownership rules, run the complete verification matrix, and
+  validate the exact sibling Edgion consumer before moving the published fork
+  branch or consumer revision.
+- A push, force-update, consumer manifest change, or lockfile change requires
+  explicit authorization beyond the existence of the synchronization
+  procedure. When publishing rewritten history, use `--force-with-lease`,
+  never bare `--force`.
+
 ## Review workflow
 
 Before reporting a finding, read

@@ -19,14 +19,17 @@ use super::*;
 use crate::proxy_cache::ServeFromCache;
 use crate::proxy_common::*;
 use crate::pump_termination::{
-    downstream_body_read_is_futile, finish_terminated_response, join_bidirectional_pumps,
-    release_cache_on_terminate, warn_response_body_terminate_content_length_leak,
+    abort_selected_response, downstream_body_read_is_futile,
+    finalize_preserved_response_downstream_reuse, finish_terminated_response,
+    join_bidirectional_pumps, release_cache_on_terminate,
+    warn_response_body_terminate_content_length_leak,
     warn_response_body_terminate_without_response, warn_terminate_without_response,
     DownstreamRequestOutcome, DuplexPumpOutcome,
 };
 use crate::request_relay::{
     bodyless_contract_violation, safe_upstream_disposition, validate_streamed_upstream_disposition,
-    violates_bodyless_contract, RequestRelayOutcome, RequestRelayProtocol,
+    violates_bodyless_contract, AbandonmentResponsePolicy, RequestRelayOutcome,
+    RequestRelayProtocol,
 };
 use crate::response_pipeline::{ResponsePipelineState, ResponseProtocol, ResponseTaskBatchOutcome};
 use pingora_core::protocols::http::{
@@ -663,11 +666,15 @@ where
                     session,
                     buffer,
                     RequestBodyEvent::from(downstream_state.is_done()),
+                    AbandonmentResponsePolicy::Abort,
                     Some(send_permit),
                     ctx,
                     body_disposition,
                 )
                 .await?;
+            if outcome == DownstreamRequestOutcome::AbortSelectedResponse {
+                return Ok(outcome);
+            }
             if outcome == DownstreamRequestOutcome::Terminate {
                 session.set_keepalive(None);
                 finish_terminated_response(session).await;
@@ -720,11 +727,15 @@ where
                         session,
                         None,
                         RequestBodyEvent::Abandoned,
+                        AbandonmentResponsePolicy::PreserveSelected,
                         None,
                         ctx,
                         body_disposition,
                     )
                     .await?;
+                if outcome == DownstreamRequestOutcome::AbortSelectedResponse {
+                    return Ok(outcome);
+                }
                 if outcome == DownstreamRequestOutcome::Terminate {
                     session.set_keepalive(None);
                     finish_terminated_response(session).await;
@@ -823,11 +834,15 @@ where
                         session,
                         body,
                         RequestBodyEvent::from(is_body_done),
+                        AbandonmentResponsePolicy::Abort,
                         Some(send_permit.unwrap()), // safe because we checked is_ok()
                         ctx,
                         body_disposition,
                     )
                     .await?;
+                    if outcome == DownstreamRequestOutcome::AbortSelectedResponse {
+                        return Ok(outcome);
+                    }
                     if outcome == DownstreamRequestOutcome::Terminate {
                         session.set_keepalive(None);
                         finish_terminated_response(session).await;
@@ -863,11 +878,15 @@ where
                                 session,
                                 None,
                                 RequestBodyEvent::Abandoned,
+                                AbandonmentResponsePolicy::Abort,
                                 None,
                                 ctx,
                                 body_disposition,
                             )
                             .await?;
+                        if outcome == DownstreamRequestOutcome::AbortSelectedResponse {
+                            return Ok(outcome);
+                        }
                         if outcome == DownstreamRequestOutcome::Terminate {
                             session.set_keepalive(None);
                             finish_terminated_response(session).await;
@@ -1155,6 +1174,8 @@ where
                 }
             }
         }
+        reuse_downstream =
+            finalize_preserved_response_downstream_reuse(session, reuse_downstream).await;
         // Signal the upstream half that the downstream half completed cleanly before
         // dropping rx, so a resulting task-pipe closure is treated as benign.
         pipe_state.store(PipeState::DownstreamComplete as u8, Ordering::Release);
@@ -1171,6 +1192,7 @@ where
         session: &mut Session,
         data: Option<Bytes>,
         event: RequestBodyEvent,
+        abandonment_response_policy: AbandonmentResponsePolicy,
         tx: Option<mpsc::Permit<'_, HttpTask>>,
         ctx: &mut SV::CTX,
         body_disposition: UpstreamRequestBodyDisposition,
@@ -1180,10 +1202,28 @@ where
         SV::CTX: Send + Sync,
     {
         let prepared = match self
-            .request_relay_event(RequestRelayProtocol::H1, session, data, event, ctx)
+            .request_relay_event_with_abandonment_policy(
+                RequestRelayProtocol::H1,
+                session,
+                data,
+                event,
+                abandonment_response_policy,
+                ctx,
+            )
             .await?
         {
             RequestRelayOutcome::Continue(prepared) => prepared,
+            RequestRelayOutcome::AbortSelectedResponse => {
+                abort_selected_response(session).await;
+                return Ok(DownstreamRequestOutcome::AbortSelectedResponse);
+            }
+            RequestRelayOutcome::PreserveSelectedResponse => {
+                // This outcome is only produced for Abandoned. No permit may
+                // be consumed and no clean upstream EOS may be manufactured;
+                // the surrounding abandonment branch will stop the request
+                // side and continue draining the selected response.
+                return Ok(DownstreamRequestOutcome::Complete(true));
+            }
             RequestRelayOutcome::Terminate(origin) => {
                 warn_terminate_without_response(session, origin.hook_name());
                 return Ok(DownstreamRequestOutcome::Terminate);

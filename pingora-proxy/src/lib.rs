@@ -629,6 +629,7 @@ pub struct Session {
     /// no downstream final header has been written, so this request must never
     /// start another upstream attempt.
     response_head_attempt_selected: bool,
+    preserved_selected_response_after_request_termination: bool,
     /// Flag that is set when the shutdown process has begun.
     shutdown_flag: Arc<AtomicBool>,
 }
@@ -662,6 +663,7 @@ impl Session {
             native_retry_buffer_state: request_relay::NativeRetryBufferState::NotStarted,
             prepared_response_headers: 0,
             response_head_attempt_selected: false,
+            preserved_selected_response_after_request_termination: false,
             shutdown_flag,
         }
     }
@@ -674,6 +676,26 @@ impl Session {
         self.response_head_attempt_selected = true;
     }
 
+    /// Whether the response pipeline selected a final response for this
+    /// request, even if a response-head hold has not handed it to the writer
+    /// yet.
+    ///
+    /// This deliberately excludes responses written directly by application
+    /// request hooks. Callers that arbitrate a late local reply against an
+    /// origin response need the owner of the response, not merely
+    /// [`Self::response_written`].
+    pub fn response_head_selected_by_pipeline(&self) -> bool {
+        self.response_head_attempt_selected
+    }
+
+    pub(crate) fn mark_preserved_selected_response_after_request_termination(&mut self) {
+        self.preserved_selected_response_after_request_termination = true;
+    }
+
+    pub(crate) fn preserved_selected_response_after_request_termination(&self) -> bool {
+        self.preserved_selected_response_after_request_termination
+    }
+
     /// Whether retry is permanently closed by final-response selection or
     /// commit for this request.
     ///
@@ -681,7 +703,8 @@ impl Session {
     /// advancing an attempt scheduler. Pingora also enforces it after the hook,
     /// but that later guard cannot roll back product-side effects.
     pub fn response_head_retry_closed(&self) -> bool {
-        self.response_head_attempt_selected || final_response_committed(self.response_written())
+        self.response_head_selected_by_pipeline()
+            || final_response_committed(self.response_written())
     }
 
     /// Create a new [Session] from the given [Stream]

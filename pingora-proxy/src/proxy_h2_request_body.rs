@@ -27,10 +27,12 @@ use pingora_error::{
 use pingora_http::RequestHeader;
 use std::time::Duration;
 
-use crate::pump_termination::{warn_terminate_without_response, DownstreamRequestOutcome};
+use crate::pump_termination::{
+    abort_selected_response, warn_terminate_without_response, DownstreamRequestOutcome,
+};
 use crate::request_relay::{
-    bodyless_contract_violation, violates_bodyless_contract, RequestRelayOutcome,
-    RequestRelayProtocol,
+    bodyless_contract_violation, violates_bodyless_contract, AbandonmentResponsePolicy,
+    RequestRelayOutcome, RequestRelayProtocol,
 };
 use crate::{HttpProxy, ProxyHttp, RequestBodyEvent, Session, UpstreamRequestBodyDisposition};
 
@@ -373,50 +375,6 @@ pub(super) fn upstream_write_stalled_after_response(e: &Error) -> bool {
     matches!(e.etype, WriteTimedout)
 }
 
-/// How long the downstream request body may be drained for once the pump has
-/// stopped reading it. Generous enough that an ordinary in-flight upload
-/// finishes and the connection stays reusable; finite so that one cannot hold
-/// the connection and its task open indefinitely.
-pub(super) const ABANDONED_BODY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Bound the drain of a downstream request body the pump has stopped reading.
-///
-/// `UpstreamDoneReceiving` returns the exchange as a SUCCESS, so unlike the two
-/// `Terminate` paths nothing here clears keepalive -- and for an H1 downstream
-/// that means `finish()` will DRAIN whatever the client is still uploading in
-/// order to reuse the socket, bounded only by `total_drain_timeout`, which
-/// defaults to `None`. A client with a multi-gigabyte upload in flight would
-/// otherwise hold the connection, and this task, for as long as it cared to
-/// keep writing.
-///
-/// Bounding is chosen over the terminate paths' `set_keepalive(None)`, and the
-/// difference is not cosmetic: those paths have no response left to protect,
-/// whereas this one is in the middle of delivering a complete response the
-/// section 8.1 handling just rescued. Closing an H1 socket that still has an
-/// unread multi-megabyte upload sitting in its receive queue makes the kernel
-/// send RST rather than FIN, and the RST discards whatever the client has not
-/// yet read -- so clearing keepalive here trades an unbounded drain for
-/// intermittently truncating the very response this code exists to deliver.
-/// That was measured, not theorised: it cost
-/// `h2_upstream_no_error_reset_keeps_streaming_while_the_client_uploads` about
-/// one run in fifteen.
-///
-/// An application that has set its own drain timeout keeps it. A no-op when the
-/// downstream body is already done, which is the common case.
-pub(super) fn bound_undrained_downstream_body(session: &mut Session) {
-    if session.as_mut().is_body_done() || session.as_mut().get_total_drain_timeout().is_some() {
-        return;
-    }
-    debug!(
-        target: "pingora_proxy::proxy_h2",
-        "the upstream stopped receiving before the downstream request body ended; \
-         bounding the drain at {ABANDONED_BODY_DRAIN_TIMEOUT:?}"
-    );
-    session
-        .as_mut()
-        .set_total_drain_timeout(Some(ABANDONED_BODY_DRAIN_TIMEOUT));
-}
-
 /// How often a request-body write that is blocked on upstream flow control
 /// re-checks whether the upstream has already flagged its response complete.
 ///
@@ -576,7 +534,7 @@ where
         client_body: &mut h2::SendStream<bytes::Bytes>,
         ctx: &mut SV::CTX,
         body_write: &UpstreamBodyWrite,
-    ) -> Result<bool>
+    ) -> Result<DownstreamRequestOutcome>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
@@ -586,6 +544,7 @@ where
                 session,
                 None,
                 RequestBodyEvent::Abandoned,
+                AbandonmentResponsePolicy::PreserveSelected,
                 client_body,
                 ctx,
                 &UpstreamBodyWrite {
@@ -595,7 +554,12 @@ where
                 },
             )
             .await?;
-        Ok(outcome == UpstreamBodyOutcome::Downstream(DownstreamRequestOutcome::Terminate))
+        Ok(match outcome {
+            UpstreamBodyOutcome::Downstream(outcome) => outcome,
+            UpstreamBodyOutcome::UpstreamDoneReceiving { .. } => {
+                DownstreamRequestOutcome::Complete(true)
+            }
+        })
     }
 
     pub(super) async fn send_body_to2(
@@ -603,6 +567,7 @@ where
         session: &mut Session,
         data: Option<Bytes>,
         event: RequestBodyEvent,
+        abandonment_response_policy: AbandonmentResponsePolicy,
         client_body: &mut h2::SendStream<bytes::Bytes>,
         ctx: &mut SV::CTX,
         body_write: &UpstreamBodyWrite,
@@ -612,10 +577,31 @@ where
         SV::CTX: Send + Sync,
     {
         let prepared = match self
-            .request_relay_event(RequestRelayProtocol::H2, session, data, event, ctx)
+            .request_relay_event_with_abandonment_policy(
+                RequestRelayProtocol::H2,
+                session,
+                data,
+                event,
+                abandonment_response_policy,
+                ctx,
+            )
             .await?
         {
             RequestRelayOutcome::Continue(prepared) => prepared,
+            RequestRelayOutcome::AbortSelectedResponse => {
+                abort_selected_response(session).await;
+                return Ok(UpstreamBodyOutcome::Downstream(
+                    DownstreamRequestOutcome::AbortSelectedResponse,
+                ));
+            }
+            RequestRelayOutcome::PreserveSelectedResponse => {
+                // Abandonment already proved that this request side must stop.
+                // Do not finish the downstream response here: its selected
+                // origin tasks still belong to the H2 response pump.
+                return Ok(UpstreamBodyOutcome::Downstream(
+                    DownstreamRequestOutcome::Complete(true),
+                ));
+            }
             RequestRelayOutcome::Terminate(origin) => {
                 warn_terminate_without_response(session, origin.hook_name());
                 return Ok(UpstreamBodyOutcome::Downstream(

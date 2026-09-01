@@ -55,11 +55,11 @@ Expected feature coverage:
 | `pingora-core --lib` | body buffers, H1/H2 sessions, END_STREAM watch, listener and PROXY parser |
 | `pingora-core --lib --features boringssl` | complete TLS-backed core suite, including deterministic direct/high-level local source-bind classification and timeout-context separation |
 | `pingora-core --lib --features boringssl test_listen_tls_proxy_protocol` | explicit PROXY-before-TLS rejection stages, successful handshake and address preservation |
-| `pingora-proxy --lib` | 194 passed plus 2 ignored manual benchmarks in the Phase 4 snapshot: request relay, response-head barrier/pipeline, H1/H2 lifecycle, cache hooks, sink decisions/budgets, terminal latch, EOS migration, and retry guards |
+| `pingora-proxy --lib` | 198 passed plus 2 ignored manual benchmarks: request relay, response-head barrier/pipeline, H1/H2 lifecycle, cache hooks, sink decisions/budgets, terminal latch, EOS migration, and retry guards |
 | `test_request_body_seam` | 61 H1/H2 request-pump, framing, retry, transfer-coding admission and termination scenarios |
-| `test_upstream_response_body_sink` | 57 response streaming/cache/custom scenarios |
+| `test_upstream_response_body_sink` | 58 response streaming/cache/custom scenarios |
 | `test_terminal_body_dispatch` | 28 self-contained terminal/trailer and real H1/H2 response-head Hold scenarios |
-| `test_h2_upstream_no_error_reset` | 8 self-contained H2 reset/completion scenarios |
+| `test_h2_upstream_no_error_reset` | 10 self-contained H2 reset/completion and selected-response termination scenarios |
 | `test_h2_upstream_stalled_after_response` | 4 H2 request-body stall, configured-deadline, default-floor and END_STREAM discrimination scenarios |
 | `test_h2_upstream_cache_and_reuse` | 8 H2 cache-admission, upstream-connection-reuse, stalled-write cleanup and peer-window-handshake scenarios |
 
@@ -97,6 +97,39 @@ audits should record a pre-change hash if byte-for-byte restoration matters.
 not raise this workspace's Rust 1.85 MSRV.
 
 ## Historical validation snapshots
+
+### 2026-09-01 selected-response abandonment closure
+
+The local-source consumer run used Edgion
+`0a95362aa5a641944ef3524499366daefd6f583a` (`feature-08-30`) plus the
+uncommitted request-body termination policy change, against the Pingora
+working tree based on `938fc02f5c28859ce84356ade8375574bcb4cf58`
+(`edgion_v3`). A temporary Cargo config selected the local Pingora core and
+proxy packages without changing the normal manifest source policy.
+
+- Pingora formatting, core/proxy checks, the default and connection-filter core
+  unit suites, 768 BoringSSL core tests, and the two focused TLS/PROXY tests
+  passed. The inherited public-network connector test
+  `test_custom_client_non_custom_upstream` was excluded from the final
+  BoringSSL run after waiting more than four minutes for `1.1.1.1:443` in the
+  current environment.
+- `cargo test -p pingora-proxy --lib`: 198 passed, 2 ignored;
+  `test_request_body_seam`: 61 passed;
+  `test_upstream_response_body_sink`: 57 passed;
+  `test_terminal_body_dispatch`: 28 passed;
+  `test_h2_upstream_no_error_reset`: 10 passed;
+  `test_h2_upstream_stalled_after_response`: 4 passed; and
+  `test_h2_upstream_cache_and_reuse`: 8 passed.
+- Pingora `cargo clippy -p pingora-proxy --all-targets` exited 0 with the
+  existing warning baseline.
+- With the local-source config, Edgion formatting, workspace/all-target
+  `cargo check` and `cargo clippy`, and `cargo test -p edgion-gateway --lib`
+  passed; the gateway result was 3503 passed and 2 ignored.
+- Edgion agent-doc, SSA-force, metrics-inventory, Pingora-source-policy,
+  gateway-no-tracing, and English-only guards passed. Locked offline metadata
+  passed after the temporary config was removed. `Cargo.lock` was restored
+  byte-for-byte to SHA-256
+  `c4415fa572df7cde3cc084efba61745c1d9732680ab0e551bb15d579add090d5`.
 
 ### 2026-08-31 ws3 `feature-08-30` local-source run
 

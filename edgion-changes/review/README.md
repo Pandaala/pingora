@@ -44,6 +44,9 @@ The `status` inside each record is authoritative.
 - [Writer stall after response](h2-grpc/h2-writer-capacity-stall-after-response.md)
   (H2-007): complete evidence plus stall permits upload abandonment; neither
   condition alone does.
+- [Abandonment termination preserves a selected response](h2-grpc/h2-abandonment-terminate-preserves-selected-response.md):
+  qualified `Abandoned + Terminate` preserves a complete selected response;
+  every selected but incomplete termination explicitly aborts downstream.
 - [Writer stall without response END_STREAM](h2-grpc/h2-writer-stall-without-end-stream-bounded.md):
   every H2 capacity wait has a finite progress bound; without qualified
   response END_STREAM, expiry fails the exchange and releases stream capacity.
