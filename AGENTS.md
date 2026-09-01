@@ -111,6 +111,10 @@ for every adoption of Cloudflare Pingora `main`. These are hard gates:
   conflict and ownership rules, run the complete verification matrix, and
   validate the exact sibling Edgion consumer before moving the published fork
   branch or consumer revision.
+- In highly divergent files, use the new upstream implementation as the
+  structural baseline and reapply only the smallest contract-complete Edgion
+  delta. Review that downstream-only diff separately; minimizing it must not
+  remove documented behavior, safety checks, or regression coverage.
 - A push, force-update, consumer manifest change, or lockfile change requires
   explicit authorization beyond the existence of the synchronization
   procedure. When publishing rewritten history, use `--force-with-lease`,

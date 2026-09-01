@@ -80,6 +80,10 @@ consumer change.
    line counts. Run focused tests after each feature or coherent conflict
    group. If upstream now supplies the feature, retain only the fork-owned
    policy or safety boundary that remains necessary and update its provenance.
+   In a highly divergent file, start from the new upstream structure and
+   reapply the smallest contract-complete fork delta instead of restoring the
+   old fork version. Avoid carrying fork-only formatting, moves, helper copies,
+   or compatibility layers that no longer protect an Edgion-owned behavior.
 4. Compare the old and rebuilt stacks with `git range-diff`:
 
    ```text
@@ -115,7 +119,7 @@ output here.
 
 | Date | Old upstream base | New upstream target | Old fork head/tag | New fork head/tag | Edgion revision | Verification |
 | --- | --- | --- | --- | --- | --- | --- |
-| _append after the next completed synchronization_ | | | | | | |
+| 2026-09-01 (baseline audit; no upstream delta) | `09696b5` | `09696b5` | `2e2e674` | `edgion-v3-sync-20260901-upstream-09696b5` | `b9a73a8` | [snapshot](../verification/test-matrix.md#2026-09-01-upstream-baseline-audit-no-upstream-delta) |
 
 The baseline provenance in the [knowledge index](../README.md) and
 [feature inventory](../features.md) records the original migration and remains
@@ -174,6 +178,10 @@ The expected shared-main conflict surface is intentionally concentrated:
   Edgion implementation has a larger conflicting block.
 - Compare behavior and tests, not raw line counts. A smaller adapter around a
   current helper is preferable to copying an old function.
+- For high-divergence conflicts, inspect the resolved file against the new
+  upstream version as a separate diff. Minimize that downstream diff while
+  preserving every documented fork contract; a smaller diff is a maintenance
+  goal, not permission to weaken behavior or coverage.
 - Keep feature commits reviewable and single-purpose; follow-up fixes belong to
   the feature they correct rather than a generic final `fix` commit.
 - Do not treat a successful compile, a conflict-free rebase, or an unchanged

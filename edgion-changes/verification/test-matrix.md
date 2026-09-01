@@ -98,6 +98,46 @@ not raise this workspace's Rust 1.85 MSRV.
 
 ## Historical validation snapshots
 
+### 2026-09-01 upstream baseline audit (no upstream delta)
+
+The official Cloudflare `refs/heads/main` and the fetched `upstream/main` both
+resolved to `09696b51bc59315353d96686355861604d0bb48c`. That commit was already
+the merge base of the published Edgion fork at
+`2e2e67416e4819d6b260ae1298324da221350541`, so there was no upstream commit to
+merge, rebase, or rebuild. The synchronization deliberately did not rewrite the
+55-commit fork stack. Only the synchronization policy and this verification
+record changed after the behavior commit.
+
+Pingora verification against behavior commit `2e2e674` passed:
+
+- formatting, `git diff --check`, the core/proxy check, and the combined
+  `connection_filter boringssl` core check;
+- default core: 737 passed, 17 ignored;
+  connection-filter core: 742 passed, 17 ignored;
+  BoringSSL core: 769 passed, 17 ignored; and the focused TLS/PROXY target:
+  2 passed;
+- proxy library: 198 passed, 2 ignored;
+  `test_request_body_seam`: 61 passed;
+  `test_upstream_response_body_sink`: 58 passed;
+  `test_terminal_body_dispatch`: 28 passed;
+  `test_h2_upstream_no_error_reset`: 10 passed;
+  `test_h2_upstream_stalled_after_response`: 4 passed; and
+  `test_h2_upstream_cache_and_reuse`: 8 passed.
+
+Consumer verification used a detached worktree at Edgion
+`b9a73a83ba80a97c21a43987b958cce4c1727672` and a temporary Cargo patch that
+resolved all 16 Pingora-family Git packages to this local checkout. The
+workspace/all-target check passed. The first Gateway run had 3545 passed,
+2 ignored, and two environment-sensitive failures: the GeoIP test created its
+temporary directory on a filesystem with only about 700 MiB free while its
+preflight intentionally requires 1 GiB, and the closed-ephemeral-port OTLP
+probe raced with local port reuse. The OTLP test passed in isolation; the GeoIP
+test passed with its temporary directory on ExtStore; and the complete rerun
+under that temporary directory passed 3547 tests with 2 ignored. The source
+Edgion worktree and its manifest were not changed, and its original lockfile
+remained SHA-256
+`c4415fa572df7cde3cc084efba61745c1d9732680ab0e551bb15d579add090d5`.
+
 ### 2026-09-01 selected-response abandonment closure
 
 The local-source consumer run used Edgion
