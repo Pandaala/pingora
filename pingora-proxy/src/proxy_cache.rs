@@ -18,7 +18,9 @@ use http::{Method, StatusCode};
 use pingora_cache::key::CacheHashKey;
 use pingora_cache::lock::LockWaitOutcome;
 use pingora_cache::max_file_size::ERR_RESPONSE_TOO_LARGE;
-use pingora_cache::{ForcedFreshness, HitHandler, HitStatus, RespCacheable::*};
+use pingora_cache::{
+    CachePhase, ForcedFreshness, HitHandler, HitStatus, RespCacheable, RespCacheable::*,
+};
 use pingora_core::protocols::http::conditional_filter::to_304;
 use pingora_core::protocols::http::v1::common::header_value_content_length;
 use pingora_core::ErrorType;
@@ -27,10 +29,71 @@ use std::time::SystemTime;
 
 const DEFAULT_MAX_CACHE_LOCK_RETRIES: usize = 2;
 
+const TERMINAL_SYNTHETIC_CACHE_MARKER: &str = "x-pingora-internal-terminal-synthetic";
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TerminalSyntheticEntity;
+
+pub(crate) fn mark_terminal_synthetic_entity(header: &mut ResponseHeader) {
+    header.extensions_mut().insert(TerminalSyntheticEntity);
+}
+
+pub(crate) fn is_terminal_synthetic_entity(header: &ResponseHeader) -> bool {
+    header.extensions.get::<TerminalSyntheticEntity>().is_some()
+}
+
+pub(crate) fn strip_terminal_synthetic_wire_marker(header: &mut ResponseHeader) {
+    header.remove_header(TERMINAL_SYNTHETIC_CACHE_MARKER);
+}
+
+fn take_terminal_synthetic_wire_marker(header: &mut ResponseHeader) -> bool {
+    header
+        .remove_header(TERMINAL_SYNTHETIC_CACHE_MARKER)
+        .is_some()
+}
+
+fn persist_terminal_synthetic_wire_marker(header: &mut ResponseHeader, terminal: bool) {
+    strip_terminal_synthetic_wire_marker(header);
+    if terminal {
+        header
+            .insert_header(TERMINAL_SYNTHETIC_CACHE_MARKER, "1")
+            .expect("the static terminal synthetic cache marker must be a valid header");
+    }
+}
+
 impl<SV, C> HttpProxy<SV, C>
 where
     C: custom::Connector,
 {
+    pub(crate) fn track_predicted_uncacheable_response(
+        &self,
+        session: &mut Session,
+        task: &HttpTask,
+        sink: &ResponseBodySink,
+    ) {
+        if !matches!(
+            session.cache.phase(),
+            CachePhase::Disabled(NoCacheReason::PredictedResponseTooLarge)
+        ) {
+            return;
+        }
+
+        let task_bytes = match task {
+            HttpTask::Body(Some(data), _) | HttpTask::UpgradedBody(Some(data), _) => data.len(),
+            _ => 0,
+        };
+        let emitted_bytes = sink.peek_extra().iter().map(Bytes::len).sum::<usize>();
+        session
+            .cache
+            .track_body_bytes_for_max_file_size(task_bytes + emitted_bytes);
+        if task.is_end()
+            && !matches!(task, HttpTask::Failed(_))
+            && !session.cache.exceeded_max_file_size()
+        {
+            session.cache.response_became_cacheable();
+        }
+    }
+
     // return bool: server_session can be reused, and error if any
     pub(crate) async fn proxy_cache(
         self: &Arc<Self>,
@@ -294,6 +357,7 @@ where
 
         let seekable = session.cache.hit_handler().can_seek();
         let mut header = cache_hit_header(&session.cache);
+        let terminal_synthetic_entity = is_terminal_synthetic_entity(&header);
 
         let req = session.req_header();
 
@@ -315,19 +379,31 @@ where
         let header_only = not_modified || req.method == http::method::Method::HEAD;
 
         // process range header if the cache storage supports seek
-        let range_type = if seekable && !session.ignore_downstream_range {
-            self.inner.range_header_filter(session, &mut header, ctx)
-        } else {
-            RangeType::None
-        };
+        let range_type =
+            if seekable && !terminal_synthetic_entity && !session.ignore_downstream_range {
+                self.inner.range_header_filter(session, &mut header, ctx)
+            } else {
+                RangeType::None
+            };
 
         // return a 416 with an empty body for simplicity
-        let header_only = header_only || matches!(range_type, RangeType::Invalid);
+        let mut header_only = header_only || matches!(range_type, RangeType::Invalid);
         debug!("header: {header:?}");
 
         // TODO: use ProxyUseCache to replace the logic below
         match self.inner.response_filter(session, &mut header, ctx).await {
             Ok(_) => {
+                let filtered_body_forbidden = downstream_response_body_forbidden(session, &header);
+                if filtered_body_forbidden
+                    && (header.status.is_informational()
+                        || matches!(header.status.as_u16(), 204 | 304))
+                {
+                    header.remove_header(&http::header::TRANSFER_ENCODING);
+                    if header.status.is_informational() || header.status.as_u16() == 204 {
+                        header.remove_header(&http::header::CONTENT_LENGTH);
+                    }
+                }
+                header_only |= filtered_body_forbidden;
                 if let Err(e) = session
                     .downstream_modules_ctx
                     .response_header_filter(&mut header, header_only)
@@ -578,6 +654,7 @@ where
         &self,
         session: &mut Session,
         task: &HttpTask,
+        response_cacheability: Option<RespCacheable>,
         ctx: &mut SV::CTX,
         serve_from_cache: &mut ServeFromCache,
     ) -> Result<()>
@@ -599,8 +676,33 @@ where
                 {
                     return Ok(());
                 }
-                match self.inner.response_cache_filter(session, header, ctx)? {
-                    Cacheable(meta) => {
+                let precomputed_cacheability = response_cacheability.is_some();
+                let cacheability = match response_cacheability {
+                    Some(cacheability) => cacheability,
+                    None => self.inner.response_cache_filter(session, header, ctx)?,
+                };
+                match cacheability {
+                    Cacheable(mut meta) => {
+                        // Never trust an origin-provided copy of the private
+                        // wire marker. Only the typed extension set by the
+                        // terminal pump may persist it into cache metadata.
+                        persist_terminal_synthetic_wire_marker(
+                            meta.response_header_mut(),
+                            is_terminal_synthetic_entity(header),
+                        );
+                        if precomputed_cacheability {
+                            if let Some(content_length) =
+                                header.headers.get(http::header::CONTENT_LENGTH)
+                            {
+                                meta.response_header_mut().insert_header(
+                                    http::header::CONTENT_LENGTH,
+                                    content_length.clone(),
+                                )?;
+                            } else {
+                                meta.response_header_mut()
+                                    .remove_header(&http::header::CONTENT_LENGTH);
+                            }
+                        }
                         let mut fill_cache = true;
                         if session.cache.bypassing() {
                             // Only hold this request back if the predictor bypassed it over size.
@@ -759,6 +861,262 @@ where
         Ok(())
     }
 
+    /// Feed `task` and everything the upstream body filter queued in `sink`
+    /// (via [`ResponseBodySink::push`]) to the cache, in the same order
+    /// [`super::proxy_h1::HttpProxy::h1_response_filter`] (and its h2/custom
+    /// siblings) hand them to the downstream writer -- see
+    /// `drain_emitted_chunks` below for that side.
+    ///
+    /// `task`'s own end-of-stream flag is migrated onto the LAST queued
+    /// chunk instead of staying on `task`, whenever there is at least one
+    /// queued chunk. Caching `task` unmodified AND every emitted chunk would
+    /// tell the cache the response ended twice: [`HttpCache::miss_handler`]
+    /// (see its `// this will panic ... should be impossible in real world`
+    /// comment above) takes the [`pingora_cache::MissHandler`] the first
+    /// time it sees `end_stream`, and the very next `Body` write after that
+    /// unwraps `None` and panics. A `Body(Some(data), true)` /
+    /// `UpgradedBody(Some(data), true)` keeps `data` but drops its own
+    /// end-of-stream flag; a bare `Body(None, true)` / `UpgradedBody(None,
+    /// true)` end marker carries no payload of its own and is skipped
+    /// entirely -- the last chunk now carries its meaning instead. See
+    /// `migrate_end_of_stream`.
+    ///
+    /// Every cache write here (the migrated `task` and each chunk) follows
+    /// the same failure policy as the original single-task path: on error,
+    /// disable the cache; if [`ServeFromCache::is_miss_body`] is set, the
+    /// response is already streaming into the cache during a miss, so a
+    /// write failure must give up the entire request (a partial cache write
+    /// would otherwise leave a stream promising bytes it no longer has)
+    /// rather than let the client silently receive fewer bytes than the
+    /// cache now expects; otherwise, warn and stop feeding the cache instead
+    /// of retrying against a cache already disabled.
+    pub(crate) async fn cache_task_and_emitted_chunks(
+        &self,
+        session: &mut Session,
+        task: &HttpTask,
+        sink: &ResponseBodySink,
+        ctx: &mut SV::CTX,
+        serve_from_cache: &mut ServeFromCache,
+    ) -> Result<()>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        self.cache_task_and_emitted_chunks_with_decision(
+            session,
+            task,
+            sink,
+            None,
+            ctx,
+            serve_from_cache,
+        )
+        .await
+    }
+
+    pub(crate) fn response_cacheability_before_downstream_filter(
+        &self,
+        session: &Session,
+        header: &ResponseHeader,
+        ctx: &mut SV::CTX,
+    ) -> Result<Option<RespCacheable>>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        if !(session.cache.enabled() || session.cache.bypassing()) {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.inner.response_cache_filter(session, header, ctx)?,
+        ))
+    }
+
+    pub(crate) async fn cache_task_and_emitted_chunks_with_decision(
+        &self,
+        session: &mut Session,
+        task: &HttpTask,
+        sink: &ResponseBodySink,
+        response_cacheability: Option<RespCacheable>,
+        ctx: &mut SV::CTX,
+        serve_from_cache: &mut ServeFromCache,
+    ) -> Result<()>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        if !(session.cache.enabled() || session.cache.bypassing()) {
+            return Ok(());
+        }
+
+        let extra = sink.peek_extra();
+        let is_upgraded = matches!(task, HttpTask::UpgradedBody(..));
+        let leading = if !extra.is_empty() || matches!(task, HttpTask::Header(_, true)) {
+            migrate_end_of_stream(task)
+        } else {
+            LeadingTask::Unchanged
+        };
+
+        let mut response_cacheability = response_cacheability;
+        let leading_result = match &leading {
+            LeadingTask::Unchanged => {
+                self.cache_http_task(
+                    session,
+                    task,
+                    response_cacheability.take(),
+                    ctx,
+                    serve_from_cache,
+                )
+                .await
+            }
+            LeadingTask::Substitute(substitute) => {
+                self.cache_http_task(
+                    session,
+                    substitute,
+                    response_cacheability.take(),
+                    ctx,
+                    serve_from_cache,
+                )
+                .await
+            }
+            LeadingTask::Drop => Ok(()),
+        };
+        if let Err(e) = leading_result {
+            session.cache.disable(NoCacheReason::StorageError);
+            if serve_from_cache.is_miss_body() {
+                // if the response stream cache body during miss but write fails, it has to
+                // give up the entire request
+                return Err(e);
+            }
+            warn!(
+                "Fail to cache response: {}, {}",
+                e,
+                self.inner.request_summary(session, ctx)
+            );
+            // The cache is already disabled: cache_http_task would no-op on
+            // every remaining chunk anyway, so stop here instead of
+            // repeating the same warning per chunk.
+            return Ok(());
+        }
+
+        if extra.is_empty() {
+            if matches!(task, HttpTask::Header(_, true)) {
+                self.cache_http_task(
+                    session,
+                    &HttpTask::Body(None, true),
+                    None,
+                    ctx,
+                    serve_from_cache,
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+        let last = extra.len() - 1;
+        let last_chunk_is_end_of_stream = !matches!(leading, LeadingTask::Unchanged);
+        for (i, chunk) in extra.iter().enumerate() {
+            let end = last_chunk_is_end_of_stream && i == last;
+            let extra_task = if is_upgraded {
+                HttpTask::UpgradedBody(Some(chunk.clone()), end)
+            } else {
+                HttpTask::Body(Some(chunk.clone()), end)
+            };
+            if let Err(e) = self
+                .cache_http_task(session, &extra_task, None, ctx, serve_from_cache)
+                .await
+            {
+                session.cache.disable(NoCacheReason::StorageError);
+                if serve_from_cache.is_miss_body() {
+                    return Err(e);
+                }
+                warn!(
+                    "Fail to cache emitted response chunk: {}, {}",
+                    e,
+                    self.inner.request_summary(session, ctx)
+                );
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Cache the chunks `sink` queued BEFORE `task`, the admission-side mirror
+    /// of [`drain_emitted_chunks_before`].
+    ///
+    /// The cached entity must be byte-identical to what the client receives, so
+    /// a terminal `Trailer`/`Done` that released withheld body bytes has to feed
+    /// those bytes to the cache ahead of the terminal task, exactly as they are
+    /// written downstream.
+    ///
+    /// Load-bearing for the bare-`Done` dispatch specifically: `Done` runs
+    /// `finish_miss_handler()` in [`Self::cache_http_task`], so admitting the
+    /// released bytes after it would `write_body` into an already finished miss
+    /// handler -- the failure the "this will panic if more data is sent after we
+    /// see end_stream" note on the `Body` arm warns about. `Trailer` is a cache
+    /// no-op, so only the ordering around `Done` changes the stored entity.
+    ///
+    /// No end-of-stream migration, for the same reason as the downstream drain:
+    /// `Trailer`/`Done` already carry the response's single completion.
+    pub(crate) async fn cache_task_and_emitted_chunks_before(
+        &self,
+        session: &mut Session,
+        task: &HttpTask,
+        sink: &ResponseBodySink,
+        is_upgraded: bool,
+        ctx: &mut SV::CTX,
+        serve_from_cache: &mut ServeFromCache,
+    ) -> Result<()>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        if !(session.cache.enabled() || session.cache.bypassing()) {
+            return Ok(());
+        }
+
+        for chunk in sink.peek_extra() {
+            let extra_task = if is_upgraded {
+                HttpTask::UpgradedBody(Some(chunk.clone()), false)
+            } else {
+                HttpTask::Body(Some(chunk.clone()), false)
+            };
+            if let Err(e) = self
+                .cache_http_task(session, &extra_task, None, ctx, serve_from_cache)
+                .await
+            {
+                session.cache.disable(NoCacheReason::StorageError);
+                if serve_from_cache.is_miss_body() {
+                    // The miss body is already short: giving up the request is
+                    // the only way to avoid storing a truncated entity.
+                    return Err(e);
+                }
+                warn!(
+                    "Fail to cache released response chunk: {}, {}",
+                    e,
+                    self.inner.request_summary(session, ctx)
+                );
+                // The cache is disabled now; the terminal task below would
+                // no-op anyway.
+                return Ok(());
+            }
+        }
+
+        if let Err(e) = self
+            .cache_http_task(session, task, None, ctx, serve_from_cache)
+            .await
+        {
+            session.cache.disable(NoCacheReason::StorageError);
+            if serve_from_cache.is_miss_body() {
+                return Err(e);
+            }
+            warn!(
+                "Fail to cache response: {}, {}",
+                e,
+                self.inner.request_summary(session, ctx)
+            );
+        }
+        Ok(())
+    }
+
     // Decide if local cache can be used according to upstream http header
     // 1. when upstream returns 304, the local cache is refreshed and served fresh
     // 2. when upstream returns certain HTTP error status, the local cache is served stale
@@ -797,12 +1155,21 @@ where
                         }
                         // 304 doesn't contain all the headers, merge 304 into cached 200 header
                         // in order for response_cache_filter to run correctly
-                        let merged_header = session.cache.revalidate_merge_header(resp);
+                        let mut merged_header = session.cache.revalidate_merge_header(resp);
+                        let terminal_synthetic_entity =
+                            take_terminal_synthetic_wire_marker(&mut merged_header);
                         match self
                             .inner
                             .response_cache_filter(session, &merged_header, ctx)
                         {
                             Ok(Cacheable(mut meta)) => {
+                                // Preserve the trusted marker independently of
+                                // how the application rebuilds CacheMeta. The
+                                // callback never sees the private wire header.
+                                persist_terminal_synthetic_wire_marker(
+                                    meta.response_header_mut(),
+                                    terminal_synthetic_entity,
+                                );
                                 // For simplicity, ignore changes to variance over 304 for now.
                                 // Note this means upstream can only update variance via 2xx
                                 // (expired response).
@@ -835,6 +1202,10 @@ where
                                 //TODO: log more
                                 debug!("Uncacheable {reason:?} 304 received");
                                 session.cache.response_became_uncacheable(reason);
+                                persist_terminal_synthetic_wire_marker(
+                                    &mut merged_header,
+                                    terminal_synthetic_entity,
+                                );
                                 session.cache.revalidate_uncacheable(merged_header, reason);
                             }
                             Err(e) => {
@@ -842,6 +1213,10 @@ where
                                 // (avoid poisoning downstream cache with passthrough 304),
                                 // allow serving the stored response without updating cache
                                 warn!("Error {e:?} response_cache_filter during revalidation");
+                                persist_terminal_synthetic_wire_marker(
+                                    &mut merged_header,
+                                    terminal_synthetic_entity,
+                                );
                                 session.cache.revalidate_uncacheable(
                                     merged_header,
                                     NoCacheReason::InternalError,
@@ -1020,8 +1395,415 @@ where
     }
 }
 
+/// What migrating `task`'s end-of-stream flag onto a queued
+/// [`ResponseBodySink`] chunk means for `task` itself. Only meaningful when
+/// there is at least one queued chunk to migrate it onto -- callers skip
+/// calling [`migrate_end_of_stream`] entirely otherwise and use
+/// [`LeadingTask::Unchanged`] directly for that hot, sink-empty path.
+enum LeadingTask {
+    /// `task` did not carry an end-of-stream flag that can move to an emitted
+    /// body chunk: feed `task` exactly as-is.
+    Unchanged,
+    /// `task` carried a payload; feed this de-asserted (`end = false`)
+    /// substitute in its place, then the queued chunks -- the LAST of which
+    /// now carries `end = true` instead of `task`.
+    Substitute(HttpTask),
+    /// `task` was a bare end-of-stream marker with no payload of its own
+    /// (`Body(None, true)` / `UpgradedBody(None, true)`): drop it entirely
+    /// and let the last queued chunk carry its meaning instead of also
+    /// emitting a now-redundant marker.
+    Drop,
+}
+
+/// Decide how `task`'s own end-of-stream flag must move to make room for the
+/// chunks a response-body filter queued after it. Only called by
+/// [`HttpProxy::cache_task_and_emitted_chunks`] and `drain_emitted_chunks`
+/// when the sink has at least one chunk queued; see their doc comments for
+/// why the flag cannot simply be duplicated onto both `task` and the chunks.
+fn migrate_end_of_stream(task: &HttpTask) -> LeadingTask {
+    match task {
+        HttpTask::Header(header, true) => {
+            LeadingTask::Substitute(HttpTask::Header(header.clone(), false))
+        }
+        HttpTask::Body(Some(data), true) => {
+            LeadingTask::Substitute(HttpTask::Body(Some(data.clone()), false))
+        }
+        HttpTask::Body(None, true) => LeadingTask::Drop,
+        HttpTask::UpgradedBody(Some(data), true) => {
+            LeadingTask::Substitute(HttpTask::UpgradedBody(Some(data.clone()), false))
+        }
+        HttpTask::UpgradedBody(None, true) => LeadingTask::Drop,
+        _ => LeadingTask::Unchanged,
+    }
+}
+
+/// Drain the chunks `sink` queued and append them to `out_tasks` right after
+/// `task`, migrating `task`'s own end-of-stream flag onto the last of them
+/// exactly as [`HttpProxy::cache_task_and_emitted_chunks`] does for the
+/// cache -- see that function's doc comment for the failure this prevents.
+/// Cheap and branch-free when nothing was queued (the hot path: almost every
+/// call has an empty sink).
+///
+/// Chunks are re-emitted under `task`'s own variant (`Body` stays `Body`,
+/// `UpgradedBody` stays `UpgradedBody`): `Session::write_response_tasks`
+/// tracks `seen_upgraded` off this tag to pick the raw post-upgrade duplex
+/// write path over the normal framed one, so mistagging a chunk here would
+/// misroute its bytes on an upgraded (e.g. WebSocket) connection.
+pub(crate) fn drain_emitted_chunks(
+    task: HttpTask,
+    sink: &mut ResponseBodySink,
+    out_tasks: &mut Vec<HttpTask>,
+) {
+    let extra = sink.take_extra();
+    if extra.is_empty() {
+        if let HttpTask::Header(header, true) = task {
+            out_tasks.push(HttpTask::Header(header, false));
+            out_tasks.push(HttpTask::Body(None, true));
+        } else {
+            out_tasks.push(task);
+        }
+        return;
+    }
+
+    let is_upgraded = matches!(task, HttpTask::UpgradedBody(..));
+    let leading = migrate_end_of_stream(&task);
+    let last_chunk_is_end_of_stream = !matches!(leading, LeadingTask::Unchanged);
+    match leading {
+        LeadingTask::Unchanged => out_tasks.push(task),
+        LeadingTask::Substitute(substitute) => out_tasks.push(substitute),
+        LeadingTask::Drop => {}
+    }
+
+    let last = extra.len() - 1;
+    for (i, chunk) in extra.into_iter().enumerate() {
+        let end = last_chunk_is_end_of_stream && i == last;
+        out_tasks.push(if is_upgraded {
+            HttpTask::UpgradedBody(Some(chunk), end)
+        } else {
+            HttpTask::Body(Some(chunk), end)
+        });
+    }
+}
+
+/// Drain the chunks `sink` queued and append them to `out_tasks` BEFORE
+/// `task`, the mirror image of [`drain_emitted_chunks`].
+///
+/// Used only for a terminal `Trailer`/`Done` that dispatched the terminal
+/// `upstream_response_body_filter` callback (see
+/// `proxy_common::TerminalBodyDispatch`). The chunks queued there are response
+/// BODY the filter had been withholding, so they must reach the wire before the
+/// trailer that terminates the response, not after it.
+///
+/// No end-of-stream migration happens here, unlike [`drain_emitted_chunks`]:
+/// `Trailer` and `Done` are intrinsically `HttpTask::is_end()`, so `task`
+/// already carries the response's single completion and the released chunks are
+/// always emitted with `end = false`. Migrating would either duplicate the
+/// completion or, because [`migrate_end_of_stream`] reports `Unchanged` for
+/// both variants, strand the released bytes after a terminal marker.
+///
+/// `is_upgraded` comes from the latch rather than from `task`, which is a
+/// `Trailer`/`Done` and carries no body variant of its own -- see
+/// `TerminalBodyDispatch::is_upgraded` for why the tag must be preserved.
+pub(crate) fn drain_emitted_chunks_before(
+    task: HttpTask,
+    sink: &mut ResponseBodySink,
+    is_upgraded: bool,
+    out_tasks: &mut Vec<HttpTask>,
+) {
+    for chunk in sink.take_extra() {
+        out_tasks.push(if is_upgraded {
+            HttpTask::UpgradedBody(Some(chunk), false)
+        } else {
+            HttpTask::Body(Some(chunk), false)
+        });
+    }
+    out_tasks.push(task);
+}
+
+#[cfg(test)]
+mod eos_migration_tests {
+    use super::*;
+    use crate::{RESPONSE_BODY_EMIT_BUDGET, RESPONSE_BODY_EMIT_CHUNK_BUDGET};
+
+    fn sink_with(chunks: &[&'static [u8]]) -> ResponseBodySink {
+        let mut sink = ResponseBodySink::new();
+        for c in chunks {
+            sink.push(Bytes::from_static(c)).unwrap();
+        }
+        sink
+    }
+
+    /// Nothing released: the terminal task is emitted alone, unchanged.
+    #[test]
+    fn before_drain_with_empty_sink_emits_only_the_task() {
+        let mut sink = ResponseBodySink::new();
+        let mut out = Vec::new();
+        drain_emitted_chunks_before(HttpTask::Done, &mut sink, false, &mut out);
+        assert!(matches!(out.as_slice(), [HttpTask::Done]));
+    }
+
+    /// The defect this helper exists for: released body bytes must reach the
+    /// wire BEFORE the trailer that terminates the response.
+    #[test]
+    fn before_drain_puts_released_bytes_ahead_of_the_trailer() {
+        let mut sink = sink_with(&[b"held-a", b"held-b"]);
+        let mut out = Vec::new();
+        drain_emitted_chunks_before(
+            HttpTask::Trailer(Some(Box::default())),
+            &mut sink,
+            false,
+            &mut out,
+        );
+        assert!(matches!(
+            out.as_slice(),
+            [
+                HttpTask::Body(Some(a), false),
+                HttpTask::Body(Some(b), false),
+                HttpTask::Trailer(Some(_)),
+            ] if a.as_ref() == b"held-a" && b.as_ref() == b"held-b"
+        ));
+    }
+
+    /// `Trailer`/`Done` are intrinsically `is_end()`, so the completion stays
+    /// on the terminal task and no released chunk claims it -- this is what
+    /// keeps the response finishing exactly once.
+    #[test]
+    fn before_drain_never_migrates_end_of_stream_onto_released_chunks() {
+        for task in [HttpTask::Done, HttpTask::Trailer(Some(Box::default()))] {
+            let mut sink = sink_with(&[b"a", b"b"]);
+            let mut out = Vec::new();
+            assert!(task.is_end());
+            drain_emitted_chunks_before(task, &mut sink, false, &mut out);
+            assert_eq!(out.len(), 3);
+            assert!(out[..2].iter().all(|t| !t.is_end()));
+            assert!(out[2].is_end());
+        }
+    }
+
+    /// When `response_trailer_filter` converts the trailer into a body buffer
+    /// (`proxy_h2.rs`), the released bytes must still come first and the
+    /// converted buffer keeps its `end = true`.
+    #[test]
+    fn before_drain_keeps_released_bytes_ahead_of_a_converted_trailer_buffer() {
+        let mut sink = sink_with(&[b"held"]);
+        let mut out = Vec::new();
+        drain_emitted_chunks_before(
+            HttpTask::Body(Some(Bytes::from_static(b"trailer-buffer")), true),
+            &mut sink,
+            false,
+            &mut out,
+        );
+        assert!(matches!(
+            out.as_slice(),
+            [
+                HttpTask::Body(Some(held), false),
+                HttpTask::Body(Some(buf), true),
+            ] if held.as_ref() == b"held" && buf.as_ref() == b"trailer-buffer"
+        ));
+    }
+
+    /// Released bytes inherit the response's body variant: mistagging them as
+    /// plain `Body` would misroute them off the post-upgrade duplex write path.
+    #[test]
+    fn before_drain_preserves_the_upgraded_body_tag() {
+        let mut sink = sink_with(&[b"frame"]);
+        let mut out = Vec::new();
+        drain_emitted_chunks_before(HttpTask::Done, &mut sink, true, &mut out);
+        assert!(matches!(
+            out.as_slice(),
+            [HttpTask::UpgradedBody(Some(d), false), HttpTask::Done] if d.as_ref() == b"frame"
+        ));
+    }
+
+    /// The sink is drained, not peeked: a later batch must not replay them.
+    #[test]
+    fn before_drain_empties_the_sink() {
+        let mut sink = sink_with(&[b"a"]);
+        let mut out = Vec::new();
+        drain_emitted_chunks_before(HttpTask::Done, &mut sink, false, &mut out);
+        assert!(sink.peek_extra().is_empty());
+    }
+
+    #[test]
+    fn empty_sink_leaves_task_untouched() {
+        let mut sink = ResponseBodySink::new();
+        let mut out = Vec::new();
+        drain_emitted_chunks(
+            HttpTask::Body(Some(Bytes::from_static(b"hello")), true),
+            &mut sink,
+            &mut out,
+        );
+        assert!(
+            matches!(out.as_slice(), [HttpTask::Body(Some(d), true)] if d.as_ref() == b"hello")
+        );
+    }
+
+    #[test]
+    fn non_eos_body_leaves_every_chunk_non_eos() {
+        let mut sink = sink_with(&[b"a", b"b"]);
+        let mut out = Vec::new();
+        drain_emitted_chunks(
+            HttpTask::Body(Some(Bytes::from_static(b"x")), false),
+            &mut sink,
+            &mut out,
+        );
+        match out.as_slice() {
+            [HttpTask::Body(Some(d0), false), HttpTask::Body(Some(d1), false), HttpTask::Body(Some(d2), false)] =>
+            {
+                assert_eq!(d0.as_ref(), b"x");
+                assert_eq!(d1.as_ref(), b"a");
+                assert_eq!(d2.as_ref(), b"b");
+            }
+            other => panic!("unexpected sequence: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fragmented_full_budget_has_a_bounded_downstream_operation_count() {
+        let mut contiguous = ResponseBodySink::new();
+        contiguous
+            .push(Bytes::from(vec![0; RESPONSE_BODY_EMIT_BUDGET]))
+            .unwrap();
+        let mut contiguous_tasks = Vec::new();
+        drain_emitted_chunks(
+            HttpTask::Body(None, true),
+            &mut contiguous,
+            &mut contiguous_tasks,
+        );
+
+        let chunk_len = RESPONSE_BODY_EMIT_BUDGET / RESPONSE_BODY_EMIT_CHUNK_BUDGET;
+        let fragment = Bytes::from(vec![0; chunk_len]);
+        let mut fragmented = ResponseBodySink::new();
+        for _ in 0..RESPONSE_BODY_EMIT_CHUNK_BUDGET {
+            fragmented.push(fragment.clone()).unwrap();
+        }
+        let mut fragmented_tasks = Vec::new();
+        drain_emitted_chunks(
+            HttpTask::Body(None, true),
+            &mut fragmented,
+            &mut fragmented_tasks,
+        );
+
+        assert_eq!(contiguous_tasks.len(), 1);
+        assert_eq!(fragmented_tasks.len(), RESPONSE_BODY_EMIT_CHUNK_BUDGET);
+        assert!(fragmented_tasks[..fragmented_tasks.len() - 1]
+            .iter()
+            .all(|task| !task.is_end()));
+        assert!(fragmented_tasks.last().unwrap().is_end());
+        assert_eq!(
+            fragmented_tasks
+                .iter()
+                .filter_map(|task| match task {
+                    HttpTask::Body(Some(bytes), _) => Some(bytes.len()),
+                    _ => None,
+                })
+                .sum::<usize>(),
+            RESPONSE_BODY_EMIT_BUDGET
+        );
+    }
+
+    #[test]
+    fn eos_body_with_payload_migrates_flag_to_last_chunk() {
+        // This is Critical 1's exact shape: `Body(Some(data), true)` is the
+        // normal single-read last-chunk shape on both H1 and H2, not an edge
+        // case. The original must lose its `true` and gain a `false`, and
+        // exactly one chunk -- the LAST one -- must carry `true` instead.
+        let mut sink = sink_with(&[b"a", b"b"]);
+        let mut out = Vec::new();
+        drain_emitted_chunks(
+            HttpTask::Body(Some(Bytes::from_static(b"x")), true),
+            &mut sink,
+            &mut out,
+        );
+        match out.as_slice() {
+            [HttpTask::Body(Some(d0), false), HttpTask::Body(Some(d1), false), HttpTask::Body(Some(d2), true)] =>
+            {
+                assert_eq!(d0.as_ref(), b"x");
+                assert_eq!(d1.as_ref(), b"a");
+                assert_eq!(d2.as_ref(), b"b");
+            }
+            other => panic!("unexpected sequence: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_eos_marker_is_dropped_and_last_chunk_carries_its_meaning() {
+        // `Body(None, true)` is a pure end-of-stream signal with no payload
+        // of its own: emitting it AND a migrated last chunk would still be
+        // two end-of-stream signals for the cache to choke on, so it must
+        // not appear in the output at all.
+        let mut sink = sink_with(&[b"a", b"b"]);
+        let mut out = Vec::new();
+        drain_emitted_chunks(HttpTask::Body(None, true), &mut sink, &mut out);
+        match out.as_slice() {
+            [HttpTask::Body(Some(d0), false), HttpTask::Body(Some(d1), true)] => {
+                assert_eq!(d0.as_ref(), b"a");
+                assert_eq!(d1.as_ref(), b"b");
+            }
+            other => panic!("unexpected sequence: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn header_eos_migrates_to_the_last_emitted_body_chunk() {
+        let mut sink = sink_with(&[b"current", b"extra"]);
+        let mut out = Vec::new();
+        let header = Box::new(ResponseHeader::build(503, None).unwrap());
+        drain_emitted_chunks(HttpTask::Header(header, true), &mut sink, &mut out);
+        match out.as_slice() {
+            [HttpTask::Header(header, false), HttpTask::Body(Some(d0), false), HttpTask::Body(Some(d1), true)] =>
+            {
+                assert_eq!(header.status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(d0.as_ref(), b"current");
+                assert_eq!(d1.as_ref(), b"extra");
+            }
+            other => panic!("unexpected sequence: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upgraded_body_chunks_stay_tagged_upgraded_body() {
+        // `Session::write_response_tasks` picks the raw post-upgrade duplex
+        // write path off this tag; mistagging a chunk as plain `Body` would
+        // misroute its bytes on an upgraded (e.g. WebSocket) connection.
+        let mut sink = sink_with(&[b"a"]);
+        let mut out = Vec::new();
+        drain_emitted_chunks(
+            HttpTask::UpgradedBody(Some(Bytes::from_static(b"x")), true),
+            &mut sink,
+            &mut out,
+        );
+        match out.as_slice() {
+            [HttpTask::UpgradedBody(Some(d0), false), HttpTask::UpgradedBody(Some(d1), true)] => {
+                assert_eq!(d0.as_ref(), b"x");
+                assert_eq!(d1.as_ref(), b"a");
+            }
+            other => panic!("unexpected sequence: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trailer_with_a_nonempty_sink_still_drains_every_chunk() {
+        // Defensive: a trailer does not run the body hook, so it should see an
+        // empty sink. If it somehow does not, deliver the chunks without
+        // inventing another end-of-stream source.
+        let mut sink = sink_with(&[b"a"]);
+        let mut out = Vec::new();
+        drain_emitted_chunks(HttpTask::Trailer(None), &mut sink, &mut out);
+        match out.as_slice() {
+            [HttpTask::Trailer(None), HttpTask::Body(Some(d), false)] => {
+                assert_eq!(d.as_ref(), b"a");
+            }
+            other => panic!("unexpected sequence: {other:?}"),
+        }
+    }
+}
+
 fn cache_hit_header(cache: &HttpCache) -> Box<ResponseHeader> {
     let mut header = Box::new(cache.cache_meta().response_header_copy());
+    if take_terminal_synthetic_wire_marker(&mut header) {
+        mark_terminal_synthetic_entity(&mut header);
+    }
     // convert cache response
 
     // these status codes / method cannot have body, so no need to add chunked encoding
@@ -2684,6 +3466,7 @@ mod tests {
             .cache_http_task(
                 session,
                 &HttpTask::Header(Box::new(resp), true),
+                None,
                 &mut (),
                 &mut ServeFromCache::new(),
             )

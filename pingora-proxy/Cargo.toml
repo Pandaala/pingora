@@ -22,6 +22,7 @@ path = "src/lib.rs"
 pingora-error = { version = "0.8.0", path = "../pingora-error" }
 pingora-core = { version = "0.8.0", path = "../pingora-core", default-features = false }
 pingora-cache = { version = "0.8.0", path = "../pingora-cache", default-features = false }
+pingora-timeout = { version = "0.8.0", path = "../pingora-timeout" }
 tokio = { workspace = true, features = ["macros", "net"] }
 pingora-http = { version = "0.8.0", path = "../pingora-http" }
 http = { workspace = true }
@@ -81,6 +82,10 @@ trace = ["pingora-cache/trace"]
 [[example]]
 name = "connection_filter"
 required-features = ["connection_filter"]
+
+[[bench]]
+name = "response_body_filter"
+harness = false
 
 # or locally cargo doc --config "build.rustdocflags='--cfg doc_async_trait'"
 [package.metadata.docs.rs]

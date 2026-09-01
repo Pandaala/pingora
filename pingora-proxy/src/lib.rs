@@ -42,6 +42,8 @@ use futures::future::FutureExt;
 use http::{header, version::Version, Method};
 use log::{debug, error, trace, warn};
 use once_cell::sync::Lazy;
+pub use pingora_core::modules::http::RequestBodyEvent;
+use pingora_core::protocols::http::v1::common::header_value_content_length;
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::fmt::Debug;
 use std::str;
@@ -52,6 +54,127 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 use tokio::time;
+
+fn downstream_response_body_forbidden(session: &Session, header: &ResponseHeader) -> bool {
+    session.req_header().method == http::Method::HEAD
+        || header.status.is_informational()
+        || matches!(header.status.as_u16(), 204 | 304)
+}
+
+fn is_downstream_followup(task: &HttpTask) -> bool {
+    !matches!(task, HttpTask::Header(..))
+}
+
+fn abort_cache_after_response_source_failure(session: &mut Session, from_cache: bool) {
+    if session.cache.enabled() || session.cache.bypassing() {
+        session.cache.disable(if from_cache {
+            NoCacheReason::StorageError
+        } else {
+            NoCacheReason::UpstreamError
+        });
+    }
+}
+
+fn reconcile_terminal_response_tasks(
+    tasks: &mut Vec<HttpTask>,
+    start: usize,
+    downstream_body_forbidden: bool,
+) -> Result<()> {
+    if !matches!(tasks.get(start), Some(HttpTask::Header(..))) {
+        return Ok(());
+    }
+
+    if downstream_body_forbidden {
+        tasks.truncate(start + 1);
+        let HttpTask::Header(header, eos) = &mut tasks[start] else {
+            unreachable!("retained task must be a response header")
+        };
+        *eos = true;
+        header.remove_header(&http::header::TRANSFER_ENCODING);
+        if header.status.is_informational() || header.status.as_u16() == 204 {
+            header.remove_header(&http::header::CONTENT_LENGTH);
+        }
+        return Ok(());
+    }
+
+    let body_len = tasks
+        .iter()
+        .skip(start + 1)
+        .filter_map(|task| match task {
+            HttpTask::Body(Some(data), _) | HttpTask::UpgradedBody(Some(data), _) => {
+                Some(data.len())
+            }
+            _ => None,
+        })
+        .sum::<usize>();
+    let HttpTask::Header(header, eos) = &mut tasks[start] else {
+        unreachable!("located task must be a response header")
+    };
+    *eos = false;
+
+    reconcile_content_length(header, body_len);
+    if header.headers.get(http::header::CONTENT_LENGTH).is_none()
+        && header
+            .headers
+            .get(http::header::TRANSFER_ENCODING)
+            .is_none()
+    {
+        header.set_version(Version::HTTP_11);
+        header.insert_header(http::header::TRANSFER_ENCODING, "chunked")?;
+    }
+    Ok(())
+}
+
+fn reconcile_content_length(header: &mut ResponseHeader, body_len: usize) {
+    let content_length_matches =
+        header_value_content_length(header.headers.get(http::header::CONTENT_LENGTH))
+            .is_some_and(|content_length| content_length == body_len);
+    if header.headers.contains_key(http::header::CONTENT_LENGTH) && !content_length_matches {
+        header.remove_header(&http::header::CONTENT_LENGTH);
+    }
+}
+
+fn reconcile_terminal_cache_header(header: &mut ResponseHeader, sink: &ResponseBodySink) {
+    let body_len = sink.peek_extra().iter().map(Bytes::len).sum();
+    reconcile_content_length(header, body_len);
+}
+
+#[cfg(test)]
+mod downstream_body_suppression_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_followups_are_dropped_instead_of_converted_to_done() {
+        assert!(is_downstream_followup(&HttpTask::Body(None, true)));
+        assert!(is_downstream_followup(&HttpTask::Trailer(None)));
+        assert!(is_downstream_followup(&HttpTask::Done));
+        assert!(!is_downstream_followup(&HttpTask::Header(
+            Box::new(ResponseHeader::build(204, None).unwrap()),
+            true,
+        )));
+    }
+
+    #[test]
+    fn terminal_framing_removes_a_stale_content_length() {
+        let mut header = ResponseHeader::build(503, None).unwrap();
+        header
+            .insert_header(http::header::CONTENT_LENGTH, "0")
+            .unwrap();
+        let mut tasks = vec![
+            HttpTask::Header(Box::new(header), false),
+            HttpTask::Body(Some(Bytes::from_static(b"generated")), true),
+        ];
+        reconcile_terminal_response_tasks(&mut tasks, 0, false).unwrap();
+        let HttpTask::Header(header, false) = &tasks[0] else {
+            panic!("unexpected header task")
+        };
+        assert!(header.headers.get(http::header::CONTENT_LENGTH).is_none());
+        assert_eq!(
+            header.headers.get(http::header::TRANSFER_ENCODING).unwrap(),
+            "chunked"
+        );
+    }
+}
 
 use pingora_cache::NoCacheReason;
 use pingora_core::apps::{
@@ -88,16 +211,32 @@ mod proxy_h1;
 mod proxy_h2;
 mod proxy_purge;
 mod proxy_trait;
+mod request_relay;
+mod response_body_sink;
+mod response_pipeline;
 pub mod subrequest;
+#[cfg(test)]
+mod test_allocator;
 
 use subrequest::{BodyMode, Ctx as SubrequestCtx};
 
 pub use proxy_cache::range_filter::{range_header_filter, MultiRangeInfo, RangeType};
 pub use proxy_purge::PurgeStatus;
-pub use proxy_trait::{FailToProxy, ProxyHttp, ProxyWarnLogContext};
+pub use proxy_trait::{
+    FailToProxy, ProxyHttp, ProxyWarnLogContext, RequestAttemptId, RequestBodyAction,
+    RequestRelayPlan, RequestRelayRetryState, RequestReplayPolicy, UpstreamRequestBodyDisposition,
+    UpstreamResponseBodyEvent,
+};
+pub use response_body_sink::{
+    ResponseBodySink, RESPONSE_BODY_EMIT_BUDGET, RESPONSE_BODY_EMIT_CHUNK_BUDGET,
+};
 
 pub mod prelude {
-    pub use crate::{http_proxy, http_proxy_service, ProxyHttp, ProxyWarnLogContext, Session};
+    pub use crate::{
+        http_proxy, http_proxy_service, ProxyHttp, ProxyWarnLogContext, RequestBodyAction,
+        RequestRelayPlan, RequestRelayRetryState, RequestReplayPolicy, Session,
+        UpstreamRequestBodyDisposition, UpstreamResponseBodyEvent,
+    };
 }
 
 pub type ProcessCustomSession<SV, C> = Arc<
@@ -363,23 +502,23 @@ where
                         (server_reused, error)
                     }
                     ClientSession::Custom(mut c) => {
-                        let (server_reused, error) = self
+                        let (server_reused, client_reuse, error) = self
                             .proxy_to_custom_upstream(session, &mut c, client_reused, &peer, ctx)
                             .await;
-                        let session = ClientSession::Custom(c);
-                        self.client_upstream
-                            .release_http_session(session, &*peer, peer.idle_timeout())
-                            .await;
+                        if client_reuse {
+                            let session = ClientSession::Custom(c);
+                            self.client_upstream
+                                .release_http_session(session, &*peer, peer.idle_timeout())
+                                .await;
+                        }
                         (server_reused, error)
                     }
                 };
-                (
-                    server_reused,
-                    error.map(|e| {
-                        self.inner
-                            .error_while_proxy(&peer, session, e, ctx, client_reused)
-                    }),
-                )
+                let error = error.map(|e| {
+                    self.inner
+                        .error_while_proxy(&peer, session, e, ctx, client_reused)
+                });
+                (server_reused, error)
             }
             Err(mut e) => {
                 e.as_up();
@@ -393,6 +532,7 @@ where
         &self,
         session: &mut Session,
         task: &mut HttpTask,
+        sink: &mut ResponseBodySink,
         ctx: &mut SV::CTX,
     ) -> Result<Option<Duration>>
     where
@@ -400,19 +540,24 @@ where
         SV::CTX: Send + Sync,
     {
         let duration = match task {
-            HttpTask::Header(header, _eos) => {
+            HttpTask::Header(header, eos) => {
                 self.inner
-                    .upstream_response_filter(session, header, ctx)
+                    .upstream_response_header_filter_event(session, header, *eos, ctx)
                     .await?;
                 None
             }
-            HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => self
-                .inner
-                .upstream_response_body_filter(session, data, *eos, ctx)?,
-            HttpTask::Trailer(Some(trailers)) => {
+            HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => {
                 self.inner
-                    .upstream_response_trailer_filter(session, trailers, ctx)?;
-                None
+                    .upstream_response_body_filter_event(
+                        session,
+                        data,
+                        UpstreamResponseBodyEvent::Data {
+                            end_of_stream: *eos,
+                        },
+                        sink,
+                        ctx,
+                    )
+                    .await?
             }
             _ => {
                 // task does not support a filter
@@ -421,6 +566,62 @@ where
         };
 
         Ok(duration)
+    }
+
+    /// Dispatch the terminal body event carried by a final Header task.
+    ///
+    /// Protocol pumps call this only after `response_filter` succeeds, matching
+    /// the ordering of an ordinary terminal Body task. The returned current
+    /// chunk is not sink output and therefore is not charged against the
+    /// bounded extra-chunk budget.
+    async fn terminal_upstream_body_filter(
+        &self,
+        session: &mut Session,
+        event: UpstreamResponseBodyEvent,
+        sink: &mut ResponseBodySink,
+        ctx: &mut SV::CTX,
+    ) -> Result<Option<Duration>>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        let mut body = None;
+        let duration = self
+            .inner
+            .upstream_response_body_filter_event(session, &mut body, event, sink, ctx)
+            .await?;
+        if let Some(body) = body {
+            sink.prepend_current(body);
+        }
+        // The source is already naturally complete. A terminate request at
+        // this boundary must not turn a reusable upstream into an abort.
+        sink.consume_terminate();
+        Ok(duration)
+    }
+
+    async fn downstream_response_body_filter_tasks(
+        &self,
+        session: &mut Session,
+        tasks: &mut [HttpTask],
+        ctx: &mut SV::CTX,
+    ) -> Result<()>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        for task in tasks {
+            let duration = match task {
+                HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => {
+                    self.inner.response_body_filter(session, data, *eos, ctx)?
+                }
+                _ => None,
+            };
+            if let Some(duration) = duration {
+                trace!("delaying downstream response for {duration:?}");
+                time::sleep(duration).await;
+            }
+        }
+        Ok(())
     }
 
     async fn finish(
@@ -504,6 +705,21 @@ pub struct Session {
     downstream_task_seen_upgraded: bool,
     /// Upstream write pending time. Set by proxy layer (HTTP/1.x only).
     upstream_write_pending_time: Duration,
+    /// Latch so that `ProxyHttp::request_trailer_filter` fires at most once
+    /// per downstream request. Without it a retry attempt (whose replayed EOF
+    /// also has `data == None` while the trailer fact stays true) would
+    /// re-fire the hook.
+    pub(crate) request_trailer_filter_fired: bool,
+    /// Request-scoped relay policy and core-derived source, frozen before the
+    /// upstream retry loop.
+    frozen_request_relay_plan: Option<request_relay::FrozenRequestRelayPlan>,
+    /// Canonical identity of the current upstream attempt.
+    request_attempt_id: Option<RequestAttemptId>,
+    /// Whether native retry capture has started for the live source.
+    native_retry_buffer_state: request_relay::NativeRetryBufferState,
+    /// Number of response header tasks whose downstream module filtering was
+    /// completed early so a same-batch trailer hook can query planned framing.
+    prepared_response_headers: usize,
     /// Flag that is set when the shutdown process has begun.
     shutdown_flag: Arc<AtomicBool>,
 }
@@ -531,7 +747,108 @@ impl Session {
             upstream_body_bytes_received: 0,
             downstream_task_seen_upgraded: false,
             upstream_write_pending_time: Duration::ZERO,
+            request_trailer_filter_fired: false,
+            frozen_request_relay_plan: None,
+            request_attempt_id: None,
+            native_retry_buffer_state: request_relay::NativeRetryBufferState::NotStarted,
+            prepared_response_headers: 0,
             shutdown_flag,
+        }
+    }
+
+    fn freeze_request_relay_plan(&mut self, requested: RequestRelayPlan) -> Result<()> {
+        if self.frozen_request_relay_plan.is_some() {
+            return Error::e_explain(
+                InternalError,
+                "request relay plan was frozen more than once",
+            );
+        }
+        if requested.disposition == UpstreamRequestBodyDisposition::Streamed
+            && requested.replay != RequestReplayPolicy::Never
+        {
+            return Error::e_explain(
+                InternalError,
+                "a streamed request relay plan must disable replay",
+            );
+        }
+        let registered = self.downstream_session.request_body_buffer_registered();
+        self.downstream_session.freeze_request_body_configuration();
+        self.frozen_request_relay_plan = Some(request_relay::FrozenRequestRelayPlan::derive(
+            requested, registered,
+        ));
+        Ok(())
+    }
+
+    fn frozen_request_relay_plan(&self) -> request_relay::FrozenRequestRelayPlan {
+        self.frozen_request_relay_plan
+            .expect("request relay plan must be frozen before an upstream attempt")
+    }
+
+    /// Return the request-scoped relay policy once it has been frozen.
+    pub fn request_relay_plan(&self) -> Option<RequestRelayPlan> {
+        self.frozen_request_relay_plan.map(|plan| plan.requested)
+    }
+
+    /// Return the current canonical upstream attempt identity.
+    pub fn request_attempt_id(&self) -> Option<RequestAttemptId> {
+        self.request_attempt_id
+    }
+
+    fn begin_request_relay_attempt(&mut self, attempt: usize) {
+        self.request_attempt_id = Some(RequestAttemptId::new(attempt));
+    }
+
+    fn enable_request_relay_retry_buffer(&mut self) {
+        let plan = self.frozen_request_relay_plan();
+        if !plan.enables_native_retry_buffer()
+            || self.native_retry_buffer_state != request_relay::NativeRetryBufferState::NotStarted
+        {
+            return;
+        }
+        if self.downstream_session.retry_buffering_supported() {
+            self.downstream_session.enable_retry_buffering();
+            self.native_retry_buffer_state = request_relay::NativeRetryBufferState::Enabled;
+        } else {
+            self.native_retry_buffer_state = request_relay::NativeRetryBufferState::Unsupported;
+        }
+    }
+
+    fn request_relay_retry_buffer(&self) -> Option<Bytes> {
+        (self.native_retry_buffer_state == request_relay::NativeRetryBufferState::Enabled)
+            .then(|| self.downstream_session.get_retry_buffer())
+            .flatten()
+    }
+
+    /// Return the current body backing state used by the retry gate.
+    pub fn request_relay_retry_state(&self) -> RequestRelayRetryState {
+        let Some(plan) = self.frozen_request_relay_plan else {
+            return RequestRelayRetryState::Disabled;
+        };
+        if plan.requested.replay == RequestReplayPolicy::Never {
+            return RequestRelayRetryState::Disabled;
+        }
+        if plan.source == request_relay::RequestRelaySource::RegisteredReplay {
+            return if self
+                .downstream_session
+                .request_body_buffer_replay_available()
+            {
+                RequestRelayRetryState::RegisteredReplay
+            } else {
+                RequestRelayRetryState::RegisteredUnavailable
+            };
+        }
+        match self.native_retry_buffer_state {
+            request_relay::NativeRetryBufferState::NotStarted => RequestRelayRetryState::LiveUnread,
+            request_relay::NativeRetryBufferState::Unsupported => {
+                RequestRelayRetryState::Unsupported
+            }
+            request_relay::NativeRetryBufferState::Enabled => {
+                if self.downstream_session.retry_buffer_truncated() {
+                    RequestRelayRetryState::NativeTruncated
+                } else {
+                    RequestRelayRetryState::NativeCapturing
+                }
+            }
         }
     }
 
@@ -631,7 +948,23 @@ impl Session {
         self.downstream_modules_ctx
             .response_header_filter(&mut resp, end_of_stream)
             .await?;
+        self.downstream_session.prepare_response_header(&mut resp)?;
         self.downstream_session.write_response_header(resp).await
+    }
+
+    /// Run final downstream response-header filters before a same-batch
+    /// trailer hook, then latch the resulting H1 framing capability.
+    pub(crate) async fn prepare_response_headers(&mut self, tasks: &mut [HttpTask]) -> Result<()> {
+        for task in tasks {
+            if let HttpTask::Header(resp, end) = task {
+                self.downstream_modules_ctx
+                    .response_header_filter(resp, *end)
+                    .await?;
+                self.downstream_session.prepare_response_header(resp)?;
+                self.prepared_response_headers += 1;
+            }
+        }
+        Ok(())
     }
 
     /// Similar to `write_response_header()`, this fn will clone the `resp` internally
@@ -679,9 +1012,14 @@ impl Session {
                 if *seen_upgraded {
                     return reject_unexpected_task_after_h1_upgrade(self, "header", *seen_upgraded);
                 }
-                self.downstream_modules_ctx
-                    .response_header_filter(resp, *end)
-                    .await?;
+                if self.prepared_response_headers > 0 {
+                    self.prepared_response_headers -= 1;
+                } else {
+                    self.downstream_modules_ctx
+                        .response_header_filter(resp, *end)
+                        .await?;
+                    self.downstream_session.prepare_response_header(resp)?;
+                }
                 reject_mismatched_h1_upgrade_101(self, resp, "downstream_module_header_filter")
                     .map_err(|e| e.into_in())?;
                 if resp.status == http::StatusCode::SWITCHING_PROTOCOLS
@@ -1025,6 +1363,12 @@ static BAD_GATEWAY: Lazy<ResponseHeader> = Lazy::new(|| {
     resp
 });
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DownstreamErrorReuse {
+    ApplicationControlled,
+    ForceClose,
+}
+
 impl<SV, C> HttpProxy<SV, C>
 where
     C: custom::Connector,
@@ -1156,6 +1500,16 @@ where
             }
         }
 
+        // Body policy is request-scoped. Freeze it exactly once after every
+        // pre-upstream request hook has completed, but before any attempt can
+        // select a peer or mutate attempt-local headers.
+        let relay_plan = self.inner.request_relay_plan(&session, &ctx);
+        if let Err(e) = session.freeze_request_relay_plan(relay_plan) {
+            return self
+                .handle_error(session, &mut ctx, e, "Error freezing request relay plan:")
+                .await;
+        }
+
         let mut retries: usize = 0;
 
         let mut server_reuse = false;
@@ -1163,12 +1517,22 @@ where
 
         while retries < self.max_retries {
             retries += 1;
+            session.begin_request_relay_attempt(retries);
 
             let (reuse, e) = self.proxy_to_upstream(&mut session, &mut ctx).await;
             server_reuse = reuse;
 
             match e {
-                Some(error) => {
+                Some(mut error) => {
+                    if final_response_committed(session.response_written()) {
+                        error.retry = false.into();
+                    }
+                    if !session.request_relay_retry_state().can_start_next_attempt() {
+                        // Preserve the final error's observable classification:
+                        // fail_to_proxy/logging must not see a retryable error
+                        // after the relay backing vetoed the retry.
+                        error.retry = false.into();
+                    }
                     let retry = error.retry();
                     // only log error that will be retried here, the final error will be logged below
                     if retry
@@ -1250,7 +1614,7 @@ where
 
     async fn handle_error(
         &self,
-        mut session: Session,
+        session: Session,
         ctx: &mut <SV as ProxyHttp>::CTX,
         e: Box<Error>,
         context: &str,
@@ -1259,7 +1623,36 @@ where
         SV: ProxyHttp + Send + Sync + 'static,
         <SV as ProxyHttp>::CTX: Send + Sync,
     {
+        self.handle_error_with_downstream_reuse(
+            session,
+            ctx,
+            e,
+            context,
+            DownstreamErrorReuse::ApplicationControlled,
+        )
+        .await
+    }
+
+    async fn handle_error_with_downstream_reuse(
+        &self,
+        mut session: Session,
+        ctx: &mut <SV as ProxyHttp>::CTX,
+        e: Box<Error>,
+        context: &str,
+        downstream_reuse: DownstreamErrorReuse,
+    ) -> Option<ReusedHttpStream>
+    where
+        SV: ProxyHttp + Send + Sync + 'static,
+        <SV as ProxyHttp>::CTX: Send + Sync,
+    {
+        let force_close_downstream = downstream_reuse == DownstreamErrorReuse::ForceClose;
         let res = self.inner.fail_to_proxy(&mut session, &e, ctx).await;
+        if force_close_downstream {
+            // Admission has already decided that unread request bytes make reuse unsafe. A custom
+            // error renderer has mutable Session access and may change keepalive while writing its
+            // response, so re-assert the transport boundary after the hook returns.
+            session.set_keepalive(None);
+        }
         if !self.inner.suppress_error_log(&session, ctx, &e) {
             error!(
                 "{context} {}, status: {}, {}",
@@ -1272,8 +1665,16 @@ where
         self.cleanup_sub_req(&mut session);
 
         session.downstream_session.on_proxy_failure(e);
+        if force_close_downstream {
+            // Keep this as the final mutable write before reuse is evaluated. In particular,
+            // `logging` also receives `&mut Session` and may have changed keepalive after the
+            // renderer-level re-assertion above.
+            session.set_keepalive(None);
+        }
 
-        if res.can_reuse_downstream {
+        let can_reuse_downstream = res.can_reuse_downstream
+            && downstream_reuse == DownstreamErrorReuse::ApplicationControlled;
+        if can_reuse_downstream {
             let mut persistent_settings = HttpPersistentSettings::for_session(&session);
             if let Some(uc) = self.inner.persist_connection_context(&session, ctx) {
                 persistent_settings.set_user_context(uc);
@@ -1469,6 +1870,31 @@ where
         }
 
         let mut ctx = self.inner.new_ctx();
+
+        if session.downstream_session.as_http1().is_some()
+            && !proxy_common::h1_transfer_encoding_is_forwardable(session.req_header())
+        {
+            // The request body has not been consumed. Close the H1 connection even when a custom
+            // `fail_to_proxy` implementation would otherwise allow reuse, so unread coded bytes
+            // can never be interpreted as another request. This must also precede
+            // `on_connection_reuse`, whose mutable Session access could otherwise rewrite the
+            // external header before admission validates it.
+            session.set_keepalive(None);
+            let e = Error::explain(
+                HTTPStatus(501),
+                "unsupported HTTP/1 request Transfer-Encoding",
+            )
+            .into_down();
+            return self
+                .handle_error_with_downstream_reuse(
+                    session,
+                    &mut ctx,
+                    e,
+                    "Fail closed on unsupported request transfer coding:",
+                    DownstreamErrorReuse::ForceClose,
+                )
+                .await;
+        }
 
         // Deliver user context from the previous request on this reused connection
         if let Some(prev_ctx) = prev_user_ctx {
@@ -2279,5 +2705,50 @@ mod tests {
         assert!(called.load(Ordering::Acquire));
         let written = written.lock().unwrap().clone();
         assert_raw_upgrade_payload(&written);
+    }
+}
+
+/// Whether a final downstream response has been committed, which forbids any
+/// further upstream retry: the client has already received bytes from this
+/// attempt, and a retry would concatenate two upstream responses into one
+/// downstream body.
+///
+/// A 1xx informational response is not final — the H1 downstream session can
+/// store one in `response_written()` — except 101, which switches protocols
+/// and is final. The H2 session never stores a 1xx, so the informational
+/// check is inert there.
+fn final_response_committed(resp: Option<&ResponseHeader>) -> bool {
+    resp.is_some_and(|r| {
+        !r.status.is_informational() || r.status == http::StatusCode::SWITCHING_PROTOCOLS
+    })
+}
+
+#[cfg(test)]
+mod retry_guard_tests {
+    use super::*;
+
+    fn resp(code: u16) -> ResponseHeader {
+        ResponseHeader::build(code, None).unwrap()
+    }
+
+    #[test]
+    fn no_committed_response_permits_retry() {
+        assert!(!final_response_committed(None));
+    }
+
+    #[test]
+    fn retry_guard_ignores_1xx_but_not_101() {
+        // H1 can store a 1xx informational response in response_written();
+        // it is not final and must not block a retry.
+        assert!(!final_response_committed(Some(&resp(100))));
+        assert!(!final_response_committed(Some(&resp(103))));
+        // 101 is a final response despite being 1xx.
+        assert!(final_response_committed(Some(&resp(101))));
+    }
+
+    #[test]
+    fn final_statuses_forbid_retry() {
+        assert!(final_response_committed(Some(&resp(200))));
+        assert!(final_response_committed(Some(&resp(502))));
     }
 }
