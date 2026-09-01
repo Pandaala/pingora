@@ -21,6 +21,7 @@ use pingora_core::protocols::Stream;
 use pingora_core::server::configuration::ServerConf;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::ErrorType::InternalError;
+use pingora_http::ResponseHeader;
 use std::any::Any;
 use std::future::pending;
 use std::hint::black_box;
@@ -30,10 +31,73 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 
+fn facts(
+    is_upgrade_req: bool,
+    is_connect: bool,
+    body_empty: bool,
+    below_11: bool,
+) -> DispositionFacts {
+    DispositionFacts {
+        is_upgrade_req,
+        is_connect,
+        body_empty,
+        upstream_below_http11: below_11,
+    }
+}
+
+#[test]
+fn streamed_protocol_conflict_excludes_only_tunnel_and_legacy_framing() {
+    assert!(!facts(false, false, false, false).streamed_protocol_conflict());
+    assert!(facts(true, false, false, false).streamed_protocol_conflict());
+    assert!(facts(false, true, false, false).streamed_protocol_conflict());
+    assert!(facts(false, false, false, true).streamed_protocol_conflict());
+    assert!(
+        !facts(false, false, true, false).streamed_protocol_conflict(),
+        "a strictly bodyless request keeps the existing benign Ordinary coercion"
+    );
+}
+
+/// The tunnel facts come from the UNION of both sides, because the
+/// rewrite the disposition drives targets the upstream request while the
+/// downstream request is what the client actually sent.
+#[test]
+fn disposition_facts_union_both_sides() {
+    fn upstream(method: &str, upgrade: bool) -> RequestHeader {
+        let mut req = RequestHeader::build(method, b"/", None).unwrap();
+        if upgrade {
+            req.insert_header(http::header::UPGRADE, "websocket")
+                .unwrap();
+            req.insert_header(http::header::CONNECTION, "upgrade")
+                .unwrap();
+        }
+        req
+    }
+
+    // Neither side: nothing to protect.
+    let plain = DispositionFacts::union(false, false, false, &upstream("POST", false));
+    assert!(!plain.is_upgrade_req && !plain.is_connect);
+
+    // Only the DOWNSTREAM request is a tunnel (the application stripped
+    // `Upgrade` from the upstream request).
+    let downstream_only = DispositionFacts::union(true, false, false, &upstream("POST", false));
+    assert!(downstream_only.is_upgrade_req);
+    let downstream_connect = DispositionFacts::union(false, true, false, &upstream("POST", false));
+    assert!(downstream_connect.is_connect);
+
+    // Only the UPSTREAM request is a tunnel (the application synthesized
+    // it from an ordinary downstream request).
+    let upstream_only = DispositionFacts::union(false, false, false, &upstream("GET", true));
+    assert!(upstream_only.is_upgrade_req);
+    let upstream_connect =
+        DispositionFacts::union(false, false, false, &upstream("CONNECT", false));
+    assert!(upstream_connect.is_connect);
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HookBehavior {
     Continue,
     Terminate,
+    TerminateWithLocalResponse,
     Error,
     Pending,
 }
@@ -79,7 +143,7 @@ impl ProxyHttp for RelayProbe {
 
     async fn request_body_filter_action(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         body: &mut Option<Bytes>,
         event: RequestBodyEvent,
         ctx: &mut Self::CTX,
@@ -92,6 +156,13 @@ impl ProxyHttp for RelayProbe {
         match self.body {
             HookBehavior::Continue => Ok(RequestBodyAction::Continue),
             HookBehavior::Terminate => Ok(RequestBodyAction::Terminate),
+            HookBehavior::TerminateWithLocalResponse => {
+                let response = ResponseHeader::build(403, Some(0))?;
+                session
+                    .write_response_header(Box::new(response), true)
+                    .await?;
+                Ok(RequestBodyAction::Terminate)
+            }
             HookBehavior::Error => Error::e_explain(InternalError, "body hook failed"),
             HookBehavior::Pending => pending().await,
         }
@@ -99,13 +170,20 @@ impl ProxyHttp for RelayProbe {
 
     async fn request_trailer_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<RequestBodyAction> {
         self.log.lock().unwrap().push("trailer");
         match self.trailer {
             HookBehavior::Continue => Ok(RequestBodyAction::Continue),
             HookBehavior::Terminate => Ok(RequestBodyAction::Terminate),
+            HookBehavior::TerminateWithLocalResponse => {
+                let response = ResponseHeader::build(403, Some(0))?;
+                session
+                    .write_response_header(Box::new(response), true)
+                    .await?;
+                Ok(RequestBodyAction::Terminate)
+            }
             HookBehavior::Error => Error::e_explain(InternalError, "trailer hook failed"),
             HookBehavior::Pending => pending().await,
         }
@@ -324,6 +402,82 @@ async fn h1_and_h2_return_typed_body_termination_but_custom_fails_closed() {
 }
 
 #[tokio::test]
+async fn qualified_abandoned_terminate_preserves_a_response_selected_before_the_hook() {
+    for protocol in [
+        RequestRelayProtocol::H1,
+        RequestRelayProtocol::H2,
+        RequestRelayProtocol::Custom,
+    ] {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let proxy = make_proxy(HookBehavior::Terminate, HookBehavior::Continue, log);
+        let (mut session, _client) = empty_request_session().await;
+        session.mark_response_head_attempt_selected();
+
+        let outcome = proxy
+            .request_relay_event_with_abandonment_policy(
+                protocol,
+                &mut session,
+                None,
+                RequestBodyEvent::Abandoned,
+                AbandonmentResponsePolicy::PreserveSelected,
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RequestRelayOutcome::PreserveSelectedResponse);
+    }
+}
+
+#[tokio::test]
+async fn selected_incomplete_response_is_explicitly_aborted() {
+    for protocol in [
+        RequestRelayProtocol::H1,
+        RequestRelayProtocol::H2,
+        RequestRelayProtocol::Custom,
+    ] {
+        for event in [RequestBodyEvent::Abandoned, RequestBodyEvent::Data] {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let proxy = make_proxy(HookBehavior::Terminate, HookBehavior::Continue, log);
+            let (mut session, _client) = empty_request_session().await;
+            session.mark_response_head_attempt_selected();
+
+            let outcome = proxy
+                .request_relay_event(protocol, &mut session, None, event, &mut Vec::new())
+                .await
+                .unwrap();
+
+            assert_eq!(outcome, RequestRelayOutcome::AbortSelectedResponse);
+        }
+    }
+}
+
+#[tokio::test]
+async fn abandoned_terminate_without_a_pipeline_response_keeps_local_termination() {
+    for protocol in [RequestRelayProtocol::H1, RequestRelayProtocol::H2] {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let proxy = make_proxy(HookBehavior::Terminate, HookBehavior::Continue, log);
+        let (mut session, _client) = empty_request_session().await;
+
+        let outcome = proxy
+            .request_relay_event(
+                protocol,
+                &mut session,
+                None,
+                RequestBodyEvent::Abandoned,
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            RequestRelayOutcome::Terminate(RequestTerminationOrigin::BodyFilter)
+        );
+    }
+}
+
+#[tokio::test]
 async fn body_hook_error_propagates_for_every_protocol() {
     for protocol in [
         RequestRelayProtocol::H1,
@@ -425,6 +579,50 @@ async fn trailer_terminate_skips_body_filter_and_custom_preserves_no_trailer_hoo
     assert!(matches!(outcome, RequestRelayOutcome::Continue(_)));
     assert!(!session.request_trailer_filter_fired);
     assert_eq!(&*log.lock().unwrap(), &["application"]);
+}
+
+#[tokio::test]
+async fn trailer_terminate_aborts_a_preselected_response_but_keeps_a_hook_local_reply() {
+    let proxy = make_proxy(
+        HookBehavior::Continue,
+        HookBehavior::Terminate,
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let (mut session, _client) = trailer_request_session().await;
+    session.mark_response_head_attempt_selected();
+    let outcome = proxy
+        .request_relay_event(
+            RequestRelayProtocol::H2,
+            &mut session,
+            None,
+            RequestBodyEvent::Complete,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, RequestRelayOutcome::AbortSelectedResponse);
+
+    let proxy = make_proxy(
+        HookBehavior::Continue,
+        HookBehavior::TerminateWithLocalResponse,
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let (mut session, _client) = trailer_request_session().await;
+    let outcome = proxy
+        .request_relay_event(
+            RequestRelayProtocol::H2,
+            &mut session,
+            None,
+            RequestBodyEvent::Complete,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        RequestRelayOutcome::Terminate(RequestTerminationOrigin::TrailerFilter)
+    );
+    assert_eq!(session.response_written().unwrap().status.as_u16(), 403);
 }
 
 #[tokio::test]

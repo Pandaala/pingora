@@ -31,8 +31,9 @@
 //! per batch. Revisit this bound if a producer is ever scheduled independently
 //! or the channel gains another sender.
 
+use crate::ResponseHeadReplacement;
 use bytes::Bytes;
-use pingora_error::{Error, ErrorType::InternalError, Result};
+use pingora_error::{BError, Error, ErrorType::InternalError, Result};
 
 /// Maximum bytes a filter may emit through the sink within one pump batch.
 /// In-place growth of the current chunk is outside this limit.
@@ -49,6 +50,30 @@ pub struct ResponseBodySink {
     remaining: usize,
     remaining_chunks: usize,
     terminate: bool,
+    head_control: ResponseHeadControl,
+    head_work: Option<ResponseHeadWorkBudget>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResponseHeadWorkBudget {
+    remaining: u64,
+    used: u64,
+    exhausted: bool,
+}
+
+#[derive(Debug)]
+enum ResponseHeadControl {
+    Disarmed,
+    Armed,
+    Release,
+    Replace(ResponseHeadReplacement),
+    Fail(BError),
+}
+
+pub(crate) enum ResponseHeadDecision {
+    Release,
+    Replace(ResponseHeadReplacement),
+    Fail(BError),
 }
 
 impl Default for ResponseBodySink {
@@ -64,7 +89,153 @@ impl ResponseBodySink {
             remaining: RESPONSE_BODY_EMIT_BUDGET,
             remaining_chunks: RESPONSE_BODY_EMIT_CHUNK_BUDGET,
             terminate: false,
+            head_control: ResponseHeadControl::Disarmed,
+            head_work: None,
         }
+    }
+
+    /// Request release of a response head currently held by the bounded
+    /// response-head barrier.
+    ///
+    /// Returns `true` only for the first request while a head is armed. The
+    /// default Immediate path is disarmed and returns `false`. This signal is
+    /// intentionally independent of [`Self::terminate`]: releasing a head
+    /// permits normal streaming to continue.
+    pub fn release_response_head(&mut self) -> bool {
+        if matches!(self.head_control, ResponseHeadControl::Armed) {
+            self.head_control = ResponseHeadControl::Release;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether a bounded response head is currently awaiting or carrying a
+    /// callback-local decision.
+    pub fn response_head_is_held(&self) -> bool {
+        !matches!(self.head_control, ResponseHeadControl::Disarmed)
+    }
+
+    /// Whether the active Hold has a staged callback decision waiting for the
+    /// response pipeline to consume it.
+    ///
+    /// Product processor drivers can use this after their full callback chain
+    /// returns to avoid translating a precommit Replace/Fail into the legacy
+    /// post-commit stream-termination path.
+    pub fn response_head_decision_pending(&self) -> bool {
+        matches!(
+            self.head_control,
+            ResponseHeadControl::Release
+                | ResponseHeadControl::Replace(_)
+                | ResponseHeadControl::Fail(_)
+        )
+    }
+
+    /// Reserve units from the response-head Hold work budget before performing
+    /// bounded synchronous or external work. Reservations survive pump batch
+    /// resets and are aggregated into the final content-free usage report.
+    pub fn reserve_response_head_work(&mut self, units: u64) -> Result<()> {
+        let Some(work) = self.head_work.as_mut() else {
+            return Error::e_explain(InternalError, "response head work requested outside Hold");
+        };
+        if units > work.remaining {
+            work.exhausted = true;
+            return Error::e_explain(
+                InternalError,
+                format!(
+                    "response head work budget exhausted: {units} units requested, {} remaining",
+                    work.remaining
+                ),
+            );
+        }
+        work.remaining -= units;
+        work.used = work.used.checked_add(units).ok_or_else(|| {
+            Error::explain(InternalError, "response head work accounting overflow")
+        })?;
+        Ok(())
+    }
+
+    /// Replace the held origin prefix with one complete bounded response.
+    /// A pending Release may be upgraded within the same callback.
+    pub fn replace_response_head(&mut self, replacement: ResponseHeadReplacement) -> Result<()> {
+        if matches!(
+            self.head_control,
+            ResponseHeadControl::Armed | ResponseHeadControl::Release
+        ) {
+            self.head_control = ResponseHeadControl::Replace(replacement);
+            Ok(())
+        } else {
+            Error::e_explain(
+                InternalError,
+                "response head Replace requested without an undecided Hold",
+            )
+        }
+    }
+
+    /// Fail the held response before its original head reaches the writer.
+    /// A pending Release may be upgraded within the same callback.
+    pub fn fail_response_head(&mut self, error: BError) -> Result<()> {
+        if matches!(
+            self.head_control,
+            ResponseHeadControl::Armed | ResponseHeadControl::Release
+        ) {
+            self.head_control = ResponseHeadControl::Fail(error);
+            Ok(())
+        } else {
+            Error::e_explain(
+                InternalError,
+                "response head Fail requested without an undecided Hold",
+            )
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_response_head_release(&mut self) -> bool {
+        self.arm_response_head_release_with_work_limit(u64::MAX)
+    }
+
+    pub(crate) fn arm_response_head_release_with_work_limit(
+        &mut self,
+        max_work_units: u64,
+    ) -> bool {
+        if !matches!(self.head_control, ResponseHeadControl::Disarmed) {
+            return false;
+        }
+        self.head_control = ResponseHeadControl::Armed;
+        self.head_work = Some(ResponseHeadWorkBudget {
+            remaining: max_work_units,
+            used: 0,
+            exhausted: false,
+        });
+        true
+    }
+
+    pub(crate) fn response_head_work_units(&self) -> Option<u64> {
+        self.head_work.map(|work| work.used)
+    }
+
+    pub(crate) fn response_head_work_limit_exceeded(&self) -> bool {
+        self.head_work.is_some_and(|work| work.exhausted)
+    }
+
+    pub(crate) fn take_response_head_decision(&mut self) -> Option<ResponseHeadDecision> {
+        match std::mem::replace(&mut self.head_control, ResponseHeadControl::Disarmed) {
+            ResponseHeadControl::Disarmed => None,
+            ResponseHeadControl::Armed => {
+                self.head_control = ResponseHeadControl::Armed;
+                None
+            }
+            ResponseHeadControl::Release => Some(ResponseHeadDecision::Release),
+            ResponseHeadControl::Replace(replacement) => {
+                Some(ResponseHeadDecision::Replace(replacement))
+            }
+            ResponseHeadControl::Fail(error) => Some(ResponseHeadDecision::Fail(error)),
+        }
+    }
+
+    pub(crate) fn disarm_response_head_release(&mut self) {
+        self.head_control = ResponseHeadControl::Disarmed;
+        self.head_work = None;
     }
 
     /// Queue an additional chunk to be written downstream after the current
@@ -170,125 +341,5 @@ impl ResponseBodySink {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn push_accumulates_and_take_drains() {
-        let mut sink = ResponseBodySink::new();
-        sink.push(Bytes::from_static(b"a")).unwrap();
-        sink.push(Bytes::from_static(b"bc")).unwrap();
-        let extra = sink.take_extra();
-        assert_eq!(
-            extra,
-            vec![Bytes::from_static(b"a"), Bytes::from_static(b"bc")]
-        );
-        assert!(sink.take_extra().is_empty(), "take must drain");
-    }
-
-    #[test]
-    fn budget_is_consumed_and_exhaustion_errors() {
-        let mut sink = ResponseBodySink::new();
-        assert_eq!(sink.remaining_budget(), RESPONSE_BODY_EMIT_BUDGET);
-        sink.push(Bytes::from_static(b"1234")).unwrap();
-        assert_eq!(sink.remaining_budget(), RESPONSE_BODY_EMIT_BUDGET - 4);
-
-        let oversized = Bytes::from(vec![0u8; RESPONSE_BODY_EMIT_BUDGET]);
-        assert!(sink.push(oversized).is_err(), "must reject, never truncate");
-        // The rejected chunk must not be partially recorded.
-        assert_eq!(sink.remaining_budget(), RESPONSE_BODY_EMIT_BUDGET - 4);
-        assert_eq!(sink.take_extra().len(), 1);
-    }
-
-    #[test]
-    fn chunk_budget_accepts_limit_and_rejects_next_without_mutation() {
-        let mut sink = ResponseBodySink::new();
-        for _ in 0..RESPONSE_BODY_EMIT_CHUNK_BUDGET {
-            sink.push(Bytes::from_static(b"x")).unwrap();
-        }
-        assert_eq!(sink.remaining_chunk_budget(), 0);
-        assert_eq!(
-            sink.remaining_budget(),
-            RESPONSE_BODY_EMIT_BUDGET - RESPONSE_BODY_EMIT_CHUNK_BUDGET
-        );
-
-        let remaining_bytes = sink.remaining_budget();
-        assert!(sink.push(Bytes::from_static(b"y")).is_err());
-        assert_eq!(sink.remaining_budget(), remaining_bytes);
-        assert_eq!(sink.remaining_chunk_budget(), 0);
-        assert_eq!(sink.take_extra().len(), RESPONSE_BODY_EMIT_CHUNK_BUDGET);
-    }
-
-    #[test]
-    fn reset_batch_restores_budget_but_not_terminate() {
-        let mut sink = ResponseBodySink::new();
-        sink.push(Bytes::from_static(b"xyz")).unwrap();
-        sink.terminate();
-        sink.reset_batch();
-        assert_eq!(sink.remaining_budget(), RESPONSE_BODY_EMIT_BUDGET);
-        assert_eq!(
-            sink.remaining_chunk_budget(),
-            RESPONSE_BODY_EMIT_CHUNK_BUDGET
-        );
-        assert!(
-            sink.take_extra().is_empty(),
-            "reset_batch drops undelivered extras"
-        );
-        assert!(sink.is_terminated(), "terminate is sticky across batches");
-    }
-
-    #[test]
-    fn empty_push_is_free() {
-        let mut sink = ResponseBodySink::new();
-        sink.push(Bytes::new()).unwrap();
-        assert_eq!(sink.remaining_budget(), RESPONSE_BODY_EMIT_BUDGET);
-        assert_eq!(
-            sink.remaining_chunk_budget(),
-            RESPONSE_BODY_EMIT_CHUNK_BUDGET
-        );
-        assert!(
-            sink.take_extra().is_empty(),
-            "empty chunks are dropped, not queued"
-        );
-    }
-
-    #[test]
-    fn prepend_current_keeps_current_chunk_before_extras_without_spending_budget() {
-        let mut sink = ResponseBodySink::new();
-        sink.push(Bytes::from_static(b"extra-a")).unwrap();
-        sink.push(Bytes::from_static(b"extra-b")).unwrap();
-        let remaining = sink.remaining_budget();
-        let remaining_chunks = sink.remaining_chunk_budget();
-        sink.prepend_current(Bytes::from_static(b"current"));
-        assert_eq!(sink.remaining_budget(), remaining);
-        assert_eq!(sink.remaining_chunk_budget(), remaining_chunks);
-        assert_eq!(
-            sink.take_extra(),
-            vec![
-                Bytes::from_static(b"current"),
-                Bytes::from_static(b"extra-a"),
-                Bytes::from_static(b"extra-b"),
-            ]
-        );
-    }
-
-    #[test]
-    fn synthetic_current_chunk_has_the_same_unbudgeted_semantics_as_body_mutation() {
-        let mut sink = ResponseBodySink::new();
-        sink.prepend_current(Bytes::from(vec![0; RESPONSE_BODY_EMIT_BUDGET + 1]));
-        assert_eq!(sink.remaining_budget(), RESPONSE_BODY_EMIT_BUDGET);
-        assert_eq!(sink.take_extra()[0].len(), RESPONSE_BODY_EMIT_BUDGET + 1);
-
-        assert!(sink
-            .push(Bytes::from(vec![0; RESPONSE_BODY_EMIT_BUDGET + 1]))
-            .is_err());
-    }
-
-    #[test]
-    fn terminal_boundary_consumes_terminate() {
-        let mut sink = ResponseBodySink::new();
-        sink.terminate();
-        sink.consume_terminate();
-        assert!(!sink.is_terminated());
-    }
-}
+#[path = "response_body_sink_tests.rs"]
+mod tests;

@@ -18,8 +18,20 @@ use futures::StreamExt;
 use super::*;
 use crate::proxy_cache::ServeFromCache;
 use crate::proxy_common::*;
-use crate::request_relay::{RequestRelayOutcome, RequestRelayProtocol};
-use crate::response_pipeline::{ResponsePipelineState, ResponseProtocol};
+use crate::pump_termination::{
+    abort_selected_response, downstream_body_read_is_futile,
+    finalize_preserved_response_downstream_reuse, finish_terminated_response,
+    join_bidirectional_pumps, release_cache_on_terminate,
+    warn_response_body_terminate_content_length_leak,
+    warn_response_body_terminate_without_response, warn_terminate_without_response,
+    DownstreamRequestOutcome, DuplexPumpOutcome,
+};
+use crate::request_relay::{
+    bodyless_contract_violation, safe_upstream_disposition, validate_streamed_upstream_disposition,
+    violates_bodyless_contract, AbandonmentResponsePolicy, RequestRelayOutcome,
+    RequestRelayProtocol,
+};
+use crate::response_pipeline::{ResponsePipelineState, ResponseProtocol, ResponseTaskBatchOutcome};
 use pingora_core::protocols::http::{
     custom::CUSTOM_MESSAGE_QUEUE_SIZE, v1::common::is_upgrade_req as is_h1_upgrade_req,
 };
@@ -205,10 +217,11 @@ where
         // Shared signal so the upstream half can distinguish an expected task-pipe
         // closure (the downstream half finished and dropped rx) from an unexpected one.
         let pipe_state = Arc::new(AtomicU8::new(PipeState::Active as u8));
+        let mut response_pipeline = ResponsePipelineState::default();
 
         // start bi-directional streaming
-        let ret = {
-            let downstream = self.proxy_handle_downstream(
+        let ret = join_bidirectional_pumps(
+            self.proxy_handle_downstream(
                 session,
                 tx_downstream,
                 rx_upstream,
@@ -217,43 +230,12 @@ where
                 &mut downstream_custom_message_reader,
                 pipe_state.clone(),
                 body_disposition,
-            );
-            let upstream =
-                self.proxy_handle_upstream(client_session, tx_upstream, rx_downstream, pipe_state);
-            tokio::pin!(downstream);
-            tokio::pin!(upstream);
-
-            tokio::select! {
-                // Deterministic preference for the typed terminate outcome: when a
-                // downstream `Ok(Terminate)` (the application already wrote the
-                // response) and an upstream `Err` become ready in the same poll,
-                // random branch order would non-deterministically pick the generic
-                // error path instead. Non-terminate orderings are unchanged because
-                // the `Complete` arm still awaits the sibling.
-                biased;
-
-                downstream_result = &mut downstream => {
-                    match downstream_result {
-                        Ok(DownstreamRequestOutcome::Terminate) => {
-                            // Dropping the sibling future immediately stops both upstream
-                            // response reads and request-body writes.
-                            None
-                        }
-                        Ok(outcome @ (DownstreamRequestOutcome::Complete(_)
-                            | DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(_))) => {
-                            Some(upstream.await.map(|upstream| (outcome, upstream)))
-                        }
-                        Err(e) => Some(Err(e)),
-                    }
-                }
-                upstream_result = &mut upstream => {
-                    Some(match upstream_result {
-                        Ok(upstream) => downstream.await.map(|downstream| (downstream, upstream)),
-                        Err(e) => Err(e),
-                    })
-                }
-            }
-        };
+                &mut response_pipeline,
+            ),
+            self.proxy_handle_upstream(client_session, tx_upstream, rx_downstream, pipe_state),
+        )
+        .await;
+        self.cancel_response_head_hold(session, ctx, &mut response_pipeline);
 
         if let Some(custom_session) = session.downstream_session.as_custom_mut() {
             if let Some(downstream_custom_message_writer) = downstream_custom_message_writer {
@@ -277,18 +259,18 @@ where
         }
 
         match ret {
-            None | Some(Ok((DownstreamRequestOutcome::Terminate, _))) => {
+            DuplexPumpOutcome::ApplicationTerminate { .. } => {
                 release_cache_on_terminate(session);
                 (false, false, None)
             }
-            Some(Ok((DownstreamRequestOutcome::Complete(downstream_can_reuse), _upstream))) => {
-                (downstream_can_reuse, true, None)
-            }
-            Some(Ok((
-                DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(downstream_can_reuse),
-                _upstream,
-            ))) => (downstream_can_reuse, false, None),
-            Some(Err(e)) => (false, false, Some(e)),
+            DuplexPumpOutcome::Complete {
+                downstream_can_reuse,
+                upstream: upstream_can_reuse,
+            } => (downstream_can_reuse, upstream_can_reuse, None),
+            DuplexPumpOutcome::OriginAbandoned {
+                downstream_can_reuse,
+            } => (downstream_can_reuse, false, None),
+            DuplexPumpOutcome::Failed(error) => (false, false, Some(error)),
         }
     }
 
@@ -465,7 +447,7 @@ where
         serve_from_cache: &mut ServeFromCache,
         response_state: &mut ResponseStateMachine,
         pipeline: &mut ResponsePipelineState,
-    ) -> Result<Option<(bool, bool)>>
+    ) -> Result<Option<ResponseTaskBatchOutcome>>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
@@ -496,7 +478,21 @@ where
         let mut tasks = tasks.into_iter();
         for mut t in tasks.by_ref() {
             let task_source_done = t.is_end();
-            if self.revalidate_or_stale(session, &mut t, ctx).await {
+            if self
+                .enforce_response_head_source_input(session, &t, ctx, pipeline, &mut filtered_tasks)
+                .await?
+            {
+                break;
+            }
+            let revalidated = pipeline
+                .wait_with_response_head_deadline(async {
+                    Ok(self.revalidate_or_stale(session, &mut t, ctx).await)
+                })
+                .await
+                .map_err(|error| {
+                    self.resolve_response_head_wait_error(session, ctx, pipeline, error)
+                })?;
+            if revalidated {
                 serve_from_cache.enable();
                 response_state.enable_cached_response();
                 // skip downstream filtering entirely as the 304 will not be sent
@@ -504,12 +500,25 @@ where
             }
             #[cfg(feature = "upstream_modules")]
             if let HttpTask::Header(header, end_of_stream) = &t {
-                self.inner
-                    .adjust_upstream_modules(session, header, *end_of_stream, ctx)
-                    .await?;
+                pipeline
+                    .wait_with_response_head_deadline(self.inner.adjust_upstream_modules(
+                        session,
+                        header,
+                        *end_of_stream,
+                        ctx,
+                    ))
+                    .await
+                    .map_err(|error| {
+                        self.resolve_response_head_wait_error(session, ctx, pipeline, error)
+                    })?;
             }
             #[cfg(feature = "upstream_modules")]
-            session.upstream_modules_filter_task(&mut t).await?;
+            pipeline
+                .wait_with_response_head_deadline(session.upstream_modules_filter_task(&mut t))
+                .await
+                .map_err(|error| {
+                    self.resolve_response_head_wait_error(session, ctx, pipeline, error)
+                })?;
             let compression_prefix = session
                 .upstream_compression
                 .response_filter_with_preceding(&mut t);
@@ -525,6 +534,9 @@ where
                     &mut filtered_tasks,
                 )
                 .await?;
+                if pipeline.origin_abandoned {
+                    break;
+                }
             }
             if !pipeline.sink.is_terminated() {
                 self.response_task_pipeline(
@@ -538,6 +550,9 @@ where
                     &mut filtered_tasks,
                 )
                 .await?;
+            }
+            if pipeline.origin_abandoned {
+                break;
             }
             source_done |= task_source_done;
             if serve_from_cache.is_miss_header() {
@@ -570,12 +585,19 @@ where
             return Ok(None);
         }
 
-        session.write_response_tasks(filtered_tasks).await?;
+        if !filtered_tasks.is_empty() {
+            session.write_response_tasks(filtered_tasks).await?;
+        }
 
-        Ok(Some((
-            source_done,
-            pipeline.sink.is_terminated() && !source_done,
-        )))
+        if pipeline.origin_abandoned {
+            abort_cache_after_response_source_failure(session, false);
+            Ok(Some(ResponseTaskBatchOutcome::OriginAbandoned))
+        } else {
+            Ok(Some(ResponseTaskBatchOutcome::Progress {
+                source_done,
+                terminated: pipeline.sink.is_terminated() && !source_done,
+            }))
+        }
     }
 
     // todo use this function to replace bidirection_1to2()
@@ -593,6 +615,7 @@ where
         >,
         pipe_state: Arc<AtomicU8>,
         body_disposition: UpstreamRequestBodyDisposition,
+        response_pipeline: &mut ResponsePipelineState,
     ) -> Result<DownstreamRequestOutcome>
     where
         SV: ProxyHttp + Send + Sync,
@@ -643,11 +666,15 @@ where
                     session,
                     buffer,
                     RequestBodyEvent::from(downstream_state.is_done()),
+                    AbandonmentResponsePolicy::Abort,
                     Some(send_permit),
                     ctx,
                     body_disposition,
                 )
                 .await?;
+            if outcome == DownstreamRequestOutcome::AbortSelectedResponse {
+                return Ok(outcome);
+            }
             if outcome == DownstreamRequestOutcome::Terminate {
                 session.set_keepalive(None);
                 finish_terminated_response(session).await;
@@ -665,8 +692,6 @@ where
         // the per-batch byte budget is reset at each batch boundary (see
         // `ResponseBodySink::reset_batch`), but a `terminate()` signal stays
         // sticky for the rest of this response.
-        let mut response_pipeline = ResponsePipelineState::default();
-
         let mut next_upstream_task: Option<HttpTask> = None;
 
         /* duplex mode without caching
@@ -702,11 +727,15 @@ where
                         session,
                         None,
                         RequestBodyEvent::Abandoned,
+                        AbandonmentResponsePolicy::PreserveSelected,
                         None,
                         ctx,
                         body_disposition,
                     )
                     .await?;
+                if outcome == DownstreamRequestOutcome::AbortSelectedResponse {
+                    return Ok(outcome);
+                }
                 if outcome == DownstreamRequestOutcome::Terminate {
                     session.set_keepalive(None);
                     finish_terminated_response(session).await;
@@ -732,6 +761,10 @@ where
                 .as_mut()
                 .map(|reader| reader.next())
                 .into();
+            let response_head_timeout: OptionFuture<_> = response_pipeline
+                .response_head_deadline()
+                .map(tokio::time::sleep_until)
+                .into();
 
             // partial read support, this check will also be false if cache is disabled.
             let support_cache_partial_read =
@@ -739,6 +772,14 @@ where
             let upgraded = session.was_upgraded();
 
             tokio::select! {
+                Some(()) = response_head_timeout => {
+                    return Err(self.resolve_response_head_idle_timeout(
+                        session,
+                        ctx,
+                        response_pipeline,
+                    ));
+                },
+
                 // only try to send to pipe if there is capacity to avoid deadlock
                 // Otherwise deadlock could happen if both upstream and downstream are blocked
                 // on sending to their corresponding pipes which are both full.
@@ -793,11 +834,15 @@ where
                         session,
                         body,
                         RequestBodyEvent::from(is_body_done),
+                        AbandonmentResponsePolicy::Abort,
                         Some(send_permit.unwrap()), // safe because we checked is_ok()
                         ctx,
                         body_disposition,
                     )
                     .await?;
+                    if outcome == DownstreamRequestOutcome::AbortSelectedResponse {
+                        return Ok(outcome);
+                    }
                     if outcome == DownstreamRequestOutcome::Terminate {
                         session.set_keepalive(None);
                         finish_terminated_response(session).await;
@@ -833,11 +878,15 @@ where
                                 session,
                                 None,
                                 RequestBodyEvent::Abandoned,
+                                AbandonmentResponsePolicy::Abort,
                                 None,
                                 ctx,
                                 body_disposition,
                             )
                             .await?;
+                        if outcome == DownstreamRequestOutcome::AbortSelectedResponse {
+                            return Ok(outcome);
+                        }
                         if outcome == DownstreamRequestOutcome::Terminate {
                             session.set_keepalive(None);
                             finish_terminated_response(session).await;
@@ -857,27 +906,34 @@ where
                 task = async { next_upstream_task.take() }, if next_upstream_task.is_some() => {
                     debug!("buffered upstream event: {:?}", task);
                     if let Some(t) = task {
-                        let Some((response_done, terminated)) = self.process_upstream_tasks(
+                        let Some(batch_outcome) = self.process_upstream_tasks(
                             session,
                             ctx,
                             t,
                             &mut rx,
                             &mut serve_from_cache,
                             &mut response_state,
-                            &mut response_pipeline,
+                            response_pipeline,
                         ).await? else {
                             // nothing sent downstream e.g. serve_from_cache
                             continue;
                         };
-                        if terminated {
-                            session.set_keepalive(None);
-                            warn_response_body_terminate_without_response(session, "upstream_response_body_filter");
-                            warn_response_body_terminate_content_length_leak(session, "upstream_response_body_filter");
-                            finish_terminated_response(session).await;
-                            restore_custom_message_reader(session, downstream_custom_message_reader.take());
-                            return Ok(DownstreamRequestOutcome::Terminate);
+                        match batch_outcome {
+                            ResponseTaskBatchOutcome::Progress { source_done, terminated } => {
+                                if terminated {
+                                    session.set_keepalive(None);
+                                    warn_response_body_terminate_without_response(session, "upstream_response_body_filter");
+                                    warn_response_body_terminate_content_length_leak(session, "upstream_response_body_filter");
+                                    finish_terminated_response(session).await;
+                                    restore_custom_message_reader(session, downstream_custom_message_reader.take());
+                                    return Ok(DownstreamRequestOutcome::Terminate);
+                                }
+                                response_state.maybe_set_upstream_done(source_done);
+                            }
+                            ResponseTaskBatchOutcome::OriginAbandoned => {
+                                response_state.maybe_set_upstream_done(true);
+                            }
                         }
-                        response_state.maybe_set_upstream_done(response_done);
                         // unsuccessful upgrade response may force the request done
                         downstream_state.maybe_finished(session.is_body_done());
                     } else {
@@ -890,26 +946,32 @@ where
                     debug!("upstream event: {:?}", task);
                     if let Some(t) = task {
                         let upgraded = session.was_upgraded();
-                        let Some((response_done, terminated)) = self.process_upstream_tasks(
+                        let Some(batch_outcome) = self.process_upstream_tasks(
                             session,
                             ctx,
                             t,
                             &mut rx,
                             &mut serve_from_cache,
                             &mut response_state,
-                            &mut response_pipeline,
+                            response_pipeline,
                         ).await? else {
                             // nothing sent downstream e.g. serve_from_cache
                             continue;
                         };
-                        if terminated {
-                            session.set_keepalive(None);
-                            warn_response_body_terminate_without_response(session, "upstream_response_body_filter");
-                            warn_response_body_terminate_content_length_leak(session, "upstream_response_body_filter");
-                            finish_terminated_response(session).await;
-                            restore_custom_message_reader(session, downstream_custom_message_reader.take());
-                            return Ok(DownstreamRequestOutcome::Terminate);
-                        }
+                        let response_done = match batch_outcome {
+                            ResponseTaskBatchOutcome::Progress { source_done, terminated } => {
+                                if terminated {
+                                    session.set_keepalive(None);
+                                    warn_response_body_terminate_without_response(session, "upstream_response_body_filter");
+                                    warn_response_body_terminate_content_length_leak(session, "upstream_response_body_filter");
+                                    finish_terminated_response(session).await;
+                                    restore_custom_message_reader(session, downstream_custom_message_reader.take());
+                                    return Ok(DownstreamRequestOutcome::Terminate);
+                                }
+                                source_done
+                            }
+                            ResponseTaskBatchOutcome::OriginAbandoned => true,
+                        };
                         if !upgraded && session.was_upgraded() && downstream_state.can_poll() {
                             // TODO: write can happen async now
                             // just upgraded, the downstream state should be reset to continue to
@@ -942,7 +1004,7 @@ where
                     let mut cached_tasks = Vec::with_capacity(1);
                     self.response_task_pipeline(ResponseProtocol::H1, session, task, ctx,
                         &mut serve_from_cache,
-                        true, &mut response_pipeline, &mut cached_tasks).await?;
+                        true, response_pipeline, &mut cached_tasks).await?;
                     debug!("serve_from_cache task {cached_tasks:?}");
 
                     if session.downstream_session.supports_proxy_task_api() {
@@ -1112,6 +1174,8 @@ where
                 }
             }
         }
+        reuse_downstream =
+            finalize_preserved_response_downstream_reuse(session, reuse_downstream).await;
         // Signal the upstream half that the downstream half completed cleanly before
         // dropping rx, so a resulting task-pipe closure is treated as benign.
         pipe_state.store(PipeState::DownstreamComplete as u8, Ordering::Release);
@@ -1128,6 +1192,7 @@ where
         session: &mut Session,
         data: Option<Bytes>,
         event: RequestBodyEvent,
+        abandonment_response_policy: AbandonmentResponsePolicy,
         tx: Option<mpsc::Permit<'_, HttpTask>>,
         ctx: &mut SV::CTX,
         body_disposition: UpstreamRequestBodyDisposition,
@@ -1137,10 +1202,28 @@ where
         SV::CTX: Send + Sync,
     {
         let prepared = match self
-            .request_relay_event(RequestRelayProtocol::H1, session, data, event, ctx)
+            .request_relay_event_with_abandonment_policy(
+                RequestRelayProtocol::H1,
+                session,
+                data,
+                event,
+                abandonment_response_policy,
+                ctx,
+            )
             .await?
         {
             RequestRelayOutcome::Continue(prepared) => prepared,
+            RequestRelayOutcome::AbortSelectedResponse => {
+                abort_selected_response(session).await;
+                return Ok(DownstreamRequestOutcome::AbortSelectedResponse);
+            }
+            RequestRelayOutcome::PreserveSelectedResponse => {
+                // This outcome is only produced for Abandoned. No permit may
+                // be consumed and no clean upstream EOS may be manufactured;
+                // the surrounding abandonment branch will stop the request
+                // side and continue draining the selected response.
+                return Ok(DownstreamRequestOutcome::Complete(true));
+            }
             RequestRelayOutcome::Terminate(origin) => {
                 warn_terminate_without_response(session, origin.hook_name());
                 return Ok(DownstreamRequestOutcome::Terminate);

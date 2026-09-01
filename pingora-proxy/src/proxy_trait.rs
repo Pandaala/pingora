@@ -355,9 +355,14 @@ pub trait ProxyHttp {
     /// continue.
     ///
     /// Before returning [`RequestBodyAction::Terminate`] the application must
-    /// have finished the downstream response itself — either by writing a
-    /// local reply, or by observing an already-committed response and
-    /// abandoning. Pingora never writes a response on the terminate path; a
+    /// have finished an application-owned downstream response itself. For an
+    /// [`RequestBodyEvent::Abandoned`] delivered after the response pipeline
+    /// selected a final response, do not write a local replacement. If the
+    /// protocol pump has independently qualified that response as complete,
+    /// `Terminate` stops the request side while Pingora preserves and drains
+    /// the selected response. Otherwise Pingora explicitly aborts the selected
+    /// incomplete response without writing a clean body terminator. Pingora
+    /// never creates a response on the ordinary terminate path; a
     /// terminate with nothing written leaves the client with a bare connection
     /// close, and Pingora logs a warning when it detects that.
     ///
@@ -387,9 +392,11 @@ pub trait ProxyHttp {
     /// before a trailer-free synthetic request-body EOF could be delivered.
     /// Pingora does not expose or forward the trailer fields.
     ///
-    /// It fires AT MOST ONCE per downstream request, on the attempt that
-    /// observes the transport EOF. Retry attempts replay the same EOF and do
-    /// not re-fire it.
+    /// A successful dispatch is claimed at most once per downstream request.
+    /// The claim is committed only after the awaited hook succeeds, so a
+    /// retryable error or cancellation may let a later attempt invoke the hook
+    /// again. Once claimed, replaying the EOF on a retry does not invoke it
+    /// again.
     ///
     /// It never fires on custom-connector sessions: the trailer-presence fact
     /// is `None` there.
@@ -409,8 +416,11 @@ pub trait ProxyHttp {
     ///   yields no trailer event.
     ///
     /// The [`RequestBodyAction::Terminate`] contract is the same as for
-    /// [`Self::request_body_filter_action`]: the application must have
-    /// finished the downstream response before returning it.
+    /// [`Self::request_body_filter_action`]. A local response first written in
+    /// this hook is application-owned. If the response pipeline selected a
+    /// response before the hook, do not write a replacement: termination
+    /// explicitly aborts that unqualified incomplete response without a clean
+    /// body terminator.
     async fn request_trailer_filter(
         &self,
         _session: &mut Session,
@@ -467,6 +477,18 @@ pub trait ProxyHttp {
         Self::CTX: Send + Sync,
     {
         Ok(())
+    }
+
+    /// Whether this request may select a response-head Hold after cache lookup.
+    ///
+    /// The cache layer checks this request-stage fact after
+    /// [`Self::request_cache_filter`] and before cache-key generation or
+    /// lookup. A true value disables cache lookup and admission for the
+    /// request, because Hold and entity caching are mutually exclusive in the
+    /// initial response-head barrier contract. The default preserves existing
+    /// cache behavior.
+    fn response_head_may_hold(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
+        false
     }
 
     /// This callback generates the cache key.
@@ -713,6 +735,79 @@ pub trait ProxyHttp {
         Self::CTX: Send + Sync,
     {
         Ok(())
+    }
+
+    /// Select how the final downstream response head is committed.
+    ///
+    /// This synchronous hook runs after [`Self::response_filter`] succeeds, so
+    /// the application sees the final post-filter status and headers. It runs
+    /// before downstream module header preparation or writer handoff. Interim
+    /// informational responses do not call it.
+    ///
+    /// The default [`ResponseHeadCommitPlan::Immediate`] preserves existing
+    /// behavior without allocating. Applications may construct a bounded Hold
+    /// for supported ordinary final origin responses. Unsupported cache,
+    /// custom, upgrade, or tunnel shapes reach the typed boundary hook and
+    /// never degrade silently to Immediate.
+    fn response_head_commit_plan(
+        &self,
+        _session: &Session,
+        _source: ResponseHeadSource,
+        _response: &ResponseHeader,
+        _ctx: &Self::CTX,
+    ) -> Result<ResponseHeadCommitPlan> {
+        Ok(ResponseHeadCommitPlan::Immediate)
+    }
+
+    /// Observe the exact final response head selected for downstream commit.
+    ///
+    /// The response pipeline calls this synchronously after an Immediate,
+    /// Release, or Replace decision has selected its final head, but before
+    /// downstream module preparation, task queueing, or writer handoff. An
+    /// error aborts the uncommitted response.
+    fn response_head_will_commit(
+        &self,
+        _session: &Session,
+        _chosen_header: &ResponseHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Resolve a terminal or resource boundary reached while Hold is active.
+    ///
+    /// This hook is synchronous so it remains callable after cancellation of
+    /// an async response processor. The default fails closed with a
+    /// non-retryable internal error. A source [`HttpTask::Failed`] preserves
+    /// its original error and does not pass through this mapper.
+    fn response_head_hold_boundary(
+        &self,
+        _session: &Session,
+        boundary: ResponseHeadBoundary,
+        _ctx: &mut Self::CTX,
+    ) -> ResponseHeadBoundaryAction {
+        let mut error = Error::explain(
+            InternalError,
+            format!(
+                "response head Hold reached an unresolved {} boundary",
+                boundary.as_str()
+            ),
+        );
+        error.set_retry(false);
+        ResponseHeadBoundaryAction::Fail(error)
+    }
+
+    /// Observe the final Hold disposition and aggregate resource usage.
+    ///
+    /// This is a notification hook, not another decision point. It receives no
+    /// body content and defaults to a no-op.
+    fn response_head_hold_outcome(
+        &self,
+        _session: &Session,
+        _outcome: ResponseHeadOutcome,
+        _usage: ResponseHeadUsage,
+        _ctx: &mut Self::CTX,
+    ) {
     }
 
     // custom_forwarding is called when downstream and upstream connections are successfully established.
@@ -1191,127 +1286,5 @@ pub struct FailToProxy {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct DefaultsOnly;
-
-    #[async_trait]
-    impl ProxyHttp for DefaultsOnly {
-        type CTX = ();
-
-        fn new_ctx(&self) -> Self::CTX {}
-
-        async fn upstream_peer(
-            &self,
-            _session: &mut Session,
-            _ctx: &mut Self::CTX,
-        ) -> Result<Box<HttpPeer>> {
-            unreachable!("upstream_peer is not used by trait-default unit tests")
-        }
-    }
-
-    #[test]
-    fn relay_plan_defaults_to_ordinary_replayable() {
-        let io = tokio_test::io::Builder::new().build();
-        let session = Session::new_h1(Box::new(io));
-        assert_eq!(
-            DefaultsOnly.request_relay_plan(&session, &()),
-            RequestRelayPlan::ordinary()
-        );
-    }
-
-    #[test]
-    fn proxy_http_remains_object_compatible() {
-        fn accept_dyn(_proxy: &dyn ProxyHttp<CTX = ()>) {}
-
-        accept_dyn(&DefaultsOnly);
-    }
-
-    struct LegacyBodyFilter;
-
-    #[async_trait]
-    impl ProxyHttp for LegacyBodyFilter {
-        type CTX = bool;
-
-        fn new_ctx(&self) -> Self::CTX {
-            false
-        }
-
-        async fn upstream_peer(
-            &self,
-            _session: &mut Session,
-            _ctx: &mut Self::CTX,
-        ) -> Result<Box<HttpPeer>> {
-            unreachable!("upstream_peer is not used by this body-hook unit test")
-        }
-
-        async fn request_body_filter(
-            &self,
-            _session: &mut Session,
-            _body: &mut Option<Bytes>,
-            _event: RequestBodyEvent,
-            ctx: &mut Self::CTX,
-        ) -> Result<()> {
-            *ctx = true;
-            Ok(())
-        }
-
-        async fn upstream_response_body_filter(
-            &self,
-            _session: &mut Session,
-            _body: &mut Option<Bytes>,
-            end_of_stream: bool,
-            _sink: &mut ResponseBodySink,
-            ctx: &mut Self::CTX,
-        ) -> Result<Option<Duration>> {
-            *ctx = end_of_stream;
-            Ok(None)
-        }
-    }
-
-    #[tokio::test]
-    async fn action_hook_defaults_to_legacy_body_filter_and_continue() {
-        let io = tokio_test::io::Builder::new().build();
-        let mut session = Session::new_h1(Box::new(io));
-        let mut body = Some(Bytes::from_static(b"body"));
-        let mut ctx = false;
-        let app = LegacyBodyFilter;
-
-        let action = app
-            .request_body_filter_action(&mut session, &mut body, RequestBodyEvent::Data, &mut ctx)
-            .await
-            .unwrap();
-
-        assert!(ctx, "the legacy request_body_filter must have run");
-        assert_eq!(action, RequestBodyAction::Continue);
-
-        let trailer_action = app
-            .request_trailer_filter(&mut session, &mut ctx)
-            .await
-            .unwrap();
-        assert_eq!(trailer_action, RequestBodyAction::Continue);
-    }
-
-    #[tokio::test]
-    async fn typed_pre_trailer_terminal_defaults_to_legacy_eos() {
-        let io = tokio_test::io::Builder::new().build();
-        let mut session = Session::new_h1(Box::new(io));
-        let mut body = None;
-        let mut sink = ResponseBodySink::new();
-        let mut ctx = false;
-
-        LegacyBodyFilter
-            .upstream_response_body_filter_event(
-                &mut session,
-                &mut body,
-                UpstreamResponseBodyEvent::TerminalBeforeTrailers,
-                &mut sink,
-                &mut ctx,
-            )
-            .await
-            .unwrap();
-
-        assert!(ctx, "legacy filters must retain their terminal callback");
-    }
-}
+#[path = "proxy_trait_tests.rs"]
+mod tests;

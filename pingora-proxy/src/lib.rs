@@ -43,7 +43,6 @@ use http::{header, version::Version, Method};
 use log::{debug, error, trace, warn};
 use once_cell::sync::Lazy;
 pub use pingora_core::modules::http::RequestBodyEvent;
-use pingora_core::protocols::http::v1::common::header_value_content_length;
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::fmt::Debug;
 use std::str;
@@ -55,126 +54,9 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 use tokio::time;
 
-fn downstream_response_body_forbidden(session: &Session, header: &ResponseHeader) -> bool {
-    session.req_header().method == http::Method::HEAD
-        || header.status.is_informational()
-        || matches!(header.status.as_u16(), 204 | 304)
-}
-
-fn is_downstream_followup(task: &HttpTask) -> bool {
-    !matches!(task, HttpTask::Header(..))
-}
-
-fn abort_cache_after_response_source_failure(session: &mut Session, from_cache: bool) {
-    if session.cache.enabled() || session.cache.bypassing() {
-        session.cache.disable(if from_cache {
-            NoCacheReason::StorageError
-        } else {
-            NoCacheReason::UpstreamError
-        });
-    }
-}
-
-fn reconcile_terminal_response_tasks(
-    tasks: &mut Vec<HttpTask>,
-    start: usize,
-    downstream_body_forbidden: bool,
-) -> Result<()> {
-    if !matches!(tasks.get(start), Some(HttpTask::Header(..))) {
-        return Ok(());
-    }
-
-    if downstream_body_forbidden {
-        tasks.truncate(start + 1);
-        let HttpTask::Header(header, eos) = &mut tasks[start] else {
-            unreachable!("retained task must be a response header")
-        };
-        *eos = true;
-        header.remove_header(&http::header::TRANSFER_ENCODING);
-        if header.status.is_informational() || header.status.as_u16() == 204 {
-            header.remove_header(&http::header::CONTENT_LENGTH);
-        }
-        return Ok(());
-    }
-
-    let body_len = tasks
-        .iter()
-        .skip(start + 1)
-        .filter_map(|task| match task {
-            HttpTask::Body(Some(data), _) | HttpTask::UpgradedBody(Some(data), _) => {
-                Some(data.len())
-            }
-            _ => None,
-        })
-        .sum::<usize>();
-    let HttpTask::Header(header, eos) = &mut tasks[start] else {
-        unreachable!("located task must be a response header")
-    };
-    *eos = false;
-
-    reconcile_content_length(header, body_len);
-    if header.headers.get(http::header::CONTENT_LENGTH).is_none()
-        && header
-            .headers
-            .get(http::header::TRANSFER_ENCODING)
-            .is_none()
-    {
-        header.set_version(Version::HTTP_11);
-        header.insert_header(http::header::TRANSFER_ENCODING, "chunked")?;
-    }
-    Ok(())
-}
-
-fn reconcile_content_length(header: &mut ResponseHeader, body_len: usize) {
-    let content_length_matches =
-        header_value_content_length(header.headers.get(http::header::CONTENT_LENGTH))
-            .is_some_and(|content_length| content_length == body_len);
-    if header.headers.contains_key(http::header::CONTENT_LENGTH) && !content_length_matches {
-        header.remove_header(&http::header::CONTENT_LENGTH);
-    }
-}
-
-fn reconcile_terminal_cache_header(header: &mut ResponseHeader, sink: &ResponseBodySink) {
-    let body_len = sink.peek_extra().iter().map(Bytes::len).sum();
-    reconcile_content_length(header, body_len);
-}
-
 #[cfg(test)]
-mod downstream_body_suppression_tests {
-    use super::*;
-
-    #[test]
-    fn terminal_followups_are_dropped_instead_of_converted_to_done() {
-        assert!(is_downstream_followup(&HttpTask::Body(None, true)));
-        assert!(is_downstream_followup(&HttpTask::Trailer(None)));
-        assert!(is_downstream_followup(&HttpTask::Done));
-        assert!(!is_downstream_followup(&HttpTask::Header(
-            Box::new(ResponseHeader::build(204, None).unwrap()),
-            true,
-        )));
-    }
-
-    #[test]
-    fn terminal_framing_removes_a_stale_content_length() {
-        let mut header = ResponseHeader::build(503, None).unwrap();
-        header
-            .insert_header(http::header::CONTENT_LENGTH, "0")
-            .unwrap();
-        let mut tasks = vec![
-            HttpTask::Header(Box::new(header), false),
-            HttpTask::Body(Some(Bytes::from_static(b"generated")), true),
-        ];
-        reconcile_terminal_response_tasks(&mut tasks, 0, false).unwrap();
-        let HttpTask::Header(header, false) = &tasks[0] else {
-            panic!("unexpected header task")
-        };
-        assert!(header.headers.get(http::header::CONTENT_LENGTH).is_none());
-        assert_eq!(
-            header.headers.get(http::header::TRANSFER_ENCODING).unwrap(),
-            "chunked"
-        );
-    }
-}
+#[path = "response_reconciliation_tests.rs"]
+mod downstream_body_suppression_tests;
 
 use pingora_cache::NoCacheReason;
 use pingora_core::apps::{
@@ -211,14 +93,23 @@ mod proxy_h1;
 mod proxy_h2;
 mod proxy_purge;
 mod proxy_trait;
+mod pump_termination;
 mod request_relay;
 mod response_body_sink;
+mod response_cache_relay;
+mod response_head_barrier;
 mod response_pipeline;
+mod response_reconciliation;
 pub mod subrequest;
 #[cfg(test)]
 mod test_allocator;
 
 use subrequest::{BodyMode, Ctx as SubrequestCtx};
+
+use response_reconciliation::{
+    abort_cache_after_response_source_failure, downstream_response_body_forbidden,
+    is_downstream_followup, reconcile_terminal_cache_header, reconcile_terminal_response_tasks,
+};
 
 pub use proxy_cache::range_filter::{range_header_filter, MultiRangeInfo, RangeType};
 pub use proxy_purge::PurgeStatus;
@@ -230,12 +121,19 @@ pub use proxy_trait::{
 pub use response_body_sink::{
     ResponseBodySink, RESPONSE_BODY_EMIT_BUDGET, RESPONSE_BODY_EMIT_CHUNK_BUDGET,
 };
+pub use response_head_barrier::{
+    ResponseHeadBoundary, ResponseHeadBoundaryAction, ResponseHeadCommitPlan,
+    ResponseHeadHoldLimits, ResponseHeadHoldPlan, ResponseHeadOutcome, ResponseHeadReplacement,
+    ResponseHeadSource, ResponseHeadUsage,
+};
 
 pub mod prelude {
     pub use crate::{
         http_proxy, http_proxy_service, ProxyHttp, ProxyWarnLogContext, RequestBodyAction,
-        RequestRelayPlan, RequestRelayRetryState, RequestReplayPolicy, Session,
-        UpstreamRequestBodyDisposition, UpstreamResponseBodyEvent,
+        RequestRelayPlan, RequestRelayRetryState, RequestReplayPolicy, ResponseHeadBoundary,
+        ResponseHeadBoundaryAction, ResponseHeadCommitPlan, ResponseHeadHoldLimits,
+        ResponseHeadHoldPlan, ResponseHeadOutcome, ResponseHeadReplacement, ResponseHeadSource,
+        ResponseHeadUsage, Session, UpstreamRequestBodyDisposition, UpstreamResponseBodyEvent,
     };
 }
 
@@ -514,7 +412,13 @@ where
                         (server_reused, error)
                     }
                 };
-                let error = error.map(|e| {
+                let error = error.map(|mut e| {
+                    // Product hooks may consume retry budget or advance an
+                    // attempt scheduler. Close retry before invoking them once
+                    // a final response selected the bounded head processor.
+                    if session.response_head_retry_closed() {
+                        e.retry = false.into();
+                    }
                     self.inner
                         .error_while_proxy(&peer, session, e, ctx, client_reused)
                 });
@@ -720,6 +624,12 @@ pub struct Session {
     /// Number of response header tasks whose downstream module filtering was
     /// completed early so a same-batch trailer hook can query planned framing.
     prepared_response_headers: usize,
+    /// A final upstream response has activated the bounded head barrier. The
+    /// response processor set may already have consumed body input even though
+    /// no downstream final header has been written, so this request must never
+    /// start another upstream attempt.
+    response_head_attempt_selected: bool,
+    preserved_selected_response_after_request_termination: bool,
     /// Flag that is set when the shutdown process has begun.
     shutdown_flag: Arc<AtomicBool>,
 }
@@ -752,104 +662,49 @@ impl Session {
             request_attempt_id: None,
             native_retry_buffer_state: request_relay::NativeRetryBufferState::NotStarted,
             prepared_response_headers: 0,
+            response_head_attempt_selected: false,
+            preserved_selected_response_after_request_termination: false,
             shutdown_flag,
         }
     }
 
-    fn freeze_request_relay_plan(&mut self, requested: RequestRelayPlan) -> Result<()> {
-        if self.frozen_request_relay_plan.is_some() {
-            return Error::e_explain(
-                InternalError,
-                "request relay plan was frozen more than once",
-            );
-        }
-        if requested.disposition == UpstreamRequestBodyDisposition::Streamed
-            && requested.replay != RequestReplayPolicy::Never
-        {
-            return Error::e_explain(
-                InternalError,
-                "a streamed request relay plan must disable replay",
-            );
-        }
-        let registered = self.downstream_session.request_body_buffer_registered();
-        self.downstream_session.freeze_request_body_configuration();
-        self.frozen_request_relay_plan = Some(request_relay::FrozenRequestRelayPlan::derive(
-            requested, registered,
-        ));
-        Ok(())
+    pub(crate) fn mark_response_head_attempt_selected(&mut self) {
+        self.response_head_attempt_selected = true;
     }
 
-    fn frozen_request_relay_plan(&self) -> request_relay::FrozenRequestRelayPlan {
-        self.frozen_request_relay_plan
-            .expect("request relay plan must be frozen before an upstream attempt")
+    pub(crate) fn mark_response_head_writer_handoff(&mut self) {
+        self.response_head_attempt_selected = true;
     }
 
-    /// Return the request-scoped relay policy once it has been frozen.
-    pub fn request_relay_plan(&self) -> Option<RequestRelayPlan> {
-        self.frozen_request_relay_plan.map(|plan| plan.requested)
+    /// Whether the response pipeline selected a final response for this
+    /// request, even if a response-head hold has not handed it to the writer
+    /// yet.
+    ///
+    /// This deliberately excludes responses written directly by application
+    /// request hooks. Callers that arbitrate a late local reply against an
+    /// origin response need the owner of the response, not merely
+    /// [`Self::response_written`].
+    pub fn response_head_selected_by_pipeline(&self) -> bool {
+        self.response_head_attempt_selected
     }
 
-    /// Return the current canonical upstream attempt identity.
-    pub fn request_attempt_id(&self) -> Option<RequestAttemptId> {
-        self.request_attempt_id
+    pub(crate) fn mark_preserved_selected_response_after_request_termination(&mut self) {
+        self.preserved_selected_response_after_request_termination = true;
     }
 
-    fn begin_request_relay_attempt(&mut self, attempt: usize) {
-        self.request_attempt_id = Some(RequestAttemptId::new(attempt));
+    pub(crate) fn preserved_selected_response_after_request_termination(&self) -> bool {
+        self.preserved_selected_response_after_request_termination
     }
 
-    fn enable_request_relay_retry_buffer(&mut self) {
-        let plan = self.frozen_request_relay_plan();
-        if !plan.enables_native_retry_buffer()
-            || self.native_retry_buffer_state != request_relay::NativeRetryBufferState::NotStarted
-        {
-            return;
-        }
-        if self.downstream_session.retry_buffering_supported() {
-            self.downstream_session.enable_retry_buffering();
-            self.native_retry_buffer_state = request_relay::NativeRetryBufferState::Enabled;
-        } else {
-            self.native_retry_buffer_state = request_relay::NativeRetryBufferState::Unsupported;
-        }
-    }
-
-    fn request_relay_retry_buffer(&self) -> Option<Bytes> {
-        (self.native_retry_buffer_state == request_relay::NativeRetryBufferState::Enabled)
-            .then(|| self.downstream_session.get_retry_buffer())
-            .flatten()
-    }
-
-    /// Return the current body backing state used by the retry gate.
-    pub fn request_relay_retry_state(&self) -> RequestRelayRetryState {
-        let Some(plan) = self.frozen_request_relay_plan else {
-            return RequestRelayRetryState::Disabled;
-        };
-        if plan.requested.replay == RequestReplayPolicy::Never {
-            return RequestRelayRetryState::Disabled;
-        }
-        if plan.source == request_relay::RequestRelaySource::RegisteredReplay {
-            return if self
-                .downstream_session
-                .request_body_buffer_replay_available()
-            {
-                RequestRelayRetryState::RegisteredReplay
-            } else {
-                RequestRelayRetryState::RegisteredUnavailable
-            };
-        }
-        match self.native_retry_buffer_state {
-            request_relay::NativeRetryBufferState::NotStarted => RequestRelayRetryState::LiveUnread,
-            request_relay::NativeRetryBufferState::Unsupported => {
-                RequestRelayRetryState::Unsupported
-            }
-            request_relay::NativeRetryBufferState::Enabled => {
-                if self.downstream_session.retry_buffer_truncated() {
-                    RequestRelayRetryState::NativeTruncated
-                } else {
-                    RequestRelayRetryState::NativeCapturing
-                }
-            }
-        }
+    /// Whether retry is permanently closed by final-response selection or
+    /// commit for this request.
+    ///
+    /// Product retry hooks must check this before consuming retry budget or
+    /// advancing an attempt scheduler. Pingora also enforces it after the hook,
+    /// but that later guard cannot roll back product-side effects.
+    pub fn response_head_retry_closed(&self) -> bool {
+        self.response_head_selected_by_pipeline()
+            || final_response_committed(self.response_written())
     }
 
     /// Create a new [Session] from the given [Stream]
@@ -1524,7 +1379,7 @@ where
 
             match e {
                 Some(mut error) => {
-                    if final_response_committed(session.response_written()) {
+                    if session.response_head_retry_closed() {
                         error.retry = false.into();
                     }
                     if !session.request_relay_retry_state().can_start_next_attempt() {

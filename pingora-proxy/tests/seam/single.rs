@@ -1027,7 +1027,7 @@ fn streamed_fails_before_write_when_upstream_filter_synthesizes_connect() {
 }
 
 /// A CONNECT tunnel must not be half-closed at header time by an application
-/// disposition: `safe_disposition` (in `proxy_common.rs`) coerces a
+/// disposition: `safe_disposition` (in `request_relay.rs`) coerces a
 /// non-`Ordinary` disposition back to `Ordinary` for CONNECT requests. An
 /// honored `Bodyless` would put END_STREAM on the upstream HEADERS -- ending
 /// the request half of the tunnel before a single tunnel byte could flow.
