@@ -17,6 +17,7 @@ use crate::connectors::{ConnectorOptions, IdleConnection, PoolCallback, Transpor
 use crate::protocols::http::custom::client::Session;
 use crate::protocols::http::v1::client::HttpSession as Http1Session;
 use crate::protocols::http::v2::client::{drive_connection, Http2Session};
+use crate::protocols::http::v2::end_stream_watch::{EndStreamWatch, EndStreamWatchStream};
 use crate::protocols::{Digest, Stream, UniqueIDType};
 use crate::upstreams::peer::{Peer, ALPN};
 
@@ -61,6 +62,11 @@ pub(crate) struct ConnectionRefInner {
     pub(crate) digest: Digest,
     // To serialize certain operations when trying to release the connect back to the pool,
     pub(crate) release_lock: Arc<Mutex<()>>,
+    // Records which streams the peer ended with END_STREAM before tearing them
+    // down, a wire fact `h2` itself discards. `None` for connections built
+    // without the watch (only tests do that), which just falls back to the
+    // weaker end-of-body proofs.
+    end_stream_watch: Option<Arc<EndStreamWatch>>,
 }
 
 #[derive(Clone)]
@@ -75,6 +81,27 @@ impl ConnectionRef {
         max_streams: usize,
         digest: Digest,
     ) -> Self {
+        Self::new_with_end_stream_watch(
+            send_req,
+            closed,
+            ping_timeout_occurred,
+            id,
+            max_streams,
+            digest,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_end_stream_watch(
+        send_req: SendRequest<Bytes>,
+        closed: watch::Receiver<bool>,
+        ping_timeout_occurred: Arc<AtomicBool>,
+        id: UniqueIDType,
+        max_streams: usize,
+        digest: Digest,
+        end_stream_watch: Option<Arc<EndStreamWatch>>,
+    ) -> Self {
         ConnectionRef(Arc::new(ConnectionRefInner {
             connection_stub: Stub(send_req),
             closed,
@@ -85,7 +112,12 @@ impl ConnectionRef {
             shutting_down: false.into(),
             digest,
             release_lock: Arc::new(Mutex::new(())),
+            end_stream_watch,
         }))
+    }
+
+    pub(crate) fn end_stream_watch(&self) -> Option<&Arc<EndStreamWatch>> {
+        self.0.end_stream_watch.as_ref()
     }
 
     pub fn more_streams_allowed(&self) -> bool {
@@ -148,8 +180,35 @@ impl ConnectionRef {
             return Ok(None);
         }
 
+        // A connection marked for shutdown must not allocate another stream, and
+        // this is the only place that can enforce it: the pool hands a `ConnectionRef`
+        // out before the caller gets here, so a shutdown raised in between (an
+        // upstream read timeout on a sibling stream, a GOAWAY seen by an earlier
+        // `spawn_stream`) is invisible to the pool's own eligibility filter.
+        // `more_streams_allowed()` only decides whether the connection goes BACK
+        // into the pool, which is too late for the stream being allocated now.
+        if self.is_shutting_down() {
+            self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
+            return Ok(None);
+        }
+
         match self.0.connection_stub.new_stream().await {
-            Ok(send_req) => Ok(Some(Http2Session::new(send_req, self.clone()))),
+            Ok(send_req) => {
+                // Re-check after the await. This cannot fire today: `new_stream()`
+                // calls `ready()` on a FRESH CLONE of `SendRequest`, and `h2` sets
+                // `pending: None` on a clone, so `poll_pending_open` takes no
+                // pending-stream branch and never returns `Poll::Pending`. It is
+                // kept because that is a property of `Stub::new_stream`'s clone, not
+                // a contract `h2` states, and it costs one relaxed load. Dropping
+                // `send_req` here is free: `h2` allocates the stream id in
+                // `send_request()` (reached from `Http2Session::write_request_header`),
+                // not in `ready()`, so nothing was opened on the wire.
+                if self.is_shutting_down() {
+                    self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
+                    return Ok(None);
+                }
+                Ok(Some(Http2Session::new(send_req, self.clone())))
+            }
             Err(e) => {
                 // fail to create the stream, reset the counter
                 self.0.current_streams.fetch_sub(1, Ordering::SeqCst);
@@ -391,9 +450,17 @@ impl Connector {
             .in_use_pool
             .get(reuse_hash)
             // filter out closed, InUsePool does not have notify closed eviction like the idle pool
-            // and it's possible we get an in use connection that is closed and not yet released
-            .filter(|c| !c.is_closed())
-            .or_else(|| self.idle_pool.get(&reuse_hash));
+            // and it's possible we get an in use connection that is closed and not yet released.
+            // Shutting-down connections are filtered for the same reason: nothing removes
+            // them from the in-use pool until their last stream is released, so without this
+            // a new request would be handed a connection that was already given up on.
+            // Dropping it here also evicts it, since `get()` popped it out of the pool.
+            .filter(|c| !c.is_closed() && !c.is_shutting_down())
+            .or_else(|| self.idle_pool.get(&reuse_hash))
+            // The idle pool should never hold a shutting-down connection
+            // (`release_http_session` drops those instead of pooling them), but the
+            // check is cheap and keeps the eligibility rule in one place.
+            .filter(|c| !c.is_shutting_down());
         if let Some(conn) = maybe_conn {
             #[cfg(unix)]
             if !peer.matches_fd(conn.id()) {
@@ -596,6 +663,12 @@ pub async fn handshake(stream: Stream, settings: H2HandshakeSettings) -> Result<
         proxy_digest: stream.get_proxy_digest(),
         socket_digest: stream.get_socket_digest(),
     };
+    // Watch the peer's frame headers on their way into `h2`. Supported h2
+    // preserves received END_STREAM across reset, but its public state does not
+    // prove wire/delivered byte equality or express Pingora's terminal-HEADERS,
+    // local-reset, and GOAWAY evidence boundaries.
+    let end_stream_watch = EndStreamWatch::new();
+    let stream = EndStreamWatchStream::new(stream, end_stream_watch.clone());
     let stream_window = settings.stream_window_size.unwrap_or(H2_WINDOW_SIZE);
     let conn_window = settings.connection_window_size.unwrap_or(H2_WINDOW_SIZE);
     let (send_req, connection) = Builder::new()
@@ -632,13 +705,14 @@ pub async fn handshake(stream: Stream, settings: H2HandshakeSettings) -> Result<
         )
         .await;
     });
-    Ok(ConnectionRef::new(
+    Ok(ConnectionRef::new_with_end_stream_watch(
         send_req,
         closed_rx,
         ping_timeout_occurred,
         id,
         max_allowed_streams,
         digest,
+        Some(end_stream_watch),
     ))
 }
 
@@ -1048,4 +1122,6 @@ mod tests {
         assert!(result.unwrap().is_none());
         assert!(conn.is_shutting_down());
     }
+
+    include!("v2_shutdown_tests.rs");
 }
