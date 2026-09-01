@@ -21,7 +21,7 @@ mod utils;
 use bytes::Bytes;
 use http::{Response, StatusCode};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use utils::server_utils::init_without_mock_origin;
 
@@ -217,7 +217,7 @@ async fn spawn_h1_origin() -> u16 {
     port
 }
 
-async fn read_until(io: &mut TcpStream, marker: &str) -> String {
+async fn read_until(io: &mut (impl AsyncRead + Unpin), marker: &str) -> String {
     let mut seen = Vec::new();
     let mut buf = [0u8; 1024];
     loop {
@@ -352,6 +352,12 @@ mod observing {
     /// How many times the exchange reached `logging`, i.e. finished. Bumped
     /// AFTER `TERMINAL_EVENTS`, so a reader that sees this also sees that.
     pub static COMPLETED: AtomicUsize = AtomicUsize::new(0);
+    /// How many abandonment callbacks observed a response that Pingora had
+    /// already selected for downstream delivery.
+    pub static SELECTED_RESPONSE_ABANDONMENTS: AtomicUsize = AtomicUsize::new(0);
+    /// How many data callbacks explicitly aborted an incomplete response that
+    /// had already crossed the downstream writer handoff.
+    pub static ABORTED_SELECTED_RESPONSES: AtomicUsize = AtomicUsize::new(0);
 
     /// Serializes the tests that drive THIS proxy.
     ///
@@ -401,8 +407,31 @@ mod observing {
             if event.is_terminal() {
                 TERMINAL_EVENTS.fetch_add(1, Ordering::SeqCst);
             }
+            if event == RequestBodyEvent::Data
+                && !_session
+                    .get_header_bytes("x-terminate-incomplete-response")
+                    .is_empty()
+            {
+                assert!(
+                    _session.response_head_selected_by_pipeline(),
+                    "the incomplete-response fixture must commit its head before termination"
+                );
+                ABORTED_SELECTED_RESPONSES.fetch_add(1, Ordering::SeqCst);
+                return Ok(RequestBodyAction::Terminate);
+            }
             if event == RequestBodyEvent::Abandoned {
                 ABANDONED_EVENTS.fetch_add(1, Ordering::SeqCst);
+                if !_session
+                    .get_header_bytes("x-terminate-selected-response")
+                    .is_empty()
+                {
+                    assert!(
+                        _session.response_head_selected_by_pipeline(),
+                        "the abandonment fixture must select its response before the hook terminates"
+                    );
+                    SELECTED_RESPONSE_ABANDONMENTS.fetch_add(1, Ordering::SeqCst);
+                    return Ok(RequestBodyAction::Terminate);
+                }
             }
             Ok(RequestBodyAction::Continue)
         }
@@ -523,6 +552,222 @@ async fn h2_upstream_no_error_reset_reports_abandoned_request_body() {
         "the synthetic terminal event must identify the incomplete downstream body as abandoned"
     );
     drop(io);
+}
+
+/// Spawn an H2 origin that first consumes one flow-control window without
+/// releasing any capacity. The proxy is therefore blocked in its next request
+/// body write before the origin queues a complete response and follows it with
+/// RST_STREAM(NO_ERROR).
+async fn spawn_selected_response_then_stop_upload_origin() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (io, _) = listener.accept().await.unwrap();
+        let mut conn = h2::server::handshake(io).await.unwrap();
+        let (req, mut send_resp) = conn.accept().await.unwrap().unwrap();
+        let mut body = req.into_body();
+
+        tokio::spawn(async move {
+            // The downstream sends no body until it observes this response
+            // head, so the proxy necessarily commits the response before its
+            // request write can block on H2 flow control.
+            let response = Response::builder().status(StatusCode::OK).body(()).unwrap();
+            let mut response = send_resp.send_response(response, false).unwrap();
+
+            let mut received = 0;
+            while received < 60 * 1024 {
+                let chunk = body
+                    .data()
+                    .await
+                    .expect("the upload ended before filling the H2 window")
+                    .expect("the upload failed before filling the H2 window");
+                received += chunk.len();
+                // Deliberately do not release flow-control capacity. After the
+                // short pause the proxy's next send is blocked inside the
+                // request relay, so the response tasks below remain queued
+                // until RST_STREAM(NO_ERROR) produces `Abandoned`.
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            response
+                .send_data(Bytes::from(RESPONSE_BODY), true)
+                .unwrap();
+
+            // Drive the connection long enough to put HEADERS, DATA, and
+            // END_STREAM on the wire before the reset clears pending frames.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            response.send_reset(h2::Reason::NO_ERROR);
+            drop(body);
+        });
+
+        while conn.accept().await.is_some() {}
+    });
+    port
+}
+
+/// Spawn an H2 origin that commits a non-terminal 200 response head and leaves
+/// its body open. A later request-side terminate must abort this representation
+/// explicitly rather than inventing a clean downstream end-of-body.
+async fn spawn_incomplete_response_origin() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (io, _) = listener.accept().await.unwrap();
+        let mut conn = h2::server::handshake(io).await.unwrap();
+        let (_req, mut send_resp) = conn.accept().await.unwrap().unwrap();
+        let response = Response::builder().status(StatusCode::OK).body(()).unwrap();
+        let _open_response = send_resp.send_response(response, false).unwrap();
+        while conn.accept().await.is_some() {}
+    });
+    port
+}
+
+async fn read_until_connection_aborts(io: &mut (impl AsyncRead + Unpin)) -> String {
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), io.read(&mut buf)).await {
+            Ok(Ok(0)) => return String::from_utf8_lossy(&seen).into_owned(),
+            Ok(Ok(n)) => seen.extend_from_slice(&buf[..n]),
+            Ok(Err(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                return String::from_utf8_lossy(&seen).into_owned();
+            }
+            Ok(Err(e)) => panic!("failed while waiting for an explicit response abort: {e}"),
+            Err(_) => panic!("the incomplete selected response was not aborted"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminate_explicitly_aborts_an_incomplete_selected_response() {
+    observing::init();
+    let _serial = observing::SERIAL.lock().await;
+    let port = spawn_incomplete_response_origin().await;
+    let before_abort =
+        observing::ABORTED_SELECTED_RESPONSES.load(std::sync::atomic::Ordering::SeqCst);
+
+    let mut io = TcpStream::connect(observing::PROXY_ADDR).await.unwrap();
+    io.write_all(
+        format!(
+            "POST /upload HTTP/1.1\r\nHost: {}\r\nx-port: {port}\r\n\
+             x-terminate-incomplete-response: true\r\nTransfer-Encoding: chunked\r\n\r\n",
+            observing::PROXY_ADDR
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+
+    let response_head = read_until(&mut io, "\r\n\r\n").await;
+    assert!(
+        response_head.starts_with("HTTP/1.1 200 OK"),
+        "{response_head}"
+    );
+    io.write_all(b"5\r\nhello\r\n").await.unwrap();
+
+    let tail = read_until_connection_aborts(&mut io).await;
+    assert!(
+        !tail.contains("0\r\n\r\n"),
+        "an incomplete selected response must not receive a clean chunked terminator: {tail}"
+    );
+    assert_eq!(
+        observing::ABORTED_SELECTED_RESPONSES.load(std::sync::atomic::Ordering::SeqCst),
+        before_abort + 1,
+        "the fixture must terminate from a request Data callback after head commit"
+    );
+}
+
+/// A request hook may use `Terminate` to stop an abandoned upload after
+/// Pingora has already selected an origin response. That action must stop only
+/// the request relay; it must not convert a queued, complete response into a
+/// cleanly truncated downstream response.
+#[tokio::test]
+async fn h2_abandonment_terminate_preserves_the_selected_response() {
+    observing::init();
+    let _serial = observing::SERIAL.lock().await;
+    let port = spawn_selected_response_then_stop_upload_origin().await;
+
+    let before_selected =
+        observing::SELECTED_RESPONSE_ABANDONMENTS.load(std::sync::atomic::Ordering::SeqCst);
+    let before_done = observing::COMPLETED.load(std::sync::atomic::Ordering::SeqCst);
+
+    let io = TcpStream::connect(observing::PROXY_ADDR).await.unwrap();
+    let (mut read_half, mut write_half) = io.into_split();
+    write_half
+        .write_all(
+            format!(
+                "POST /upload HTTP/1.1\r\nHost: {}\r\nx-port: {port}\r\n\
+                 x-terminate-selected-response: true\r\nTransfer-Encoding: chunked\r\n\r\n",
+                observing::PROXY_ADDR
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    // Read the complete H1 head before uploading any body. This is direct
+    // client-side evidence that the final 200 crossed the writer handoff; the
+    // later Terminate therefore cannot safely replace or finish it.
+    let response_head = read_until(&mut read_half, "\r\n\r\n").await;
+    assert!(
+        response_head.starts_with("HTTP/1.1 200 OK"),
+        "{response_head}"
+    );
+
+    let writer = tokio::spawn(async move {
+        let _ = write_half
+            .write_all(format!("{UPLOAD_LEN:x}\r\n").as_bytes())
+            .await;
+        let _ = write_half.write_all(&vec![b'x'; UPLOAD_LEN]).await;
+        let _ = write_half.write_all(b"\r\n").await;
+        write_half
+    });
+
+    let response_body = read_until(&mut read_half, "0\r\n\r\n").await;
+    assert_eq!(
+        response_body.matches(RESPONSE_BODY).count(),
+        1,
+        "the selected response body must be delivered completely and exactly once: {response_body}"
+    );
+    assert!(
+        response_body.ends_with("0\r\n\r\n"),
+        "the complete body must retain its final chunked terminator: {response_body}"
+    );
+
+    // Pingora may bounded-drain the abandoned upload to keep unread inbound
+    // bytes from resetting away the response it just delivered, but this H1
+    // connection must still not enter the reusable pool. Finish the upload so
+    // that distinction is observable: reuse would leave the socket open for a
+    // next request, while the required non-reuse policy closes it promptly.
+    let mut write_half = tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("the proxy never drained the in-flight upload")
+        .expect("the upload writer task panicked");
+    write_half.write_all(b"0\r\n\r\n").await.unwrap();
+    let mut closed = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(5), read_half.read(&mut closed))
+        .await
+        .expect("the abandoned H1 connection was retained for reuse")
+        .expect("failed while waiting for the abandoned H1 connection to close");
+    assert_eq!(n, 0, "the abandoned H1 connection must not be reused");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while observing::COMPLETED.load(std::sync::atomic::Ordering::SeqCst) == before_done {
+        assert!(Instant::now() < deadline, "the exchange never finished");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        observing::SELECTED_RESPONSE_ABANDONMENTS.load(std::sync::atomic::Ordering::SeqCst),
+        before_selected + 1,
+        "the fixture must reach `Terminate` only after Pingora selected the response"
+    );
 }
 
 /// Spawn a cleartext-h2 origin that DRAINS the whole request body and only then

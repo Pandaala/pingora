@@ -13,6 +13,10 @@
 // limitations under the License.
 
 use super::*;
+use crate::response_pipeline::{normalize_trailers, TerminalBodyDispatch};
+use crate::UpstreamResponseBodyEvent;
+use http::HeaderMap;
+use pingora_core::protocols::http::HttpTask;
 
 fn request_with_headers(headers: &[(&str, &str)]) -> RequestHeader {
     let mut request = RequestHeader::build("GET", b"/", Some(headers.len())).unwrap();

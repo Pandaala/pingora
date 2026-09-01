@@ -221,7 +221,7 @@ async fn run_terminating_batch(
     let mut serve_from_cache = ServeFromCache::new();
     let mut response_state = ResponseStateMachine::new();
     let mut response_pipeline = ResponsePipelineState::default();
-    let (source_done, terminated) = proxy
+    let outcome = proxy
         .process_upstream_tasks(
             &mut session,
             &mut ctx,
@@ -234,6 +234,13 @@ async fn run_terminating_batch(
         .await
         .unwrap()
         .unwrap();
+    let ResponseTaskBatchOutcome::Progress {
+        source_done,
+        terminated,
+    } = outcome
+    else {
+        panic!("terminate test must not abandon the origin")
+    };
 
     (
         source_done,
@@ -336,6 +343,7 @@ async fn h1_batched_terminate_releases_real_cache_miss_lock() {
     let mut ctx = 0;
     let mut custom_writer = None;
     let mut custom_reader = None;
+    let mut response_pipeline = ResponsePipelineState::default();
     let outcome = proxy
         .proxy_handle_downstream(
             &mut session,
@@ -346,6 +354,7 @@ async fn h1_batched_terminate_releases_real_cache_miss_lock() {
             &mut custom_reader,
             Arc::new(AtomicU8::new(PipeState::Active as u8)),
             UpstreamRequestBodyDisposition::Ordinary,
+            &mut response_pipeline,
         )
         .await
         .unwrap();
