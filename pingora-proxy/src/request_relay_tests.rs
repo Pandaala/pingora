@@ -924,3 +924,45 @@ async fn benchmark_request_relay_data_event() {
         "the relay must not add per-event allocation"
     );
 }
+
+#[tokio::test]
+async fn prefix_capture_remains_nonretryable_after_delivery() {
+    let (mut session, _client) =
+        request_session(b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello")
+            .await;
+    session
+        .downstream_session
+        .capture_request_body_prefix(Box::new(InMemoryRequestBodyBuffer::new()), 4)
+        .await
+        .unwrap();
+    session
+        .freeze_request_relay_plan(RequestRelayPlan::ordinary())
+        .unwrap();
+    assert_eq!(
+        session.request_relay_retry_state(),
+        RequestRelayRetryState::Disabled
+    );
+    session.enable_request_relay_retry_buffer();
+    assert!(session.downstream_session.get_retry_buffer().is_none());
+    session
+        .downstream_session
+        .begin_request_body_replay()
+        .await
+        .unwrap();
+    while !session.downstream_session.is_body_done() {
+        session
+            .downstream_session
+            .read_body_or_idle(false)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        session.request_relay_retry_state(),
+        RequestRelayRetryState::Disabled
+    );
+    assert!(session
+        .downstream_session
+        .begin_request_body_replay()
+        .await
+        .is_err());
+}

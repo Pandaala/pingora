@@ -1197,3 +1197,66 @@ pub fn streamed_disposition_rewrites_upstream_framing(combo: Combo) {
         rec.dump()
     );
 }
+
+/// A verdict in request_filter must precede any upstream connection/header.
+/// Positive controls exercise prefix replay, overrun and live continuation in
+/// every downstream/upstream combination, including a short body already at EOF.
+pub fn prefix_verdict_before_forwarding(combo: Combo) {
+    for (len, reject) in [
+        (3, false),
+        (4, false),
+        (5, false),
+        (20_000, false),
+        (5, true),
+    ] {
+        let (port, rec, upstream) = combo.spawn(&[Step::DrainThenOk200]);
+        if reject {
+            upstream.expect_unused();
+        }
+        RT.block_on(async {
+            let mut req = combo
+                .client()
+                .post(format!("http://{}/", combo.down_addr()))
+                .header("x-port", port.to_string())
+                .header("x-prefix-capture", "1")
+                .body(vec![b'p'; len]);
+            if combo.upstream_is_h2() {
+                req = req.header("x-h2", "1");
+            }
+            if reject {
+                req = req.header("x-prefix-reject", "1");
+            }
+            let res = tokio::time::timeout(WAIT, req.send())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(res.status().as_u16(), if reject { 403 } else { 200 });
+            if reject {
+                expect_ok(
+                    rec.expect_none("rejected prefix connection", QUIET_WINDOW, |e| {
+                        matches!(e, UpEvent::ConnAccepted { .. })
+                    })
+                    .await,
+                );
+                assert_eq!(rec.connections(), 0);
+                assert_eq!(rec.body_bytes(), 0);
+            } else {
+                expect_ok(
+                    rec.wait_for("complete prefix request", WAIT, |e| {
+                        matches!(
+                            e,
+                            UpEvent::ReqData {
+                                end_stream: true,
+                                ..
+                            }
+                        )
+                    })
+                    .await,
+                );
+                assert_eq!(rec.body_bytes(), len, "{}", rec.dump());
+                assert_eq!(rec.count(|e| matches!(e, UpEvent::ReqHeaders { .. })), 1);
+                assert_eq!(res.headers().get("x-retry-buffer").unwrap(), "0");
+            }
+        });
+    }
+}

@@ -65,7 +65,7 @@ The word `cache` is not sufficient to describe the architecture:
 
 | Term | Owner | Purpose | Lifetime |
 | --- | --- | --- | --- |
-| Registered request replay store | `pingora-core::RequestBodyBuffer`, implemented by Edgion `BodyStorage` | Complete capture, logical mutation, rewind, bounded replay | Request, possibly across attempts |
+| Registered request replay store | `pingora-core::RequestBodyBuffer`, implemented by Edgion `BodyStorage` | Full capture with mutation/retry, or immutable prefix capture with one delivery and live continuation | Request, possibly across attempts |
 | Native retry prefix | Downstream transport session when it advertises retry buffering | Retain live bytes already consumed so a retry can replay the prefix | Request, until retry becomes impossible or request ends |
 | Semantic response window | Edgion `RawWindow` users | Hold a bounded generation until release, replace, reject, or discard | One processor decision generation |
 | `ResponseBodySink` extras | `pingora-proxy` | Bounded processor-generated output for one response pump batch | One pump batch; terminate latch is response-sticky |
@@ -103,6 +103,11 @@ RequestRelayPlan
   disposition: Ordinary | Bodyless | Streamed
   replay:      Replayable | Never
 ```
+
+A pre-forwarding prefix uses the registered source for its first delivery and
+then rejoins the live transport. Its sticky prefix selection disables retry
+regardless of the requested replay policy, including after the store is
+released. See the [prefix contract](../features/request-body-buffering.md#bounded-pre-forwarding-prefix).
 
 The application declares semantic intent, not the physical source. Core then
 derives the immutable source:

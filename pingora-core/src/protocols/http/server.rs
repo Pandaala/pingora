@@ -758,6 +758,43 @@ impl Session {
         }
     }
 
+    /// Capture at most `limit` bytes into the registered application store.
+    /// Sealing the store does not manufacture transport EOF. Forwarding drains
+    /// the store and bounded transport overrun, then continues live reads.
+    /// Prefix requests never retry. Send an explicit 100 before capture if needed.
+    pub async fn capture_request_body_prefix(
+        &mut self,
+        buffer: Box<dyn RequestBodyBuffer>,
+        limit: usize,
+    ) -> Result<()> {
+        match self {
+            Self::H1(s) => s.capture_request_body_prefix(buffer, limit).await,
+            Self::H2(s) => s.capture_request_body_prefix(buffer, limit).await,
+            _ => Error::e_explain(
+                pingora_error::ErrorType::InternalError,
+                "prefix capture requires H1 or H2",
+            ),
+        }
+    }
+
+    /// Whether prefix capture was selected, including after delivery.
+    pub fn request_body_prefix_active(&self) -> bool {
+        match self {
+            Self::H1(s) => s.request_body_prefix_active(),
+            Self::H2(s) => s.request_body_prefix_active(),
+            _ => false,
+        }
+    }
+
+    /// Actual downstream completion, independent of prefix delivery.
+    pub fn request_body_prefix_transport_complete(&self) -> bool {
+        match self {
+            Self::H1(s) => s.request_body_prefix_transport_complete(),
+            Self::H2(s) => s.request_body_prefix_transport_complete(),
+            _ => false,
+        }
+    }
+
     /// Register an app-supplied request body buffer (opt-in). Supported on the H1/H2
     /// data plane only, and fails closed otherwise: silently succeeding on a
     /// subrequest/custom session would let the app drain the body believing it will
