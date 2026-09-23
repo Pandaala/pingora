@@ -218,6 +218,7 @@ macro_rules! matrix {
             // one line here and it is covered in all four cells at once, which
             // is the whole point of the mechanism.
             $crate::cell_tests! {
+                prefix_verdict_before_forwarding,
                 terminate_is_prompt_and_cancels_the_upstream,
                 mid_body_terminate_is_not_reused,
                 trailer_terminate_is_not_reused,

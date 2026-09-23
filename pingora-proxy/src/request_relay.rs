@@ -387,6 +387,9 @@ impl Session {
 
     /// Return the current body backing state used by the retry gate.
     pub fn request_relay_retry_state(&self) -> RequestRelayRetryState {
+        if self.downstream_session.request_body_prefix_active() {
+            return RequestRelayRetryState::Disabled;
+        }
         let Some(plan) = self.frozen_request_relay_plan else {
             return RequestRelayRetryState::Disabled;
         };

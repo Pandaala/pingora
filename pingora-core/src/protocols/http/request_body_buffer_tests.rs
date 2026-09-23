@@ -238,3 +238,10 @@ use pingora_error::Result;
         );
         assert_eq!(b.next_chunk().await.unwrap(), None);
     }
+
+    #[tokio::test]
+    async fn prefix_rejects_transport_chunks_above_protocol_bound() {
+        let mut buffer = RegisteredRequestBodyBuffer::new(Box::new(InMemoryRequestBodyBuffer::new()));
+        buffer.set_prefix_limit(4);
+        assert!(buffer.capture(&Bytes::from(vec![0; 1 << 24])).await.is_err());
+    }

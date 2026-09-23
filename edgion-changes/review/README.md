@@ -114,6 +114,9 @@ The `status` inside each record is authoritative.
   retain the inherited `InternalError -> BindError -> AddrInUse` production
   chain and use localhost-only deterministic bind/TLS failures in feature tests.
 
+- [Request prefix discard lifecycle](request-prefix-discard-lifecycle.md): clear
+  pending delivery on terminal discard while retaining cancellation and retry guards.
+
 ## Open review findings
 
 - [2026-08-28 fork feature and malformed-input audit](fork-feature-malformed-input-audit-2026-08-28.md),

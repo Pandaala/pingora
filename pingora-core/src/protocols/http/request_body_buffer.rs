@@ -35,6 +35,18 @@ pub(crate) struct RegisteredRequestBodyBuffer {
     // dropped mid-poll (select! cancellation) leaves the cursor untouched and
     // the same chunk is re-served.
     uncommitted: usize,
+    // Keep prefix-only counters and retention out of every ordinary session.
+    prefix: Option<Box<PrefixCapture>>,
+}
+
+struct PrefixCapture {
+    remaining: usize,
+    captured: usize,
+    replayed: usize,
+    // A single decoded transport chunk can cross the inspection boundary.
+    // Copying its suffix prevents retaining an arbitrarily large backing owner.
+    overrun: Option<Bytes>,
+    replay_started: bool,
 }
 
 impl RegisteredRequestBodyBuffer {
@@ -43,6 +55,7 @@ impl RegisteredRequestBodyBuffer {
             buffer,
             state: RequestBodyBufferState::Capturing,
             uncommitted: 0,
+            prefix: None,
         }
     }
 
@@ -51,7 +64,30 @@ impl RegisteredRequestBodyBuffer {
             buffer,
             state: RequestBodyBufferState::Ready,
             uncommitted: 0,
+            prefix: None,
         }
+    }
+
+    pub(crate) fn set_prefix_limit(&mut self, limit: usize) {
+        self.prefix = Some(Box::new(PrefixCapture {
+            remaining: limit,
+            captured: 0,
+            replayed: 0,
+            overrun: None,
+            replay_started: false,
+        }));
+    }
+
+    pub(crate) fn prefix_full(&self) -> bool {
+        self.prefix
+            .as_ref()
+            .is_some_and(|prefix| prefix.remaining == 0)
+    }
+
+    pub(crate) fn take_prefix_overrun(&mut self) -> Option<Bytes> {
+        self.prefix
+            .as_mut()
+            .and_then(|prefix| prefix.overrun.take())
     }
 
     pub(crate) fn is_replaying(&self) -> bool {
@@ -72,7 +108,31 @@ impl RegisteredRequestBodyBuffer {
                 "request body buffer received capture data outside capture state",
             );
         }
-        self.buffer.write(data).await
+        if let Some(prefix) = self.prefix.as_mut() {
+            // HTTP/2's largest legal DATA frame is 2^24-1 bytes. HTTP/1
+            // reads are smaller. Reject any larger custom transport chunk.
+            const MAX_PREFIX_TRANSPORT_CHUNK: usize = (1 << 24) - 1;
+            if data.len() > MAX_PREFIX_TRANSPORT_CHUNK {
+                return Error::e_explain(
+                    ErrorType::InternalError,
+                    "oversized prefix transport chunk",
+                );
+            }
+            let count = prefix.remaining.min(data.len());
+            if count < data.len() {
+                prefix.overrun = Some(Bytes::copy_from_slice(&data[count..]));
+            }
+            // The storage owns only the inspected bytes, never an oversized
+            // Bytes backing allocation belonging to the transport frame.
+            self.buffer
+                .write(&Bytes::copy_from_slice(&data[..count]))
+                .await?;
+            prefix.remaining -= count;
+            prefix.captured += count;
+            Ok(())
+        } else {
+            self.buffer.write(data).await
+        }
     }
 
     pub(crate) async fn finish_capture(&mut self) -> Result<()> {
@@ -84,6 +144,15 @@ impl RegisteredRequestBodyBuffer {
     }
 
     pub(crate) async fn begin_replay(&mut self) -> Result<()> {
+        if let Some(prefix) = self.prefix.as_mut() {
+            if prefix.replay_started {
+                return Error::e_explain(
+                    ErrorType::InternalError,
+                    "request body prefix cannot be replayed twice",
+                );
+            }
+            prefix.replay_started = true;
+        }
         if self.state == RequestBodyBufferState::Capturing {
             return Error::e_explain(
                 ErrorType::InternalError,
@@ -138,6 +207,17 @@ impl RegisteredRequestBodyBuffer {
                 "request body buffer returned an oversized replay chunk",
             );
         }
+        if let Some(prefix) = self.prefix.as_mut() {
+            prefix.replayed += chunk.as_ref().map_or(0, Bytes::len);
+            if prefix.replayed > prefix.captured
+                || (chunk.is_none() && prefix.replayed != prefix.captured)
+            {
+                return Error::e_explain(
+                    ErrorType::InternalError,
+                    "request prefix replay changed captured length",
+                );
+            }
+        }
         match chunk.as_ref() {
             // Record in the same poll that returns the chunk (no await between
             // here and the return), so delivery and the pending commit are
@@ -149,7 +229,7 @@ impl RegisteredRequestBodyBuffer {
     }
 }
 
-/// A pluggable buffer for the full request body, supplied by the proxy app to capture
+/// A pluggable request body store, supplied by the proxy app to capture
 /// the body early (in `request_filter`) and replay it to upstream during forwarding.
 /// Storage policy (memory / file) and whether replay returns the captured original or a
 /// rewritten body are entirely the impl's choice.
@@ -172,6 +252,15 @@ impl RegisteredRequestBodyBuffer {
 /// never reads from the downstream transport. A request whose framing merely *permits*
 /// a body but carries zero payload bytes (e.g. chunked terminated by an immediate zero
 /// chunk, or an empty END_STREAM DATA frame) may use the normal capture registration.
+///
+/// Prefix mode: `Session::capture_request_body_prefix` uses the same store but
+/// calls `finish` at the inspection limit or real EOF, whichever comes first.
+/// The implementation must replay the original prefix without mutation. Core
+/// checks its replay length and then rejoins the live downstream body. A prefix
+/// store is not a complete-body snapshot and cannot serve later full consumers.
+/// Prefix requests are non-retryable even when the client body ended early.
+/// All full-capture requirements below remain in effect except the requirement
+/// to consume the entire downstream body before the first forwarding attempt.
 ///
 /// Contract & limitations:
 /// - **Register before reading.** The buffer must be set before any body byte is read;
@@ -255,7 +344,7 @@ pub trait RequestBodyBuffer: Send + Sync {
     /// healthy.
     async fn write(&mut self, data: &Bytes) -> Result<()>;
 
-    /// Finalize capture after downstream EOF. Implementations that spill to disk
+    /// Finalize capture after downstream EOF, or the explicit prefix limit. Implementations that spill to disk
     /// should flush pending writes here.
     ///
     /// Cancellation: like [`Self::write`], this future may be dropped before

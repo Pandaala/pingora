@@ -359,6 +359,12 @@ pub struct HttpSession {
     // consumed from the stream, so the buffered body is incomplete and any
     // further body read or replay must fail closed.
     early_body_capture_poisoned: bool,
+    // Sticky even after first delivery: a prefix is never complete retry backing.
+    prefix_active: bool,
+    // Cleared only on successful sealing; cancellation between chunks fails closed.
+    prefix_capture_pending: bool,
+    // A real transport EOF cannot hide prefix/overrun bytes awaiting delivery.
+    prefix_delivery_pending: bool,
     // Set when `drain_request_body` discards a registered `early_body_buffer`.
     // The body bytes are gone from both the stream and the buffer, so a later
     // replay attempt must fail closed instead of silently forwarding a bodyless
@@ -639,6 +645,9 @@ impl HttpSession {
             retry_buffer: None,
             early_body_buffer: None,
             early_body_capture_poisoned: false,
+            prefix_active: false,
+            prefix_capture_pending: false,
+            prefix_delivery_pending: false,
             early_body_buffer_discarded: false,
             early_body_buffer_released: false,
             request_body_configuration_frozen: false,
@@ -724,6 +733,16 @@ impl HttpSession {
 
     /// Read request body bytes. `None` when there is no more body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
+        if self.prefix_capture_pending || self.prefix_delivery_pending {
+            return Error::e_explain(
+                pingora_error::ErrorType::InternalError,
+                "prefix capture pending or prefix not yet forwarded",
+            );
+        }
+        self.read_body_bytes_inner().await
+    }
+
+    async fn read_body_bytes_inner(&mut self) -> Result<Option<Bytes>> {
         if self.early_body_capture_poisoned {
             return Error::e_explain(
                 ErrorType::InternalError,
@@ -946,6 +965,7 @@ impl HttpSession {
         // replay attempt fails closed (see the v1 counterpart for rationale).
         if self.early_body_buffer.take().is_some() {
             self.early_body_buffer_discarded = true;
+            self.prefix_delivery_pending = false;
         }
         match self.total_drain_timeout {
             Some(t) => match timeout(t, self.do_drain_request_body()).await {
@@ -1079,6 +1099,7 @@ impl HttpSession {
         {
             self.early_body_buffer = None;
             self.early_body_buffer_released = true;
+            self.prefix_delivery_pending = false;
         }
     }
 
@@ -1299,6 +1320,9 @@ impl HttpSession {
     /// trailer hook. Source (iii) exists to classify a stream END, which is a
     /// strictly later event, so nothing is lost by the narrower rule here.
     pub fn is_body_done(&self) -> bool {
+        if self.prefix_delivery_pending {
+            return false;
+        }
         if self
             .early_body_buffer
             .as_ref()
@@ -1362,6 +1386,9 @@ impl HttpSession {
     }
 
     pub fn enable_retry_buffering(&mut self) {
+        if self.prefix_active {
+            return;
+        }
         if self.retry_buffer.is_none() {
             self.retry_buffer = Some(FixedBuffer::new(BODY_BUF_LIMIT))
         }
@@ -1391,6 +1418,18 @@ impl HttpSession {
         if let Some(registered) = self.early_body_buffer.as_mut() {
             if registered.is_replaying() {
                 let chunk = registered.next_chunk().await?;
+                if chunk.is_none() && self.prefix_active {
+                    let overrun = registered.take_prefix_overrun();
+                    self.early_body_buffer = None;
+                    self.prefix_delivery_pending = false;
+                    if overrun.is_some() {
+                        return Ok(overrun);
+                    }
+                    if self.request_body_prefix_transport_complete() {
+                        return Ok(None);
+                    }
+                    return self.read_body_bytes().await;
+                }
                 if chunk.is_none() {
                     // Replay EOF. If the response was already committed downstream
                     // (upstream responded before replay finished), the buffer can
@@ -1445,3 +1484,7 @@ impl HttpSession {
 #[cfg(test)]
 #[path = "server_tests.rs"]
 mod test;
+
+#[cfg(test)]
+#[path = "server_test_prefix.rs"]
+mod test_prefix;

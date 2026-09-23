@@ -397,6 +397,27 @@ impl ProxyHttp for SeamProxy {
     /// pump never finished" apart from "this id never got here". Returning
     /// `false` proxies the request exactly as before.
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+        if session
+            .req_header()
+            .headers
+            .contains_key("x-prefix-capture")
+        {
+            session.as_mut().write_continue_response().await?;
+            session
+                .as_mut()
+                .capture_request_body_prefix(
+                    Box::new(
+                        pingora_core::protocols::http::body_buffer::InMemoryRequestBodyBuffer::new(
+                        ),
+                    ),
+                    4,
+                )
+                .await?;
+            if session.req_header().headers.contains_key("x-prefix-reject") {
+                session.respond_error(403).await?;
+                return Ok(true);
+            }
+        }
         if let Some(id) = session
             .req_header()
             .headers

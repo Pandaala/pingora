@@ -16,6 +16,57 @@ use crate::protocols::http::body_buffer::{RegisteredRequestBodyBuffer, RequestBo
 use pingora_error::{Error, ErrorType::InternalError, Result};
 
 impl super::HttpSession {
+    /// Capture a bounded prefix using the registered application store.
+    /// A cancelled capture remains pending and forwarding fails closed.
+    pub async fn capture_request_body_prefix(
+        &mut self,
+        buffer: Box<dyn RequestBodyBuffer>,
+        limit: usize,
+    ) -> Result<()> {
+        if limit == 0 {
+            return Error::e_explain(
+                pingora_error::ErrorType::InternalError,
+                "prefix limit must be positive",
+            );
+        }
+        self.set_request_body_buffer(buffer)?;
+        self.prefix_active = true;
+        self.prefix_capture_pending = true;
+        self.prefix_delivery_pending = true;
+        self.early_body_buffer
+            .as_mut()
+            .unwrap()
+            .set_prefix_limit(limit);
+        loop {
+            let chunk = self.read_body_bytes_inner().await?;
+            if chunk.is_none()
+                || self.request_body_prefix_transport_complete()
+                || self.early_body_buffer.as_ref().unwrap().prefix_full()
+            {
+                break;
+            }
+        }
+        self.early_body_capture_poisoned = true;
+        self.early_body_buffer
+            .as_mut()
+            .unwrap()
+            .finish_capture()
+            .await?;
+        self.early_body_capture_poisoned = false;
+        self.prefix_capture_pending = false;
+        Ok(())
+    }
+
+    /// Remains true after delivery: prefix captures never become retryable.
+    pub fn request_body_prefix_active(&self) -> bool {
+        self.prefix_active
+    }
+
+    /// Actual downstream EOF, independent of retained prefix delivery.
+    pub fn request_body_prefix_transport_complete(&self) -> bool {
+        self.body_reader.body_done()
+    }
+
     /// Register an app-supplied buffer to capture the request body for early
     /// inspection / rewrite and upstream replay. Must be called BEFORE any body
     /// byte is read: registering after a partial read would capture only the
@@ -34,7 +85,7 @@ impl super::HttpSession {
                 "request body configuration is frozen for upstream proxying",
             );
         }
-        if self.early_body_buffer.is_some() {
+        if self.early_body_buffer.is_some() || self.prefix_active {
             return Error::e_explain(InternalError, "request body buffer is already registered");
         }
         if self.retry_buffer.is_some() {
@@ -79,7 +130,7 @@ impl super::HttpSession {
                 "request body configuration is frozen for upstream proxying",
             );
         }
-        if self.early_body_buffer.is_some() {
+        if self.early_body_buffer.is_some() || self.prefix_active {
             return Error::e_explain(InternalError, "request body buffer is already registered");
         }
         // Same double-send defense as `set_request_body_buffer`. A bodyless
@@ -118,7 +169,8 @@ impl super::HttpSession {
 
     pub(crate) fn request_body_buffer_replay_available(&self) -> bool {
         self.early_body_buffer.as_ref().is_some_and(|buffer| {
-            !self.early_body_capture_poisoned
+            !self.prefix_active
+                && !self.early_body_capture_poisoned
                 && !self.early_body_buffer_discarded
                 && !self.early_body_buffer_released
                 && (buffer.is_ready_or_replay_done() || buffer.is_replaying())
@@ -137,7 +189,7 @@ impl super::HttpSession {
     /// Prepare the registered buffer as the active request-body source for one
     /// upstream attempt. Returns `false` when no buffer was registered.
     pub async fn begin_request_body_replay(&mut self) -> Result<bool> {
-        if self.early_body_capture_poisoned {
+        if self.early_body_capture_poisoned || self.prefix_capture_pending {
             return Error::e_explain(
                 InternalError,
                 "request body capture failed or was cancelled mid-chunk; refusing to replay incomplete buffered body",
@@ -156,6 +208,12 @@ impl super::HttpSession {
             );
         }
         let Some(registered) = self.early_body_buffer.as_mut() else {
+            if self.prefix_active {
+                return Error::e_explain(
+                    pingora_error::ErrorType::InternalError,
+                    "request prefix was already forwarded",
+                );
+            }
             return Ok(false);
         };
         registered.begin_replay().await?;
