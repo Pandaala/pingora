@@ -30,6 +30,7 @@ v2/v3 commits and review records remain provenance, not the current v4 layout.
 | Response trailer lifecycle | Typed pre-trailer boundary, awaited application hook, H1 parsing/writing, planned framing capability, HTTP/1.0 downgrade | core H1, proxy trait and pumps | [response-trailers.md](features/response-trailers.md) |
 | Bounded response-head commit barrier | Default-Immediate final-head plan; opt-in hard-bounded Hold with Release/Replace/Fail, cache bypass, absolute deadline, writer claim, and protocol-safe origin abandonment | proxy trait, shared response pipeline/sink, H1/H2 pumps, cache; Edgion Guardrail claimant | [response-head-commit-barrier.md](features/response-head-commit-barrier.md) |
 | H2 END_STREAM evidence and upload liveness | Combine decoded state, EOF, content length, and qualified wire evidence; never trust wire flag alone; bound non-progressing request writes and release abandoned reservations | H2 watcher, client/connector, proxy H2 | [h2-end-stream.md](features/h2-end-stream.md) |
+| Downstream TLS offload cancellation | An offloaded handshake task is aborted when its caller stops waiting, including listener timeout | core BoringSSL acceptor and offload runtime | [downstream-tls-offload.md](features/downstream-tls-offload.md) |
 
 The cross-cutting composition and ownership of request and response body
 features is canonicalized in [the body relay architecture](architecture/body-relay.md).
