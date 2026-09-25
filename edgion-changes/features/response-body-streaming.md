@@ -56,6 +56,31 @@ flag.
   required to prevent stale H1 Content-Length framing from clipping extra
   output and to keep H2 framing valid.
 
+## Downstream terminal observation
+
+`ProxyHttp::response_body_filter` observes the downstream representation after
+cache and Range selection. It does not acquire the upstream hook's buffering
+or extra-output contract. `ResponsePipelineState::downstream_terminal_body`
+tracks completion independently from the upstream terminal latch, because
+cache readback and held response-head release have different delivery timing.
+
+For a real or empty trailer, or a bare `Done`, the shared pipeline delivers
+one empty terminal callback if an ordinary body task has not already delivered
+completion. Trailer processing runs first: if `response_trailer_filter`
+converts the trailer to body bytes, the ordinary terminal body callback handles
+those bytes instead. The following `Done` cannot notify again. Errors propagate
+and requested delays are awaited; an aborted source does not get a synthetic
+successful completion. Existing body-forbidden/filter-suppression gates remain.
+
+An empty synthetic terminal callback may leave `None` or empty bytes, but
+nonempty output fails the exchange. Adding bytes here would change the
+representation length after framing/cache decisions. Observation never inserts
+a terminal Body before Trailer: the original trailer remains the wire-level
+completion, preserving both H1 chunked framing and H2 trailers.
+
+See the [terminal-dispatch regression record](../review/h2-grpc/trailer-done-terminal-body-dispatch.md#downstream-terminal-observation)
+for the source issue, evidence, and verification limits.
+
 ## Cache interaction
 
 The original upstream representation and filter-emitted chunks are admitted

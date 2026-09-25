@@ -18,8 +18,9 @@ use super::cert;
 mod response_feature_support;
 
 pub use response_feature_support::{
-    cache_entry_state, take_downstream_trailer_filter_calls, take_downstream_trailer_logging_error,
-    take_emit_chunk_limit_logging_error, take_eos_dispatches, CacheEntryState,
+    cache_entry_state, take_downstream_body_observation, take_downstream_trailer_filter_calls,
+    take_downstream_trailer_logging_error, take_emit_chunk_limit_logging_error,
+    take_eos_dispatches, CacheEntryState,
 };
 
 use async_trait::async_trait;
@@ -479,6 +480,16 @@ impl ProxyHttp for ExampleProxyHttp {
             &mut ctx.response_features,
         )
         .await
+    }
+
+    fn response_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        response_feature_support::http_response_body_filter(session, body, end_of_stream)
     }
 
     async fn response_trailer_filter(
@@ -984,6 +995,16 @@ impl ProxyHttp for ExampleProxyCache {
             false,
             &CACHE_DEFAULT,
         ))
+    }
+
+    fn response_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        response_feature_support::http_response_body_filter(session, body, end_of_stream)
     }
 
     /// Same withholding processor as `ExampleProxyHttp`, so the terminal

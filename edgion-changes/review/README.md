@@ -67,7 +67,8 @@ The `status` inside each record is authoritative.
 - [Cache/reuse harness consumers](h2-grpc/h2-proxy-cache-reuse-harness-consumers.md)
   (H2-012): drive harness capabilities through end-to-end tests.
 - [Trailer/Done terminal dispatch](h2-grpc/trailer-done-terminal-body-dispatch.md):
-  one latch dispatches EOS and orders released bytes before terminal tasks.
+  upstream/downstream latches dispatch completion independently while preserving
+  released-byte and trailer ordering.
 - [Compression/trailer terminal ordering](compression/compression-trailer-terminal-order.md):
   finalize compression before trailers and keep the following Done inert.
 - [Custom terminal 101](http1/custom-terminal-101-normalized-before-dispatch.md):

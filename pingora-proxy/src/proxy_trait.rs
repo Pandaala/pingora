@@ -1012,6 +1012,17 @@ pub trait ProxyHttp {
     /// after caching and is therefore the downstream per-request filter for
     /// both live responses and cache hits. Use it only for observation or for
     /// transformations whose framing and representation metadata remain valid.
+    ///
+    /// A response ending in trailers or a bare completion receives one empty
+    /// terminal callback (`body = None`, `end_of_stream = true`) if no body
+    /// task already delivered completion. For trailers this runs after
+    /// [`Self::response_trailer_filter`]; a trailer converted to body bytes
+    /// instead uses the ordinary terminal body callback. The empty terminal
+    /// callback must leave the body absent or empty; producing nonempty bytes
+    /// fails the exchange because it would change the representation length.
+    /// The original trailers remain the wire-level termination. Aborted
+    /// responses do not receive a synthetic successful completion, and paths
+    /// that suppress downstream body filtering retain that behavior.
     fn response_body_filter(
         &self,
         _session: &mut Session,

@@ -29,6 +29,9 @@ use tokio::io::AsyncWriteExt;
 struct ParityProxy;
 struct PipelineBenchProxy;
 
+#[path = "response_pipeline_downstream_tests.rs"]
+mod downstream;
+
 struct HoldReleaseCtx {
     response_filter_complete: bool,
     plan_calls: AtomicUsize,
@@ -345,10 +348,14 @@ impl ProxyHttp for ParityProxy {
         &self,
         _session: &mut Session,
         _body: &mut Option<Bytes>,
-        _end_of_stream: bool,
+        end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<Option<std::time::Duration>> {
-        ctx.push("downstream-body");
+        ctx.push(if end_of_stream {
+            "downstream-terminal"
+        } else {
+            "downstream-body"
+        });
         Ok(None)
     }
 
@@ -538,6 +545,7 @@ async fn live_header_body_trailer_done_failed_semantics_match_all_protocols() {
             "upstream-trailer",
             "downstream-body",
             "downstream-trailer",
+            "downstream-terminal",
         ]
     );
     assert!(h1.0.contains("released"));
@@ -561,7 +569,7 @@ async fn cache_hit_header_body_done_semantics_match_all_protocols() {
             "downstream-header",
             "will-commit",
             "downstream-body",
-            "downstream-body"
+            "downstream-terminal"
         ]
     );
 }

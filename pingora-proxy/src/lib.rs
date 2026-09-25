@@ -602,6 +602,7 @@ where
         &self,
         session: &mut Session,
         tasks: &mut [HttpTask],
+        terminal: &mut response_pipeline::TerminalBodyDispatch,
         ctx: &mut SV::CTX,
     ) -> Result<()>
     where
@@ -609,9 +610,25 @@ where
         SV::CTX: Send + Sync,
     {
         for task in tasks {
+            let terminal_event = terminal.claim_for(task);
             let duration = match task {
                 HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => {
                     self.inner.response_body_filter(session, data, *eos, ctx)?
+                }
+                _ if terminal_event.is_some() => {
+                    // Notify the observer without adding a wire-level EOS before
+                    // trailers. There are no original bytes to replace here.
+                    let mut body = None;
+                    let duration = self
+                        .inner
+                        .response_body_filter(session, &mut body, true, ctx)?;
+                    if body.as_ref().is_some_and(|body| !body.is_empty()) {
+                        return Error::e_explain(
+                            InternalError,
+                            "downstream terminal body observation cannot produce bytes",
+                        );
+                    }
+                    duration
                 }
                 _ => None,
             };

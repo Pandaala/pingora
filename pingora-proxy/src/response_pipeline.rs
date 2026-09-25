@@ -77,6 +77,8 @@ pub(crate) struct ResponsePipelineState {
     pub(crate) upstream_reusable: bool,
     pub(crate) sink: ResponseBodySink,
     pub(crate) terminal_body: TerminalBodyDispatch,
+    // Upstream completion can precede cache readback and downstream delivery.
+    downstream_terminal_body: TerminalBodyDispatch,
     pub(crate) head_barrier: ResponseHeadBarrier,
     pub(crate) origin_abandoned: bool,
     pending_head_boundary: Option<ResponseHeadBoundary>,
@@ -91,6 +93,7 @@ impl Default for ResponsePipelineState {
             upstream_reusable: true,
             sink: ResponseBodySink::new(),
             terminal_body: TerminalBodyDispatch::default(),
+            downstream_terminal_body: TerminalBodyDispatch::default(),
             head_barrier: ResponseHeadBarrier::default(),
             origin_abandoned: false,
             pending_head_boundary: None,
@@ -178,6 +181,7 @@ where
         &self,
         session: &mut Session,
         tasks: &mut [HttpTask],
+        terminal: &mut TerminalBodyDispatch,
         ctx: &mut SV::CTX,
     ) -> Result<()>
     where
@@ -200,8 +204,13 @@ where
                     HttpTask::Trailer(normalize_trailers(std::mem::take(trailers)))
                 };
             }
-            self.downstream_response_body_filter_tasks(session, std::slice::from_mut(task), ctx)
-                .await?;
+            self.downstream_response_body_filter_tasks(
+                session,
+                std::slice::from_mut(task),
+                terminal,
+                ctx,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -439,6 +448,7 @@ where
                         self.downstream_response_filter_tasks_in_order(
                             session,
                             &mut out_tasks[start..],
+                            &mut state.downstream_terminal_body,
                             ctx,
                         )
                         .await?;
@@ -451,6 +461,7 @@ where
                     self.downstream_response_filter_tasks_in_order(
                         session,
                         &mut out_tasks[start..],
+                        &mut state.downstream_terminal_body,
                         ctx,
                     )
                     .await?;
@@ -567,6 +578,10 @@ where
             return Ok(());
         }
         let source_failed = matches!(&task, HttpTask::Failed(_));
+        if source_failed {
+            // An aborted source must not later look like clean downstream EOF.
+            state.downstream_terminal_body.claim_for(&task);
+        }
         let source_clean_terminal = task.is_end() && !source_failed;
         let terminal_header = !from_cache
             && matches!(

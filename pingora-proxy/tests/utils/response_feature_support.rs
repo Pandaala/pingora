@@ -57,6 +57,38 @@ pub(super) struct CacheResponseFeatureState {
 pub(super) static EOS_PROBES: Lazy<Mutex<HashMap<String, usize>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+static DOWNSTREAM_BODY_PROBES: Lazy<Mutex<HashMap<String, (usize, usize)>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Return observed byte and terminal-callback counts independently of delivery.
+pub fn take_downstream_body_observation(probe: &str) -> (usize, usize) {
+    DOWNSTREAM_BODY_PROBES
+        .lock()
+        .unwrap()
+        .remove(probe)
+        .unwrap_or_default()
+}
+
+pub(super) fn http_response_body_filter(
+    session: &Session,
+    body: &mut Option<Bytes>,
+    eos: bool,
+) -> Result<Option<Duration>> {
+    let probe = session.get_header_bytes("x-downstream-body-probe");
+    if !probe.is_empty() {
+        let mut probes = DOWNSTREAM_BODY_PROBES.lock().unwrap();
+        let observation = probes
+            .entry(String::from_utf8_lossy(probe).into_owned())
+            .or_default();
+        observation.0 += body.as_ref().map_or(0, Bytes::len);
+        observation.1 += usize::from(eos);
+    }
+    if eos && body.is_none() && session.get_header_bytes("x-downstream-eos-output") == b"true" {
+        *body = Some(Bytes::from_static(b"invalid-terminal-output"));
+    }
+    Ok(None)
+}
+
 /// Downstream `response_trailer_filter` invocations, keyed by the request's
 /// `x-downstream-trailer-probe` value. This is separate from client-visible
 /// bytes so failure tests can prove the hook ran even though the response is

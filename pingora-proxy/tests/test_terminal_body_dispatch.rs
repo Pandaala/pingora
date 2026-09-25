@@ -38,15 +38,176 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::{io::AsyncReadExt, io::AsyncWriteExt, net::TcpListener, net::TcpStream};
 use utils::server_utils::{
-    init_without_mock_origin, take_downstream_trailer_filter_calls,
-    take_downstream_trailer_logging_error, take_emit_chunk_limit_logging_error,
-    take_eos_dispatches,
+    init_without_mock_origin, take_downstream_body_observation,
+    take_downstream_trailer_filter_calls, take_downstream_trailer_logging_error,
+    take_emit_chunk_limit_logging_error, take_eos_dispatches,
 };
 
 use pingora_proxy::RESPONSE_BODY_EMIT_CHUNK_BUDGET;
 
 const CHUNKS: [&str; 3] = ["alpha", "beta", "gamma"];
 const COMPRESSIBLE_BODY_LEN: usize = 4096;
+
+#[tokio::test]
+async fn downstream_observer_preserves_h1_trailer_framing() {
+    init_without_mock_origin();
+    for use_h2 in [false, true] {
+        let port = if use_h2 {
+            spawn_origin(Termination::Trailers).await
+        } else {
+            spawn_h1_chunked_origin(true).await
+        };
+        let probe = format!("downstream-h1-wire-{port}");
+        let (_, wire) = tokio::time::timeout(
+            Duration::from_secs(10),
+            raw_h1_get(
+                port,
+                use_h2,
+                "HTTP/1.1",
+                &[("x-downstream-body-probe", &probe)],
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(wire.starts_with("HTTP/1.1 200"), "{wire:?}");
+        assert!(wire.contains("0\r\ngrpc-status: 0\r\n"), "{wire:?}");
+        assert!(
+            !wire.contains("0\r\n\r\ngrpc-status"),
+            "premature body completion: {wire:?}"
+        );
+        assert_eq!(wire.matches("grpc-status: 0").count(), 1);
+        for chunk in &CHUNKS[..if use_h2 { 3 } else { 2 }] {
+            assert!(wire.contains(chunk), "{wire:?}");
+        }
+        assert_eq!(
+            take_downstream_body_observation(&probe),
+            (
+                if use_h2 {
+                    whole_body().len()
+                } else {
+                    "alphabeta".len()
+                },
+                1
+            )
+        );
+    }
+}
+
+#[tokio::test]
+async fn downstream_observer_preserves_h2_trailers_and_data() {
+    init_without_mock_origin();
+    for use_h2 in [false, true] {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let port = if use_h2 {
+                spawn_origin(Termination::Trailers).await
+            } else {
+                spawn_h1_chunked_origin(true).await
+            };
+            let probe = format!("downstream-h2-wire-{port}");
+            let stream = TcpStream::connect("127.0.0.1:6146").await.unwrap();
+            let (mut client, connection) = h2::client::handshake(stream).await.unwrap();
+            let driver = tokio::spawn(connection);
+            let mut request = http::Request::builder()
+                .uri("http://localhost/terminal-body")
+                .header("x-port", port.to_string())
+                .header("x-downstream-body-probe", &probe);
+            if use_h2 {
+                request = request.header("x-h2", "true");
+            }
+            let (response, _) = client
+                .send_request(request.body(()).unwrap(), true)
+                .unwrap();
+            let response = response.await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.unwrap();
+                bytes.extend_from_slice(&chunk);
+                body.flow_control().release_capacity(chunk.len()).unwrap();
+            }
+            let trailers = body
+                .trailers()
+                .await
+                .unwrap()
+                .expect("trailers must survive observation");
+            assert_eq!(trailers["grpc-status"], "0");
+            let expected = if use_h2 {
+                whole_body()
+            } else {
+                "alphabeta".to_owned()
+            };
+            assert_eq!(bytes, expected.as_bytes());
+            assert_eq!(take_downstream_body_observation(&probe), (bytes.len(), 1));
+            driver.abort();
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn downstream_observer_sees_one_completion_for_each_h2_end_shape() {
+    init_without_mock_origin();
+    for how in [
+        Termination::Trailers,
+        Termination::EndStreamOnLastData,
+        Termination::EndStreamOnEmptyData,
+        Termination::EndStreamOnHeaders,
+    ] {
+        let port = spawn_origin(how).await;
+        let probe = format!("downstream-end-shape-{port}");
+        let response = reqwest::Client::new()
+            .get("http://127.0.0.1:6147/terminal-body")
+            .header("x-h2", "true")
+            .header("x-port", port.to_string())
+            .header("x-downstream-body-probe", &probe)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.bytes().await.unwrap();
+        let expected = if matches!(how, Termination::EndStreamOnHeaders) {
+            "".to_owned()
+        } else {
+            whole_body()
+        };
+        assert_eq!(body.as_ref(), expected.as_bytes());
+        assert_eq!(take_downstream_body_observation(&probe), (body.len(), 1));
+    }
+}
+
+#[tokio::test]
+async fn downstream_terminal_output_failure_aborts_without_writing_trailers() {
+    init_without_mock_origin();
+    let port = spawn_origin(Termination::Trailers).await;
+    let probe = format!("downstream-invalid-output-{port}");
+    let (_, wire) = tokio::time::timeout(
+        Duration::from_secs(10),
+        raw_h1_get(
+            port,
+            true,
+            "HTTP/1.1",
+            &[
+                ("x-downstream-body-probe", &probe),
+                ("x-downstream-eos-output", "true"),
+            ],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        take_downstream_body_observation(&probe),
+        (whole_body().len(), 1)
+    );
+    assert!(!wire.contains("invalid-terminal-output"), "{wire:?}");
+    assert!(!wire.contains("grpc-status:"), "{wire:?}");
+    assert!(
+        !wire.ends_with("0\r\n\r\n"),
+        "failed exchange completed cleanly: {wire:?}"
+    );
+}
 
 fn whole_body() -> String {
     CHUNKS.concat()
@@ -495,6 +656,7 @@ async fn get_probed(port: u16, probe: &str) -> reqwest::Result<reqwest::Response
         .header("x-port", port.to_string())
         .header("x-retain-until-eos", "true")
         .header("x-eos-probe", probe)
+        .header("x-downstream-body-probe", probe)
         .timeout(Duration::from_secs(10))
         .send()
         .await
@@ -1005,6 +1167,7 @@ async fn trailered_response_dispatches_the_terminal_callback_exactly_once() {
         .await
         .unwrap();
     assert_eq!(body.matches("|eos").count(), 1, "body was {body:?}");
+    assert_eq!(take_downstream_body_observation(&probe), (body.len(), 1));
     assert_eq!(
         take_eos_dispatches(&probe),
         1,
@@ -1150,6 +1313,7 @@ async fn aborted_response_never_dispatches_a_terminal_callback() {
         Err(e) => Err(e),
     };
     let dispatches = take_eos_dispatches(&probe);
+    assert_eq!(take_downstream_body_observation(&probe).1, 0);
 
     // Without this, every infrastructure failure short of a timeout -- an
     // unbound loopback address, an unreachable proxy, a refused origin
@@ -1205,9 +1369,11 @@ async fn cached_body_matches_the_wire_body_for_a_trailered_response() {
         std::process::id()
     );
     let client = reqwest::Client::new();
+    let probe = format!("downstream-cache-{port}");
 
     let miss = client
         .get(&url)
+        .header("x-downstream-body-probe", &probe)
         .header("x-h2", "true")
         .header("x-port", port.to_string())
         .header("x-retain-until-eos", "true")
@@ -1218,9 +1384,14 @@ async fn cached_body_matches_the_wire_body_for_a_trailered_response() {
     assert_eq!(miss.headers().get("x-cache-status").unwrap(), "miss");
     let miss_body = miss.text().await.unwrap();
     assert_eq!(miss_body, format!("{}|eos", whole_body()));
+    assert_eq!(
+        take_downstream_body_observation(&probe),
+        (miss_body.len(), 1)
+    );
 
     let hit = client
         .get(&url)
+        .header("x-downstream-body-probe", &probe)
         .header("x-h2", "true")
         .header("x-port", port.to_string())
         .header("x-retain-until-eos", "true")
@@ -1230,6 +1401,10 @@ async fn cached_body_matches_the_wire_body_for_a_trailered_response() {
         .unwrap();
     assert_eq!(hit.headers().get("x-cache-status").unwrap(), "hit");
     assert_eq!(hit.text().await.unwrap(), miss_body);
+    assert_eq!(
+        take_downstream_body_observation(&probe),
+        (miss_body.len(), 1)
+    );
 }
 
 #[tokio::test]

@@ -457,6 +457,48 @@ against an incompatible `metrique-core 0.1.6`. The same failure reproduces in
 a detached, unmodified `main` worktree, so it is a baseline dependency issue
 rather than a regression in this feature stack.
 
+## Downstream terminal-observation verification (2026-09-25)
+
+Local uncommitted fix on Pingora `0b0d8bba9609655bfd7db0fe0add6818bc0ee937`;
+Edgion `937b1e6d4ee8b4e6ce252b426a99447cc571e162` retains the `edgion_v5`
+Git source and locked `7c24c0dd6ea5996af011529f6bae8ae8972f695a`. Both
+tracked worktrees were clean before this task; Edgion had three unrelated/open
+untracked task entries, including the selected finding. No dependency update,
+commit, or push is part of this verification.
+
+| Command / scope | Result |
+| --- | --- |
+| Pingora `cargo fmt --all -- --check` | Passed |
+| `cargo check -p pingora-core -p pingora-proxy` | Passed |
+| `cargo clippy -p pingora-proxy --all-targets` | Passed, existing warnings |
+| `cargo test -p pingora-proxy --lib response_pipeline` | 29 passed, 1 ignored |
+| `cargo test -p pingora-proxy --test test_terminal_body_dispatch` | 32 passed |
+| `cargo test -p pingora-proxy --test test_upstream_response_body_sink` | 58 passed |
+| `cargo test -p pingora-proxy --lib` | 225 passed, 3 failed, 2 ignored |
+| Clean archived HEAD, same lockfile, `cargo test --locked -p pingora-proxy --lib default_retry_policy` | Same 3 failures; no EOS diff present |
+| Edgion `cargo fmt --all`, workspace/all-target check and Clippy | Passed against the unchanged locked fork |
+| Edgion agent-doc, SSA-force, metrics-inventory, Pingora-source, Gateway API transform, unit-test layout guards | Passed |
+
+The three library failures are tracked by
+[default retry-policy test baseline](../pending-issues/default-retry-policy-test-baseline.md).
+They block task closure; this table does not claim a green full-library run.
+Independent code/knowledge review returned LGTM. No full Edgion test suite or
+deployed Gateway behavior was tested. The decisive changed-fork evidence is
+the Pingora tests above, not the Edgion build with its older locked revision.
+
+The deeper review found that the archived baseline run reused the live target
+directory, leaving a stale 225-test library binary that could misleadingly
+report zero matches for the new test filter. After cleaning only the
+`pingora-proxy` build artifacts, the actual new downstream filter ran 5 tests
+and passed; the pipeline rerun had 29 passed / 1 ignored, and the rebuilt
+230-test library again had 225 passed / 3 known failures / 2 ignored. Both
+response integration targets were then rebuilt and rerun: 32 and 58 passed.
+These results agree with the original pre-baseline logs. Future baseline
+comparisons should use separate target directories, and zero matched tests
+must never count as verification. Custom-protocol downstream EOS is covered
+by shared-pipeline parity; the 58-case integration suite is broader regression
+coverage, not a dedicated custom downstream EOS wire test.
+
 ## Review gates
 
 - `git diff --check` is clean.

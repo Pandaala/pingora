@@ -285,8 +285,10 @@ generic response semantics:
 - a filtered terminal header;
 - upstream reuse eligibility;
 - the bounded `ResponseBodySink`; and
-- the exactly-once `TerminalBodyDispatch` latch, implemented in the private
-  `pingora-proxy/src/response_terminal.rs` child module.
+- independent upstream and downstream `TerminalBodyDispatch` latches,
+  implemented in the private `pingora-proxy/src/response_terminal.rs` child
+  module. The downstream latch follows prepared delivery, not upstream/cache
+  admission, and therefore also survives held-header release and pump batches.
 
 It deliberately does not own `Session`, application context, cache storage,
 protocol writers, or Edgion processor boxes because those lifetimes extend to
@@ -351,7 +353,7 @@ content-length satisfaction, and wire END_STREAM are distinct facts.
 - The accepted upstream `h2` trailer limitation remains: wire END_STREAM alone
   is not sufficient cache-admission evidence.
 
-The shared terminal latch maps task evidence as follows:
+The shared upstream terminal latch maps task evidence as follows:
 
 | Input evidence | Body dispatch | Public trailer hook | Completion meaning |
 | --- | --- | --- | --- |
@@ -362,6 +364,15 @@ The shared terminal latch maps task evidence as follows:
 | Bare `Done` | `TerminalWithoutTrailers` only if still unclaimed | None | Decoded clean EOF fallback |
 | `Failed` | No clean body terminal event; latch becomes claimed | None | Aborted response |
 | Later `Done` after any claimed terminal | None | None | Inert duplicate evidence |
+
+The downstream `response_body_filter` independently observes completion after
+cache/Range processing and downstream trailer transformation. A trailer
+converted to body bytes uses the ordinary terminal body callback; otherwise
+Trailer/bare Done generates one empty terminal observation. That observation
+does not insert a wire-level Body-EOS before trailers. Nonempty output from
+the synthetic empty callback fails the exchange, preserving the hook's
+representation-preserving contract. Body-suppression gates remain unchanged.
+See [downstream terminal observation](../features/response-body-streaming.md#downstream-terminal-observation).
 
 ### 4. Sink, mutation, and cache ordering
 

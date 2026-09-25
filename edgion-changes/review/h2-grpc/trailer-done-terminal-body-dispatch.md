@@ -119,9 +119,74 @@ Re-open only if:
   (`terminal_upstream_body_filter` for `Header(_, true)`).
 - Related: [abandoned-request-body-terminal-event.md](../../../../Edgion/skills/04-review/h2-grpc/abandoned-request-body-terminal-event.md)
   — the request-side analogue of "terminal event must be distinguishable".
-- Adjacent, still open:
-  `../Edgion/tasks/todo/downstream-response-body-filter-trailer-eos-gap.md` — the
-  DOWNSTREAM `response_body_filter` has the same trailer-shaped hole. It is an
-  observation gap, not byte loss: that hook is documented observation-only, so a
-  "withheld bytes are lost there" re-report is not a defect. Priority P4, no
-  consumer in the Edgion tree today.
+- Adjacent downstream issue: see [downstream terminal observation](#downstream-terminal-observation).
+
+## Downstream terminal observation
+
+Source ID: `downstream-response-body-filter-trailer-eos-gap` (original P4
+observation gap; no production byte-loss impact established). The user explicitly authorized a
+local fork correction on 2026-09-25 after reviewing the inherited upstream
+limitation and the terminal-output policy. The implementation is based on
+Pingora `0b0d8bba9609655bfd7db0fe0add6818bc0ee937`; sibling Edgion
+`937b1e6d4ee8b4e6ce252b426a99447cc571e162` still locks `7c24c0dd`.
+This local change does not update or publish Edgion's dependency.
+
+The downstream helper previously dispatched only Body/UpgradedBody. A
+trailered response therefore delivered data with `eos=false`, then skipped
+Trailer/Done. The upstream terminal latch could not repair this: bytes released
+before trailers intentionally remain non-terminal. No production Edgion
+implementation of the downstream hook was found during this review.
+
+`ResponsePipelineState::downstream_terminal_body` now independently applies
+the existing `TerminalBodyDispatch` mechanism to prepared downstream tasks,
+after trailer transformation. Ordinary terminal bodies claim the latch;
+Trailer/bare Done supply an empty terminal callback; failure claims without
+notification. The latch survives pump batches and held-header release. A
+trailer converted to a body uses the ordinary callback rather than a second
+synthetic event. Cache readers keep their existing EOF delivery.
+
+Synthetic terminal output may be absent or empty. Nonempty output fails the
+exchange rather than silently losing bytes or changing committed framing.
+The existing hook contract permits observation and representation-preserving
+transforms, not deferred length-changing output. No Body-EOS marker is inserted
+before trailers. Delays/errors propagate through the existing downstream path.
+Body-forbidden and filter-suppression gates are unchanged.
+
+Buffering alone is not necessarily length-changing: releasing exactly the
+previously retained bytes can preserve total length. The original task's
+blanket claim that all withholding violates the old contract was too broad.
+The new synthetic callback's output rejection is the explicitly approved scope
+of this correction, not a derivation that every buffering strategy was already
+prohibited. Supporting deferred output here requires a separate design that
+preserves framing and trailer order; future reports must be evaluated on their
+actual lifecycle and representation semantics.
+
+Regression coverage lives in `response_pipeline_downstream_tests.rs`, the
+shared pipeline parity tests, and `test_terminal_body_dispatch.rs`. It checks
+cross-batch completion, bare Done, upgraded/body termination, failure, trailer
+conversion, output validation, delay, H1/H2 wire trailers, end shapes, reset,
+and cache miss/hit observation.
+
+Fresh local checks on 2026-09-25: pipeline unit filter 29 passed / 1 ignored;
+terminal integration 32 passed; response-body sink integration 58 passed.
+Format, core/proxy check, and proxy all-target Clippy passed (existing warnings).
+The full proxy library suite had 225 passed / 3 failed / 2 ignored; the same
+three default-retry failures reproduced without this diff using the same
+lockfile. They are tracked in
+[a separate baseline investigation](../../pending-issues/default-retry-policy-test-baseline.md).
+An independent read-only review returned LGTM. The selected Edgion task stays
+open because the full-library check is not green. Historical upstream checks
+above are not current evidence. The verification matrix records the companion
+Edgion checks, which exercise its locked dependency rather than this local fork.
+
+Re-evaluate when downstream filtering, trailer conversion, cache readback,
+body suppression, response-head release, or the public hook contract changes.
+
+Deeper independent lifecycle and test/contract review found no reachable
+production regression and corrected the buffering-contract overstatement
+above. The terminal notification remains a filter-stage event before writer
+and downstream-module completion; it is not proof that the client received
+the response successfully. Empty header-only replacements and existing body
+suppression remain outside the new Trailer/Done notification path. Rebuilt
+test results and a resolved baseline-comparison build-cache pitfall are
+documented in the verification matrix.
