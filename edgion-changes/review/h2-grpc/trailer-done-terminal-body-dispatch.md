@@ -174,8 +174,10 @@ The full proxy library suite had 225 passed / 3 failed / 2 ignored; the same
 three default-retry failures reproduced without this diff using the same
 lockfile. They are tracked in
 [a separate baseline investigation](../../pending-issues/default-retry-policy-test-baseline.md).
-An independent read-only review returned LGTM. The selected Edgion task stays
-open because the full-library check is not green. Historical upstream checks
+Independent read-only reviews returned LGTM. The user subsequently explicitly
+requested removal of the selected Edgion task while the unrelated baseline
+failures remain tracked separately; the full-library check is not green.
+Historical upstream checks
 above are not current evidence. The verification matrix records the companion
 Edgion checks, which exercise its locked dependency rather than this local fork.
 

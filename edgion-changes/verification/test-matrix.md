@@ -481,7 +481,8 @@ commit, or push is part of this verification.
 
 The three library failures are tracked by
 [default retry-policy test baseline](../pending-issues/default-retry-policy-test-baseline.md).
-They block task closure; this table does not claim a green full-library run.
+The user explicitly requested removal of the original EOS task with those
+failures tracked separately; this table does not claim a green full-library run.
 Independent code/knowledge review returned LGTM. No full Edgion test suite or
 deployed Gateway behavior was tested. The decisive changed-fork evidence is
 the Pingora tests above, not the Edgion build with its older locked revision.
