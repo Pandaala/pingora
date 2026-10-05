@@ -720,12 +720,19 @@ fn parse_request_target(target: &[u8]) -> Result<ParsedRequestTarget> {
         None => target,
     };
 
+    // Normalize explicitly: some supported http versions reject an empty
+    // path-and-query instead of rendering it as the root request-target.
+    if target.is_empty() {
+        return Ok(ParsedRequestTarget {
+            uri: Uri::default(),
+            raw_target: RawTarget::FromUri,
+        });
+    }
+
     // Forms the Uri round-trips on its own, so they need no separate copy: origin-form
     // (§3.2.1), asterisk-form (§3.2.4) and query-only targets all come back out of the
-    // Uri byte-identical, so anything reaching the wire from them is unchanged. A target
-    // the fragment strip left empty is the one exception: it has no bytes to reproduce,
-    // and path_and_query() renders it as "/".
-    if target.is_empty() || matches!(target.first(), Some(b'/' | b'?')) || target == b"*" {
+    // Uri byte-identical, so anything reaching the wire from them is unchanged.
+    if matches!(target.first(), Some(b'/' | b'?')) || target == b"*" {
         return Ok(match std::str::from_utf8(target) {
             Ok(target) => ParsedRequestTarget {
                 uri: path_and_query_uri(target, target)?,
@@ -1345,15 +1352,27 @@ mod tests {
 
     #[test]
     fn test_target_that_is_only_a_fragment_falls_back_to_root() {
-        // Stripping the fragment can leave nothing behind. There is nothing useful to keep
-        // verbatim for an empty target, so it resolves through the Uri, which renders it as
-        // "/" -- the same target these produced before, now stated by the variant rather
-        // than inferred from a zero-length byte vector.
+        // Normalize before invoking the dependency's path-and-query parser:
+        // an empty component is rejected by http 1.4.2 but accepted by 1.5.0.
         for target in [&b""[..], b"#", b"#frag", b"#/admin"] {
             let req = RequestHeader::build("GET", target, None).unwrap();
             let label = String::from_utf8_lossy(target);
             assert_eq!(b"/", req.raw_path(), "{label}");
+            assert_eq!("/", req.uri.path(), "{label}");
+            assert!(req.uri.query().is_none(), "{label}");
+            assert!(req.uri.authority().is_none(), "{label}");
             assert_eq!(RawTarget::FromUri, req.raw_target, "{label}");
+
+            for previous in [&b"http://old.example/path?q=old"[..], b"/path-\xff"] {
+                let mut req = RequestHeader::build("GET", previous, None).unwrap();
+                req.set_raw_path(target).unwrap();
+                assert_eq!(b"/", req.raw_path(), "{label}");
+                assert_eq!("/", req.uri.path(), "{label}");
+                assert!(req.uri.query().is_none(), "{label}");
+                assert!(req.uri.authority().is_none(), "{label}");
+                assert!(req.raw_path_is_utf8(), "{label}");
+                assert_eq!(RawTarget::FromUri, req.raw_target, "{label}");
+            }
         }
 
         // Asterisk-form and query-only targets survive their fragment rather than

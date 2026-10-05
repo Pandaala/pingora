@@ -12,12 +12,12 @@ next action, and closure evidence.
 | [H2 trailer validation](h2-trailer-validation.md) | Deferred upstream | Upstream decoder, then fork integration | [Upstream limitation](../review/upstream-limitations.md) |
 | [Non-streaming cache trailer completion](non-streaming-cache-trailer-completion.md) | Open | Fork | Discovered while closing [trailer filter parity](../review/response-trailer-filter-error-parity.md) |
 | [Custom conditional-filter gate](custom-conditional-filter-gate.md) | Open investigation | Fork custom response pump | Preserved explicitly by the shared response pipeline |
-| [Default retry-policy test baseline](default-retry-policy-test-baseline.md) | Open investigation | Fork tests / request relay | Found during downstream terminal-observation verification |
 
 ## Resolved history
 
 | Issue | Closure | Ownership | Canonical records |
 | --- | --- | --- | --- |
+| [Default retry-policy test baseline](default-retry-policy-test-baseline.md) | Test fixtures corrected in local commit `9638a37`; production gates unchanged | Fork tests / request relay | [Verification](../verification/test-matrix.md) |
 | [Bounded response-head commit barrier](response-head-commit-barrier.md) | Pingora mechanism committed as `af9e1ac`; Edgion production consumer committed as `f31d016`; recorded local-source matrix passed | Cross-repository | [Feature](../features/response-head-commit-barrier.md), [design](../review/response-head-commit-barrier-design.md), [current architecture](../architecture/body-relay.md) |
 
 ## Required issue fields

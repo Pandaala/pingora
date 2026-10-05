@@ -23,6 +23,7 @@ v2/v3 commits and review records remain provenance, not the current v4 layout.
 
 | Feature | Contract | Implementation center | Detail |
 | --- | --- | --- | --- |
+| Request-target normalization | Empty or fragment-only header targets resolve explicitly to `/`, independent of URI parser version | pingora-http header construction and mutation | [Normalization guard](review/http1/empty-request-target-normalization.md) |
 | Inbound PROXY protocol | Strict v1/v2 parsing before TLS, explicit transport trust, preserved raw peer | core listeners, L4 parser, digest | [proxy-protocol.md](features/proxy-protocol.md) |
 | Replayable request body | Full capture/replay or bounded pre-forwarding prefix followed by live bytes; cancellation fails closed | core body buffer and H1/H2 server sessions | [request-body-buffering.md](features/request-body-buffering.md) |
 | Request-body transport controls | H1 transfer-coding admission, consistent events, dispositions, termination, trailers, retry gates, cleanup | proxy entry, trait/common and pumps | [request-body-transport.md](features/request-body-transport.md) |

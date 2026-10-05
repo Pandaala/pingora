@@ -500,6 +500,60 @@ must never count as verification. Custom-protocol downstream EOS is covered
 by shared-pipeline parity; the 58-case integration suite is broader regression
 coverage, not a dedicated custom downstream EOS wire test.
 
+## Empty request-target normalization verification (2026-10-05)
+
+Checkout: `/Volumes/ExtStore/ws3/pingora`, base
+`9638a37173df57b9f5b2676adbeb6c60aeaa0ca3`, with the local normalization
+fix and regression assertions in `pingora-http/src/lib.rs`. The base already
+contains the retry-fixture and H2-observer test corrections. These results
+supersede the earlier retry-fixture failures for this checkout only.
+
+The unchanged ignored Cargo.lock selects http 1.4.2 and h2 0.4.19; its SHA256 is
+`879169c00b3e2950866f33bf57d739a0d4d362e9f9610d9912357ad696e87174`.
+On macOS arm64 with Rust 1.96.1, the existing fragment-only header test first
+failed on the unmodified base with `InvalidUri(Empty)`. Explicit normalization
+then passed the following matrix. All Cargo check/test/clippy commands used
+`--locked`; existing ignored tests remain ignored.
+
+| Command / scope | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | Passed |
+| `cargo check -p pingora-http -p pingora-core -p pingora-proxy` | Passed |
+| `cargo check -p pingora-core --features "connection_filter boringssl"` | Passed |
+| `cargo clippy -p pingora-http -p pingora-core -p pingora-proxy --all-targets` | Passed |
+| `cargo test -p pingora-http --lib`, http 1.4.2 | 56 passed |
+| Same header suite, isolated candidate with http 1.5.0 | 56 passed |
+| `cargo test -p pingora-core --lib` | 774 passed, 17 ignored |
+| Core library with `connection_filter` | 779 passed, 17 ignored |
+| Core library with `boringssl` | 813 passed, 17 ignored |
+| Core `boringssl`, filter `test_listen_tls_proxy_protocol` | 2 passed |
+| `cargo test -p pingora-proxy --lib` | 228 passed, 2 ignored |
+| Proxy `test_request_body_seam` | 65 passed |
+| Proxy `test_upstream_response_body_sink` | 58 passed |
+| Proxy `test_terminal_body_dispatch` | 32 passed |
+| Proxy `test_h2_upstream_no_error_reset` | 10 passed |
+| Proxy `test_h2_upstream_stalled_after_response` | 4 passed |
+| Proxy `test_h2_upstream_cache_and_reuse` | 8 passed |
+
+The formerly failing core cases, `validate_connect` and
+`test_absolute_form_and_connect_to_wire`, pass in all three core configurations.
+The header regression additionally checks mutation from absolute and non-UTF-8
+targets. See the [normalization guard](../review/http1/empty-request-target-normalization.md)
+for the precise API boundary and unchanged HTTP/1 wire admission rules.
+
+The http 1.5.0 run used an isolated archive of the same base plus only the
+changed header source, with refreshed source timestamps to force recompilation.
+Its borrowed dependency lock has SHA256
+`87fe3c6bb67ddacde98a19556e8c613bde668dc18d8580757b382f723584020a`;
+this did not update the primary checkout's lock. Raw logs and command results
+are local artifacts under
+`/Volumes/ExtStore/ws5/Edgion/tmp/p090-002/empty-target/`.
+
+No commit, push, dependency-source update, or remote publication is asserted by
+this snapshot. The Edgion consumer still locks fork `0b0d8bb`; its earlier
+integration results are separate evidence and do not prove consumption of this
+local patch. The broader baseline/publication task remains open.
+
 ## Review gates
 
 - `git diff --check` is clean.

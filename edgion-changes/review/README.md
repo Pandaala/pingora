@@ -36,6 +36,9 @@ The `status` inside each record is authoritative.
 
 ## Implemented or resolved conclusions
 
+- [Empty request-target normalization](http1/empty-request-target-normalization.md):
+  normalize empty and fragment-only header targets explicitly, independently
+  of the linked URI parser's acceptance of an empty component.
 - [Unsupported H1 request transfer coding](http1/h1-unsupported-request-transfer-coding-fail-closed.md):
   generic framing errors close before proxy admission; among core-accepted
   requests, `HttpProxy` accepts only a single `chunked` field and submits every
