@@ -652,6 +652,7 @@ async fn terminate_explicitly_aborts_an_incomplete_selected_response() {
     let port = spawn_incomplete_response_origin().await;
     let before_abort =
         observing::ABORTED_SELECTED_RESPONSES.load(std::sync::atomic::Ordering::SeqCst);
+    let before_done = observing::COMPLETED.load(std::sync::atomic::Ordering::SeqCst);
 
     let mut io = TcpStream::connect(observing::PROXY_ADDR).await.unwrap();
     io.write_all(
@@ -673,6 +674,13 @@ async fn terminate_explicitly_aborts_an_incomplete_selected_response() {
     io.write_all(b"5\r\nhello\r\n").await.unwrap();
 
     let tail = read_until_connection_aborts(&mut io).await;
+    // Socket closure precedes logging. Keep the shared observer lock until the
+    // callback has published every counter, so it cannot finish in the next test.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while observing::COMPLETED.load(std::sync::atomic::Ordering::SeqCst) == before_done {
+        assert!(Instant::now() < deadline, "the exchange never finished");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert!(
         !tail.contains("0\r\n\r\n"),
         "an incomplete selected response must not receive a clean chunked terminator: {tail}"

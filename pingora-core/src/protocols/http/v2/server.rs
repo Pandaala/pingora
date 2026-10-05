@@ -2529,7 +2529,7 @@ mod test {
                 // 1. Check body related methods
                 http.enable_retry_buffering();
                 assert!(http.is_body_empty());
-                assert!(http.is_body_done());
+                assert!(!http.is_body_done());
                 let retry_body = http.get_retry_buffer();
                 assert!(retry_body.is_none());
 

@@ -2300,6 +2300,9 @@ mod tests {
         client_reused: bool,
     ) -> bool {
         let mut session = new_request_session(request, Arc::new(Mutex::new(Vec::new()))).await;
+        session
+            .freeze_request_relay_plan(RequestRelayPlan::ordinary())
+            .unwrap();
         default_policy_would_retry_for_session(&mut session, retry, client_reused)
     }
 
@@ -2310,7 +2313,10 @@ mod tests {
         request.resize(request.len() + body_len, b'a');
 
         let mut session = new_request_session(&request, Arc::new(Mutex::new(Vec::new()))).await;
-        session.enable_retry_buffering();
+        session
+            .freeze_request_relay_plan(RequestRelayPlan::ordinary())
+            .unwrap();
+        session.enable_request_relay_retry_buffer();
         while session.read_request_body().await.unwrap().is_some() {}
         session
     }

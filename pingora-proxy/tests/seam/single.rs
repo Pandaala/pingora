@@ -1245,7 +1245,7 @@ fn trailer_hook_fires_at_most_once_across_retries() {
         // An empty chunked body with trailers: the retry attempt's prelude
         // path is exactly the one that used to re-fire the hook.
         let request = format!(
-            "POST / HTTP/1.1\r\nHost: t\r\nx-port: {port}\r\n\
+            "PUT / HTTP/1.1\r\nHost: t\r\nx-port: {port}\r\n\
              Transfer-Encoding: chunked\r\n\r\n\
              0\r\nx-checksum: ok\r\n\r\n"
         );
