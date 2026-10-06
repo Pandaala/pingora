@@ -72,6 +72,9 @@ use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+#[path = "upstream_response_body_sink/custom_request_contract.rs"]
+mod custom_request_contract;
+
 const ORIGIN_BODY: &[u8] = b"hello world";
 
 /// What every client of a `terminate`-exercising path must see if (and only
@@ -720,7 +723,11 @@ impl BodyWrite for NoopBodyWriter {
                 "scripted custom request-body writer rejection",
             );
         }
-        data.clear();
+        let written = data.split_to(data.len());
+        custom_request_contract::record(
+            self.script.as_deref(),
+            custom_request_contract::Event::Written(written),
+        );
         Ok(())
     }
 
@@ -729,6 +736,10 @@ impl BodyWrite for NoopBodyWriter {
             CUSTOM_DOWNSTREAM_WRITER_FINISHES.fetch_add(1, Ordering::SeqCst);
         }
         self.progress.finished.store(true, Ordering::SeqCst);
+        custom_request_contract::record(
+            self.script.as_deref(),
+            custom_request_contract::Event::Finished,
+        );
         self.progress.changed.notify_one();
         if matches!(
             self.script.as_deref(),
@@ -769,7 +780,14 @@ impl HeaderOnlyCustomSession {
     }
 
     async fn wait_for_scripted_request_body_state(&self) {
+        if custom_request_contract::wait_for_termination(self.request_body_script.as_deref()).await
+        {
+            return;
+        }
         let ready = || match self.request_body_script.as_deref() {
+            Some(script) if custom_request_contract::is_script(script) => {
+                self.request_body_progress.finished.load(Ordering::SeqCst)
+            }
             Some(
                 CUSTOM_EARLY_RESPONSE_SCRIPT
                 | CUSTOM_REJECT_FIRST_WRITE_SCRIPT
@@ -889,6 +907,10 @@ impl CustomSession for HeaderOnlyCustomSession {
             self.upgraded = true;
             self.terminal_upgrade = true;
         }
+        custom_request_contract::record(
+            self.request_body_script.as_deref(),
+            custom_request_contract::Event::HeaderWritten,
+        );
         Ok(())
     }
 
@@ -1064,6 +1086,9 @@ impl ProxyHttp for EmitProxy {
         ctx: &mut Self::CTX,
     ) -> Result<RequestBodyAction> {
         self.request_body_filter(session, body, event, ctx).await?;
+        if custom_request_contract::filter_action(session, body, event).await? {
+            return Ok(RequestBodyAction::Terminate);
+        }
         if event == RequestBodyEvent::Abandoned
             && session.get_header_bytes(CUSTOM_REQUEST_BODY_SCRIPT_HEADER)
                 == CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_SCRIPT.as_bytes()
@@ -1075,6 +1100,14 @@ impl ProxyHttp for EmitProxy {
             return Ok(RequestBodyAction::Terminate);
         }
         Ok(RequestBodyAction::Continue)
+    }
+
+    fn request_relay_plan(
+        &self,
+        session: &Session,
+        _ctx: &Self::CTX,
+    ) -> pingora_proxy::RequestRelayPlan {
+        custom_request_contract::relay_plan(session)
     }
 
     async fn request_body_filter(
@@ -1366,6 +1399,10 @@ impl ProxyHttp for EmitProxy {
         upstream_request: &mut RequestHeader,
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
+        custom_request_contract::record_for_session(
+            session,
+            custom_request_contract::Event::UpstreamReady,
+        );
         if session.req_header().uri.path() == "/custom_pre_write_rejection" {
             return pingora_error::Error::e_explain(
                 pingora_error::ErrorType::InternalError,
@@ -1672,6 +1709,10 @@ impl ProxyHttp for EmitProxy {
             record.error_source = Some(error.esource().clone());
             record.error_text = Some(error.to_string());
         }
+        custom_request_contract::record_for_session(
+            session,
+            custom_request_contract::Event::Logged,
+        );
     }
 }
 
@@ -1682,6 +1723,7 @@ struct ScriptedCustomDownstream {
     read_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
     drain_timeout: Option<Duration>,
+    source_eof_contract: bool,
 }
 
 impl ScriptedCustomDownstream {
@@ -1707,6 +1749,7 @@ impl ScriptedCustomDownstream {
             read_timeout: None,
             write_timeout: None,
             drain_timeout: None,
+            source_eof_contract: false,
         }
     }
 
@@ -1736,7 +1779,28 @@ impl ScriptedCustomDownstream {
             read_timeout: None,
             write_timeout: None,
             drain_timeout: None,
+            source_eof_contract: false,
         }
+    }
+
+    fn source_eof_contract() -> Self {
+        let mut session = Self::early_response();
+        session
+            .request
+            .set_uri(http::Uri::from_static("/contract-source-eof"));
+        session
+            .request
+            .insert_header(http::header::CONTENT_LENGTH, "4")
+            .unwrap();
+        session
+            .request
+            .insert_header(
+                CUSTOM_REQUEST_BODY_SCRIPT_HEADER,
+                custom_request_contract::SOURCE_EOF,
+            )
+            .unwrap();
+        session.source_eof_contract = true;
+        session
     }
 
     fn is_selected_response_writer_rejection(&self) -> bool {
@@ -1768,6 +1832,9 @@ impl CustomServerSession for ScriptedCustomDownstream {
         end: bool,
     ) -> Result<()> {
         self.response = Some(*response);
+        if self.source_eof_contract {
+            return Ok(());
+        }
         if self.is_selected_response_writer_rejection() {
             CUSTOM_SELECTED_RESPONSE_HEAD_WRITTEN.store(true, Ordering::SeqCst);
             CUSTOM_SELECTED_RESPONSE_HEAD_CHANGED.notify_waiters();
@@ -1807,7 +1874,7 @@ impl CustomServerSession for ScriptedCustomDownstream {
                 }
             }
         }
-        if finished {
+        if finished && !self.source_eof_contract {
             CUSTOM_DOWNSTREAM_RESPONSE_DONE.store(true, Ordering::SeqCst);
             CUSTOM_DOWNSTREAM_RESPONSE_CHANGED.notify_waiters();
         }
@@ -1856,6 +1923,12 @@ impl CustomServerSession for ScriptedCustomDownstream {
     }
 
     fn is_body_done(&mut self) -> bool {
+        if self.source_eof_contract && self.body_reads == 2 {
+            custom_request_contract::record(
+                Some(custom_request_contract::SOURCE_EOF),
+                custom_request_contract::Event::ReportedUnfinished,
+            );
+        }
         false
     }
 
@@ -1871,6 +1944,34 @@ impl CustomServerSession for ScriptedCustomDownstream {
     }
 
     async fn read_body_or_idle(&mut self, no_body_expected: bool) -> Result<Option<Bytes>> {
+        if self.source_eof_contract {
+            if no_body_expected {
+                return std::future::pending().await;
+            }
+            self.body_reads += 1;
+            custom_request_contract::record(
+                Some(custom_request_contract::SOURCE_EOF),
+                custom_request_contract::Event::SourceRead,
+            );
+            return match self.body_reads {
+                1 => Ok(Some(Bytes::from_static(b"data"))),
+                2 => {
+                    custom_request_contract::record(
+                        Some(custom_request_contract::SOURCE_EOF),
+                        custom_request_contract::Event::SourceEof,
+                    );
+                    Ok(None)
+                }
+                // Keep a broken pump observable without hot-spinning the worker.
+                _ => {
+                    custom_request_contract::record(
+                        Some(custom_request_contract::SOURCE_EOF),
+                        custom_request_contract::Event::ReadAfterEof,
+                    );
+                    std::future::pending().await
+                }
+            };
+        }
         if self.is_selected_response_writer_rejection() && self.body_reads == 0 {
             while !CUSTOM_SELECTED_RESPONSE_HEAD_WRITTEN.load(Ordering::SeqCst) {
                 CUSTOM_SELECTED_RESPONSE_HEAD_CHANGED.notified().await;
@@ -1961,6 +2062,7 @@ struct Harness {
     custom_proxy_port: u16,
     custom_downstream_proxy_port: u16,
     custom_abort_downstream_proxy_port: u16,
+    custom_source_eof_proxy_port: u16,
 }
 
 impl Harness {
@@ -1987,6 +2089,7 @@ fn start_harness() -> Harness {
     let custom_proxy_port = reserve_port();
     let custom_downstream_proxy_port = reserve_port();
     let custom_abort_downstream_proxy_port = reserve_port();
+    let custom_source_eof_proxy_port = reserve_port();
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
     let cache_proxy_addr = format!("127.0.0.1:{cache_proxy_port}");
     let custom_proxy_addr = format!("127.0.0.1:{custom_proxy_port}");
@@ -1998,6 +2101,8 @@ fn start_harness() -> Harness {
     let custom_listen_addr = custom_proxy_addr.clone();
     let custom_downstream_listen_addr = custom_downstream_proxy_addr.clone();
     let custom_abort_downstream_listen_addr = custom_abort_downstream_proxy_addr.clone();
+    let custom_source_eof_addr = format!("127.0.0.1:{custom_source_eof_proxy_port}");
+    let custom_source_eof_listen_addr = custom_source_eof_addr.clone();
 
     thread::spawn(move || {
         let mut server = Server::new(None).unwrap();
@@ -2107,12 +2212,48 @@ fn start_harness() -> Harness {
         .build();
         custom_abort_downstream_proxy_service.add_tcp(&custom_abort_downstream_listen_addr);
 
+        let source_eof_handler: ProcessCustomSession<EmitProxy, HeaderOnlyCustomConnector> =
+            Arc::new(|proxy, mut stream: Stream, shutdown: &ShutdownWatch| {
+                let shutdown = shutdown.clone();
+                Box::pin(async move {
+                    // Readiness connections close without selecting a scenario.
+                    if stream.read_u8().await.ok() != Some(1) {
+                        return None;
+                    }
+                    proxy
+                        .process_new_http(
+                            ServerSession::new_custom(Box::new(
+                                ScriptedCustomDownstream::source_eof_contract(),
+                            )),
+                            &shutdown,
+                        )
+                        .await;
+                    None
+                })
+            });
+        let mut source_eof_options = pingora_core::apps::HttpServerOptions::default();
+        source_eof_options.force_custom = true;
+        let mut source_eof_service = ProxyServiceBuilder::new(
+            &server.configuration,
+            EmitProxy {
+                origin_port,
+                custom: true,
+                cache: false,
+                terminate_once_fired: AtomicBool::new(false),
+            },
+        )
+        .custom(HeaderOnlyCustomConnector, source_eof_handler)
+        .server_options(source_eof_options)
+        .build();
+        source_eof_service.add_tcp(&custom_source_eof_listen_addr);
+
         let services: Vec<Box<dyn ServiceWithDependents>> = vec![
             Box::new(proxy_service),
             Box::new(cache_proxy_service),
             Box::new(custom_proxy_service),
             Box::new(custom_downstream_proxy_service),
             Box::new(custom_abort_downstream_proxy_service),
+            Box::new(source_eof_service),
         ];
         server.add_services(services);
         server.run_forever();
@@ -2126,6 +2267,7 @@ fn start_harness() -> Harness {
         &custom_proxy_addr,
         &custom_downstream_proxy_addr,
         &custom_abort_downstream_proxy_addr,
+        &custom_source_eof_addr,
     ] {
         loop {
             if std::net::TcpStream::connect(addr).is_ok() {
@@ -2145,6 +2287,7 @@ fn start_harness() -> Harness {
         custom_proxy_port,
         custom_downstream_proxy_port,
         custom_abort_downstream_proxy_port,
+        custom_source_eof_proxy_port,
     }
 }
 

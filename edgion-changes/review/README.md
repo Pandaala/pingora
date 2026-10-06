@@ -82,6 +82,8 @@ The `status` inside each record is authoritative.
 - [Custom writer error context](custom/custom-writer-error-context.md): preserve
   the first upstream writer root cause before asynchronous abandonment and
   joined-future teardown can replace it.
+- [Custom request contract coverage](custom/custom-request-contract-coverage.md):
+  actual-pump termination, framing rejection and stale source EOF tests.
 - [Negative-test observation](testing/negative-tests-need-out-of-band-observation.md):
   failure-path negative assertions need out-of-band evidence and a positive
   control.

@@ -1051,27 +1051,16 @@ fn streamed_fails_before_write_when_upstream_filter_synthesizes_connect() {
 /// the WIRING -- a pump consulting the coercion at all, with correctly
 /// collected facts, for a real CONNECT request.
 ///
-/// One cell (H2c downstream -> H2 upstream), not the matrix, because no other
-/// cell is constructible in this fork:
-/// - H1 downstream: an authority-form request-target needs the
-///   `patched_http1` feature, which does not compile here (it requires a
-///   patched httparse this workspace does not carry); without it the parse
-///   rejects the request line (400 from `set_raw_path`).
-/// - H1 upstream: `http_req_header_to_wire` serializes `raw_path()`, which
-///   panics on an authority-form URI (no path-and-query, no raw-path
-///   fallback), so CONNECT-to-an-H1-peer cannot even be driven.
-///
-/// Consequently the H1-specific hazard the coercion also guards (re-framing
-/// the tunnel as `Transfer-Encoding: chunked`) is unreachable end-to-end in
-/// this fork and stays pinned by the truth table alone. `Streamed` is not
-/// separately driven either: on the H2 pump its honored rewrite is
-/// wire-identical to the coerced `Ordinary` for a bare CONNECT, so no
-/// end-to-end assertion could discriminate it.
+/// Historical reachability correction: this test originally claimed that H1
+/// authority parsing and serialization were unavailable. Both now work without
+/// patched_http1; `super::connect` covers H1 request framing directly. A frozen
+/// Streamed plan also fails before upstream headers for CONNECT, rather than
+/// relying on wire-identical H2 coercion. That rejection is covered separately.
 ///
 /// Edgion cannot reach this path at all -- Gateway API has no CONNECT route
 /// type -- which is exactly why the guard is pinned here in the fork
-/// (`tasks/todo/important_test/03-fork-layer-coverage-for-unreachable-paths.md`
-/// in the Edgion repository).
+/// See `edgion-changes/review/custom/custom-request-contract-coverage.md` for
+/// the completed coverage task and its remaining protocol boundaries.
 #[test]
 fn bodyless_does_not_half_close_a_connect_tunnel() {
     let ports = init();

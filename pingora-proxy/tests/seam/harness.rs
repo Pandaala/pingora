@@ -904,28 +904,19 @@ fn start_seam_server() -> SeamPorts {
         server.bootstrap();
 
         let mut h1 = pingora_proxy::http_proxy_service(&conf, SeamProxy {});
+        let mut h1_opts = pingora_core::apps::HttpServerOptions::default();
+        h1_opts.allow_connect_method_proxying = true;
+        h1.app_logic_mut().unwrap().server_options = Some(h1_opts);
         h1.add_tcp(&h1_addr);
 
         let mut h2c = pingora_proxy::http_proxy_service(&conf, SeamProxy {});
         let logic = h2c.app_logic_mut().unwrap();
         let mut opts = pingora_core::apps::HttpServerOptions::default();
         opts.h2c = true;
-        // CONNECT is 405-rejected unless the application opts in (the guard
-        // in `lib.rs`), and this listener is the only one where a CONNECT
-        // request is constructible at all: plain H2 CONNECT parses
-        // featurelessly, while an H1 authority-form request line needs the
-        // `patched_http1` feature, which does not compile in this fork (it
-        // requires a patched httparse this workspace does not carry). Opting
-        // in lets the CONNECT half of the disposition coercion
-        // (`safe_disposition`, `is_connect`) be pinned end-to-end.
-        //
-        // Setting it for the whole listener, for one test's benefit, is safe
-        // and this is the proof rather than the belief: the field is read at
-        // exactly one place in the workspace, `pingora-proxy/src/lib.rs:266`
-        // (`grep -rn allow_connect_method_proxying`), and that read is
-        // `&&`-joined with `req_header().method == Method::CONNECT`. A
-        // non-CONNECT request therefore takes the same branch either way --
-        // there is no other consumer to scope it away from.
+        // Both test listeners opt into CONNECT. Authority-form H1 parsing
+        // and serialization now work without patched_http1; the old H2-only
+        // reachability claim was disproved by the current parser/wire tests.
+        // The option only changes CONNECT admission for these test services.
         opts.allow_connect_method_proxying = true;
         logic.server_options = Some(opts);
         h2c.add_tcp(&h2c_addr);

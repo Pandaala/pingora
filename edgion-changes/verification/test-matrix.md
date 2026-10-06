@@ -55,10 +55,10 @@ Expected feature coverage:
 | `pingora-core --lib` | body buffers, H1/H2 sessions, END_STREAM watch, listener and PROXY parser |
 | `pingora-core --lib --features boringssl` | complete TLS-backed core suite, including deterministic direct/high-level local source-bind classification and timeout-context separation |
 | `pingora-core --lib --features boringssl test_listen_tls_proxy_protocol` | explicit PROXY-before-TLS rejection stages, successful handshake and address preservation |
-| `pingora-proxy --lib` | 198 passed plus 2 ignored manual benchmarks: request relay, response-head barrier/pipeline, H1/H2 lifecycle, cache hooks, sink decisions/budgets, terminal latch, EOS migration, and retry guards |
-| `test_request_body_seam` | 61 H1/H2 request-pump, framing, retry, transfer-coding admission and termination scenarios |
-| `test_upstream_response_body_sink` | 58 response streaming/cache/custom scenarios |
-| `test_terminal_body_dispatch` | 28 self-contained terminal/trailer and real H1/H2 response-head Hold scenarios |
+| `pingora-proxy --lib` | 228 passed plus 2 ignored manual benchmarks: request relay, response-head barrier/pipeline, H1/H2 lifecycle, cache hooks, sink decisions/budgets, terminal latch, EOS migration, and retry guards |
+| `test_request_body_seam` | 67 H1/H2 request-pump, CONNECT framing/rejection, retry, transfer-coding admission and termination scenarios |
+| `test_upstream_response_body_sink` | 62 response streaming/cache/custom scenarios |
+| `test_terminal_body_dispatch` | 32 self-contained terminal/trailer and real H1/H2 response-head Hold scenarios |
 | `test_h2_upstream_no_error_reset` | 10 self-contained H2 reset/completion and selected-response termination scenarios |
 | `test_h2_upstream_stalled_after_response` | 4 H2 request-body stall, configured-deadline, default-floor and END_STREAM discrimination scenarios |
 | `test_h2_upstream_cache_and_reuse` | 8 H2 cache-admission, upstream-connection-reuse, stalled-write cleanup and peer-window-handshake scenarios |
@@ -570,3 +570,46 @@ local patch. The broader baseline/publication task remains open.
   SHAs.
 - A rebase/merge-tree preview against the target main is reviewed before the
   branch is moved.
+
+## 2026-10-06 custom request coverage
+
+Baseline: Pingora `bd08429` with local uncommitted test/knowledge changes.
+Edgion verification began at `8169e4a2e`; concurrent agents subsequently moved
+its HEAD to `fc66b577e` and edited health-check and other unrelated files.
+Those changes and the unrelated untracked health-check task were preserved.
+The fork results below apply to the recorded fork tree; consumer command
+results are separate observations of a concurrently changing Edgion checkout,
+not verification of one frozen Edgion tree.
+Edgion still selects `edgion_0.9.0_v1` and locks `0b0d8bb`; no dependency update
+or publication is included in these results.
+
+- Fork formatting, `cargo check -p pingora-proxy --all-targets` and
+  `cargo clippy -p pingora-proxy --all-targets` passed. Clippy retains existing
+  warnings in unchanged test/example code.
+- `cargo test -p pingora-proxy --lib`: 228 passed, 2 ignored manual benchmarks.
+- `test_request_body_seam`: 67 passed, including the existing H2 CONNECT case
+  and new H1 no-length/Content-Length/chunked framing and rejection cases.
+- `test_upstream_response_body_sink`: 62 passed, including the four new custom
+  request contract cases, both serially and with normal test concurrency.
+- `test_terminal_body_dispatch`: 32 passed.
+- The six new tests each passed 10 isolated process invocations with
+  `--exact --test-threads=1`. Eight condition/forwarding/observer mutations failed
+  as expected and were restored in a detached worktree with a separate build
+  directory. See the [custom request coverage record](../review/custom/custom-request-contract-coverage.md).
+
+The first concurrent seam run failed 3 cases under this macOS shell's soft
+file-descriptor limit of 256, including an explicit `Too many open files`.
+Repeating with `ulimit -n 4096` passed all 65; this changes the invoking process's
+limit only. An intermediate response/custom run also failed 3 new cases because
+an isolated mutation build had overwritten its shared target's test executable.
+After separating build directories and rebuilding the normal package, both
+serial and concurrent 62-case runs passed. Neither failed attempt counts as a
+pass, and neither required weakening a test assertion.
+
+Independent Astra review required two corrections before closure: force and
+handle legal H1 payload fragmentation instead of matching whole callbacks, and
+revalidate the obsolete H1 CONNECT reachability and Streamed wire-equivalence
+claims. The final isolation/mutation counts above include both corrections.
+
+These are targeted fork verification results, not a fresh complete core/TLS
+matrix or Edgion `cargo test --all` run.

@@ -18,6 +18,7 @@
 //! duplication and the blind spots, and keeps the whole thing a
 //! seconds-not-minutes regression to run after a rebase onto upstream Pingora.
 
+pub mod connect;
 pub mod harness;
 pub mod scenarios;
 pub mod single;
