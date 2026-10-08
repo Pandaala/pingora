@@ -98,6 +98,53 @@ not raise this workspace's Rust 1.85 MSRV.
 
 ## Historical validation snapshots
 
+### 2026-10-06 H2 payload-state consolidation
+
+Baseline Pingora HEAD: `e18250efb07a66439d04f0e03df73c3364c23af3`.
+Edgion HEAD at analysis: `2ddb2ec4bc9bd7b473c39ddc64ace4ce8a5dc2d6`;
+its lock still selects Pingora `0b0d8bba9609655bfd7db0fe0add6818bc0ee937`
+and h2 0.4.19. No consumer manifest/lockfile change or deployed adoption is
+claimed. The minimum and current local h2 resolution are the same 0.4.19
+boundary, not two separately tested dependency versions.
+
+Tests/checks below ran on a disposable archive of baseline HEAD overlaid with
+the three candidate scanner/test files and the original local Cargo.lock.
+The scanner source matched the live candidate byte-for-byte (SHA-256 recorded
+in the owning review record). Because this macOS host lacks the `127.0.0.2`
+alias, only the disposable integration fixture changed its configured source
+bind to `127.0.0.1`. The actual fixture and host interface were not modified.
+
+- Default focused H2 core: 146 passed, 16 ignored.
+- BoringSSL plus connection-filter focused H2 core: 146 passed, 16 ignored.
+- Proxy library: 228 passed, two ignored manual benchmarks.
+- H2 cache/reuse integration: eight passed; reset integration: ten passed;
+  stalled-upload integration: four passed.
+- Core/proxy all-target compile check, BoringSSL/connection-filter all-target
+  core check, and core/proxy all-target Clippy passed. Existing unrelated
+  Clippy warnings remain; no `-D warnings` claim is made.
+- Live Pingora formatting and `git diff --check` passed. Edgion agent-doc
+  consistency passed after adding the spec/task pointers.
+- Original 62 watcher test identities and their ignore markers are retained;
+  three tests were added. Twelve independent guard mutations failed their
+  targeted assertions, and the pristine isolated candidate was restored and
+  rerun before the full matrix.
+- Release old/new scanner measurements ran in the real checkout, alternating
+  sample order and repeating the same immutable candidate. Both production
+  and test layouts are 136 to 96 bytes. Workload definitions, results, the
+  small terminal-padded/GOAWAY costs, and throughput limits are in
+  [the payload-state review](../review/h2-grpc/h2-payload-state-consolidation.md).
+- A fresh independent Astra final review approved with no must-fix finding;
+  its newly executed watcher suite passed 57 tests with eight original ignores.
+
+Reproduce the focused suites with the commands in the self-contained checks
+above, filtering the core library to `protocols::http::v2::`; add
+`--features "boringssl connection_filter"` for its feature leg. Compile/lint
+used `-p pingora-core -p pingora-proxy --all-targets`; the BoringSSL core check
+used `-p pingora-core --features "boringssl connection_filter" --all-targets`.
+On macOS, satisfy the documented bind prerequisite or use an explicitly
+recorded disposable fixture overlay as above. This snapshot does not close
+the ignored upstream decoder/trailer contracts or the full watcher-removal task.
+
 ### 2026-09-02 `edgion_v4` history reconstruction
 
 The official fetched `upstream/main` remained
@@ -613,3 +660,72 @@ claims. The final isolation/mutation counts above include both corrections.
 
 These are targeted fork verification results, not a fresh complete core/TLS
 matrix or Edgion `cargo test --all` run.
+
+## 2026-10-08 Edgion integration repair candidate
+
+Baseline: published fork `e18250e` plus uncommitted H1 bounded-close draining,
+H2 native replay arbitration and focused regression changes. The isolated
+Edgion consumer is `208a6bdc4` plus its integration-repair changes; its candidate
+manifest uses the local fork only for verification. The formal consumer still
+locks `0b0d8bb`. Both candidates retain h2 0.4.19. No publication or formal
+dependency change is included.
+
+Fresh commands and results:
+
+- `cargo test -p pingora-proxy --lib`: 229 passed, 2 existing ignored benchmarks.
+- `cargo test -p pingora-proxy --test test_request_body_seam --test test_terminal_body_dispatch --test test_upstream_response_body_sink`:
+  68, 32 and 62 passed. The extra seam test forces refusal during native replay
+  with zero initial stream credit and a separate six-attempt proxy listener.
+- `cargo test -p pingora-proxy --test test_h2_upstream_no_error_reset --test test_h2_upstream_stalled_after_response --test test_h2_upstream_cache_and_reuse`:
+  10, 4 and 8 passed.
+- Formatting and proxy all-target Clippy passed, with existing warnings.
+- The isolated Edgion Gateway passes all 169 Transport cases on the corrected
+  candidate, including POST protocol-refusal ceilings and ambiguous retry
+  negative controls. Root manifest and lockfile are unchanged.
+
+The H1 drain regression fails without its finalizer correction. The native
+replay regression fails after two refused attempts on the original prelude and
+passes with four refusals followed by the accepted fifth attempt; only the
+accepted attempt receives the body. Both mutations were restored before the
+final passing suites. One earlier sink run failed with `IncompleteMessage` in
+`terminate_mid_batch_drops_only_the_leaked_tasks`; the focused rerun and final
+complete 62-case sink run passed. The failed run is not counted as a pass.
+
+An earlier default consumer sweep had one Redis L4 idle-connection fixture
+failure. After explicit Redis member readiness, idempotent static DIU setup
+and correction of a temporary certificate-directory mismatch, the final default
+sweep completed with 275 checks: 266 passed, zero failed and nine existing skips.
+All Transport, transcoder and original dynamic failure groups passed.
+Publication remains pending. These commands do not establish a fresh complete
+core/TLS matrix or Edgion `cargo test --all` result.
+
+## 2026-10-08 transfer to the owner's ws3 checkout
+
+Applied the integration-repair production/test changes to
+`/Volumes/ExtStore/ws3/pingora` at `e18250e`, preserving all pre-existing work,
+including the uncommitted H2 payload-state consolidation. Existing tracked and
+untracked files were backed up before applying the patch; the two overlapping
+knowledge pages retained their original contents and received appended sections.
+
+Fresh verification of this combined working tree, with h2 0.4.19 and the
+checkout's existing lockfile:
+
+- `cargo test -p pingora-proxy --lib --test test_request_body_seam --test test_terminal_body_dispatch --test test_upstream_response_body_sink --test test_h2_upstream_no_error_reset --test test_h2_upstream_stalled_after_response --test test_h2_upstream_cache_and_reuse`:
+  229 unit tests and 184 integration tests passed, zero failures, two existing
+  ignored benchmarks.
+- `cargo test -p pingora-core --lib end_stream_watch`: 57 passed, zero failures,
+  eight existing ignored cases. The existing consolidation's differential
+  oracle and layout tests passed too.
+- `cargo fmt --all -- --check` and
+  `cargo clippy -p pingora-proxy --all-targets` passed; existing Clippy warnings
+  remain.
+
+Logs are `/tmp/edgion-pingora-ws3-transferred-tests.log`,
+`/tmp/edgion-pingora-ws3-watch-tests.log`,
+`/tmp/edgion-pingora-ws3-fmt.log`, and
+`/tmp/edgion-pingora-ws3-clippy.log`. The 266-pass default Edgion sweep above
+used the isolated ws4 candidate before this transfer; it is not a new full
+consumer sweep of the combined ws3 checkout. The sibling ws3 Edgion checkout
+is `75a5363f5` and also locks `0b0d8bb`; the tested ws4 consumer is `208a6bdc4`
+plus its integration-repair changes. Neither consumer manifest/lockfile was
+changed by this transfer. No commit or push is included.

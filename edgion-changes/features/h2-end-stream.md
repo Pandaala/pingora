@@ -140,6 +140,14 @@ frame-order handoff recorded beside the watcher.
 
 ## Implementation concentration
 
+The scanner keeps one `PayloadState` for the currently skipped frame: ordinary
+payload, pending Pad Length, terminal DATA, or GOAWAY id collection. These actions
+are mutually exclusive. Terminal DATA still waits for the full declared payload,
+including padding; GOAWAY still waits for its complete payload before applying
+the ceiling. Nonterminal DATA count timing and every shared-record guard remain
+unchanged. The test-only frozen scanner provides a differential oracle for this
+representation refactor; it is never compiled into production.
+
 - `pingora-core/src/protocols/http/v2/end_stream_watch.rs`.
 - `pingora-core/src/connectors/http/v2.rs` wires the watch around production IO.
 - `pingora-core/src/protocols/http/v2/client.rs` registers stream ids and

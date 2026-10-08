@@ -1670,3 +1670,50 @@ fn streamed_does_not_close_the_upstream_stream_for_a_cl0_request() {
         );
     });
 }
+
+/// Zero initial credit makes every upload wait for the remote refusal. The
+/// second attempt uses the native replay prelude, which must preserve the
+/// response reader's REFUSED_STREAM proof instead of its send-half error.
+#[test]
+fn refused_stream_during_native_replay_keeps_protocol_retry_evidence() {
+    let ports = init();
+    let upstream = spawn_scripted_h2_upstream_with_window(
+        vec![
+            H2UpstreamStep::RefusedStream,
+            H2UpstreamStep::RefusedStream,
+            H2UpstreamStep::RefusedStream,
+            H2UpstreamStep::RefusedStream,
+            H2UpstreamStep::EchoRequestEos,
+        ],
+        0,
+    );
+    let (port, rec) = (upstream.port(), upstream.rec());
+    RT.block_on(async {
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            reqwest::Client::new()
+                .put(format!("http://{}/", ports.retry_h1_addr()))
+                .header("x-port", port.to_string())
+                .header("x-h2", "1")
+                .body(vec![b'x'; 32])
+                .send(),
+        )
+        .await
+        .expect("remote refusal must not hang")
+        .unwrap();
+        assert_eq!(response.status(), 200, "{}", rec.dump());
+        assert_eq!(response.bytes().await.unwrap().as_ref(), b"ok");
+    });
+    assert_eq!(
+        rec.count(|e| matches!(e, UpEvent::ReqHeaders { .. })),
+        5,
+        "{}",
+        rec.dump()
+    );
+    assert_eq!(
+        rec.body_bytes(),
+        32,
+        "only the accepted attempt receives the body: {}",
+        rec.dump()
+    );
+}

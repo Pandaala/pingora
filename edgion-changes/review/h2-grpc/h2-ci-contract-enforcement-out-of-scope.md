@@ -138,7 +138,7 @@ Re-open this decision only if:
 
 - H2-009, whole-change H2 audit 2026-08-26; closed `wont-fix` at the review
   layer 2026-08-28 on the CI/CD scope rule. Source issue:
-  `../Edgion/tasks/todo/pingora-h2-end-stream-watch-simplification/issues/H2-009-ci-security-contract-enforcement.md`.
+  `../Edgion/tasks/block/pingora-h2-end-stream-watch-simplification.md`.
 - Blocking dependencies: H2-001 (h2 trailer decoder rejection, deferred pending
   upstream) and H2-004 (trailer API terminal-error latch, blocked by H2-001).
 - Fork-side state: `edgion-changes/verification/test-matrix.md` (manual

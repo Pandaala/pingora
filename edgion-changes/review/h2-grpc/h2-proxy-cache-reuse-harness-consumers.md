@@ -194,7 +194,7 @@ Re-open this decision only if:
 ## Reference Cases
 
 - H2-012, whole-change H2 audit 2026-08-26; closed `fixed` 2026-08-28. Source
-  issue: `../Edgion/tasks/todo/pingora-h2-end-stream-watch-simplification/issues/H2-012-proxy-harness-end-to-end-coverage.md`.
+  issue: `../Edgion/tasks/block/pingora-h2-end-stream-watch-simplification.md`.
 - Fork-side change: `pingora-proxy/tests/test_h2_upstream_cache_and_reuse.rs`
   (new target) and `edgion-changes/verification/test-matrix.md` (target list), branch
   `edgion_v3`.

@@ -148,6 +148,6 @@ for the sibling read-terminal contract.
 
 ## Reference cases
 
-- `../Edgion/tasks/todo/pingora-h2-end-stream-watch-simplification/issues/H2-005-goaway-persistent-poison.md`
+- `../Edgion/tasks/block/pingora-h2-end-stream-watch-simplification.md`
 - `edgion-changes/features/h2-end-stream.md` — "GOAWAY eligibility"
 - [h2-end-stream-observer-read-terminal-poison.md](h2-end-stream-observer-read-terminal-poison.md) (H2-002)

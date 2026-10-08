@@ -71,6 +71,22 @@ The durable ownership, baseline, Envoy comparison, Edgion consumer review, and
 upstream revisit trigger are recorded in
 [`h1-unsupported-request-transfer-coding-fail-closed.md`](../review/http1/h1-unsupported-request-transfer-coding-fail-closed.md).
 
+## Bounded H1 close after upload abandonment
+
+An H2 origin may finish its response while withholding request flow-control
+capacity. When the writer abandons that upload, the pump installs a bounded
+request-body drain. If early response framing has already disabled H1
+keepalive, the successful response still needs that drain before socket close;
+otherwise unread upload bytes can cause a TCP reset that discards the response.
+The shared pump finalizer handles this case even when the application callback
+returns `Continue`. It also retains selected-response termination cleanup.
+Neither case returns the abandoned H1 connection for reuse.
+
+This cleanup requires successful response delivery, an H1 downstream, and the
+explicit bounded-drain policy. Failed exchanges, H2/custom downstream ownership,
+ordinary reusable requests, and unbounded application close policies are
+unchanged. The existing configured drain deadline takes precedence.
+
 ## Event model
 
 `RequestBodyEvent` replaces a bare end-of-stream boolean:
@@ -186,6 +202,13 @@ settling the failed current AI predispatch reservation.
   return never manufactures a second terminal event.
 - H1 downstream connections with unread body state are not reused. H2 keeps
   the connection and ends only the affected stream.
+- An H2 native-replay write that fails because the upstream send half closed
+  still lets the response reader classify the peer's terminal result, as the
+  live upload path does. A send-half error grants no retry by itself; only real
+  header-time protocol evidence such as remote `REFUSED_STREAM` can do so.
+  Write deadlines, downstream failures, application errors and `Bodyless`
+  violations still fail immediately. See the
+  [native replay refusal evidence](../review/h2-grpc/h2-native-replay-refusal-evidence.md).
 - A final response already committed downstream disables retries even when an
   error would otherwise be retryable. The frozen replay policy and current
   backing readiness are applied at the same final retry gate, and a veto is

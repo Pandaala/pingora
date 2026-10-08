@@ -19,9 +19,8 @@ use super::*;
 use crate::proxy_cache::ServeFromCache;
 use crate::proxy_common::*;
 use crate::pump_termination::{
-    abort_selected_response, downstream_body_read_is_futile,
-    finalize_preserved_response_downstream_reuse, finish_terminated_response,
-    join_bidirectional_pumps, release_cache_on_terminate,
+    abort_selected_response, downstream_body_read_is_futile, finalize_response_downstream_reuse,
+    finish_terminated_response, join_bidirectional_pumps, release_cache_on_terminate,
     warn_response_body_terminate_content_length_leak,
     warn_response_body_terminate_without_response, warn_terminate_without_response,
     DownstreamRequestOutcome, DuplexPumpOutcome,
@@ -1206,8 +1205,7 @@ where
                 }
             }
         }
-        reuse_downstream =
-            finalize_preserved_response_downstream_reuse(session, reuse_downstream).await;
+        reuse_downstream = finalize_response_downstream_reuse(session, reuse_downstream).await;
         // Signal the upstream half that the downstream half completed cleanly before
         // dropping rx, so a resulting task-pipe closure is treated as benign.
         pipe_state.store(PipeState::DownstreamComplete as u8, Ordering::Release);

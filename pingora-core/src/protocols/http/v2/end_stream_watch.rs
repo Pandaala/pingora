@@ -591,17 +591,9 @@ struct FrameScanner {
     header: [u8; FRAME_HEADER_LEN],
     header_len: usize,
     payload_left: usize,
-    /// Set while the payload of a GOAWAY frame is being skipped, to collect its
-    /// `last_stream_id` (the first 4 payload bytes).
-    goaway: Option<LastStreamId>,
-    /// Set while a PADDED DATA frame's payload is being skipped, until its Pad
-    /// Length field -- the first payload byte -- has been read. Only then is
-    /// the frame's application payload size known.
-    padded_data: Option<PaddedData>,
-    /// A DATA END_STREAM whose header has been parsed but whose payload has not
-    /// yet arrived in full. h2 cannot consume the frame before then, so neither
-    /// may the observer publish it.
-    terminal_data: Option<TerminalData>,
+    /// Only one frame payload can be in progress. Its action is consumed once
+    /// at the complete-payload boundary, or discarded when the watch poisons.
+    payload: PayloadState,
     /// The last two live streams resolved for non-terminal DATA frames. H2
     /// stream ids are never reused on a connection, so repeated frames for a
     /// cached id can update its record without consulting the shared map.
@@ -636,28 +628,29 @@ struct CachedRecord {
     record: Arc<StreamRecord>,
 }
 
-/// A PADDED DATA frame whose Pad Length field has not been seen yet.
-#[derive(Debug, Clone, Copy)]
-struct PaddedData {
-    stream_id: u32,
-    /// The frame's whole payload length, Pad Length field and padding
-    /// included.
-    payload_len: usize,
-    /// Whether the frame also carried END_STREAM. Deferred with the rest: the
-    /// byte count must land BEFORE the flag, because setting the flag evicts
-    /// the entry the count is kept in.
-    end_stream: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TerminalData {
-    stream_id: u32,
-    payload_bytes: usize,
+#[derive(Debug, Default, Clone, Copy)]
+enum PayloadState {
+    #[default]
+    Skip,
+    /// Awaiting the first payload byte, which determines the DATA byte count.
+    PaddedData {
+        stream_id: u32,
+        payload_len: usize,
+        end_stream: bool,
+    },
+    /// Publication must wait for all payload bytes, including padding, so h2
+    /// can consume the complete frame before its END_STREAM is trusted.
+    TerminalData {
+        stream_id: u32,
+        payload_bytes: usize,
+    },
+    /// Collect the id first, but apply it only after the whole payload arrives.
+    Goaway(LastStreamId),
 }
 
 /// The `last_stream_id` field of a GOAWAY frame, collected across however many
 /// reads its payload happens to be split over.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 struct LastStreamId {
     buf: [u8; 4],
     len: usize,
@@ -683,9 +676,7 @@ impl FrameScanner {
     fn has_partial_frame(&self) -> bool {
         self.header_len != 0
             || self.payload_left != 0
-            || self.goaway.is_some()
-            || self.padded_data.is_some()
-            || self.terminal_data.is_some()
+            || !matches!(self.payload, PayloadState::Skip)
     }
 
     fn poison(&mut self, watch: &EndStreamWatch) {
@@ -700,9 +691,7 @@ impl FrameScanner {
     fn reset_after_poison(&mut self, watch: &EndStreamWatch) {
         self.header_len = 0;
         self.payload_left = 0;
-        self.goaway = None;
-        self.padded_data = None;
-        self.terminal_data = None;
+        self.payload = PayloadState::Skip;
         self.data_records = [None, None];
         self.forget_generation = watch.forget_generation.load(Ordering::Acquire);
     }
@@ -828,33 +817,38 @@ impl FrameScanner {
         while !bytes.is_empty() {
             if self.payload_left > 0 {
                 let skip = self.payload_left.min(bytes.len());
-                if let Some(goaway) = self.goaway.as_mut() {
+                if let PayloadState::Goaway(goaway) = &mut self.payload {
                     goaway.feed(&bytes[..skip]);
                 }
-                if let Some(padded) = self.padded_data.take() {
-                    // The Pad Length field is the FIRST payload byte, and this
-                    // branch only runs with at least one payload byte in hand
-                    // (`bytes` is non-empty and `payload_left > 0`).
-                    let pad_len = usize::from(bytes[0]);
-                    // A Pad Length that does not fit is a connection error in
-                    // `h2` (it never delivers the frame), so saturating to zero
-                    // is both safe and the conservative direction: undercounting
-                    // makes the record fail the equality check, never pass it.
-                    let data_len = padded.payload_len.saturating_sub(1 + pad_len);
-                    if padded.end_stream {
-                        self.terminal_data = Some(TerminalData {
-                            stream_id: padded.stream_id,
+                if let PayloadState::PaddedData {
+                    stream_id,
+                    payload_len,
+                    end_stream,
+                } = self.payload
+                {
+                    // The first payload byte is the Pad Length. Preserve the
+                    // conservative count for malformed padding; h2 validates it.
+                    let data_len = payload_len.saturating_sub(1 + usize::from(bytes[0]));
+                    self.payload = PayloadState::Skip;
+                    if end_stream {
+                        self.payload = PayloadState::TerminalData {
+                            stream_id,
                             payload_bytes: data_len,
-                        });
+                        };
                     } else {
-                        self.note_data(padded.stream_id, data_len, watch);
+                        self.note_data(stream_id, data_len, watch);
                     }
                 }
                 self.payload_left -= skip;
                 bytes = &bytes[skip..];
                 if self.payload_left == 0 {
-                    if let Some(terminal) = self.terminal_data.take() {
-                        self.publish_end_stream(terminal.stream_id, terminal.payload_bytes, watch);
+                    if let PayloadState::TerminalData {
+                        stream_id,
+                        payload_bytes,
+                    } = self.payload
+                    {
+                        self.payload = PayloadState::Skip;
+                        self.publish_end_stream(stream_id, payload_bytes, watch);
                     }
                     if !self.finish_goaway(watch) {
                         return;
@@ -899,11 +893,11 @@ impl FrameScanner {
                         if self.payload_left > 0 {
                             // Both the byte count and the flag have to wait for
                             // the Pad Length field in the payload.
-                            self.padded_data = Some(PaddedData {
+                            self.payload = PayloadState::PaddedData {
                                 stream_id,
                                 payload_len: self.payload_left,
                                 end_stream,
-                            });
+                            };
                         }
                         // A PADDED DATA frame with a zero-length payload is
                         // malformed: the Pad Length octet is missing, so `h2`
@@ -914,10 +908,10 @@ impl FrameScanner {
                         // `publish_end_stream`.
                     } else {
                         if end_stream && self.payload_left != 0 {
-                            self.terminal_data = Some(TerminalData {
+                            self.payload = PayloadState::TerminalData {
                                 stream_id,
                                 payload_bytes: self.payload_left,
-                            });
+                            };
                         } else {
                             self.note_data_frame(stream_id, self.payload_left, end_stream, watch);
                         }
@@ -950,7 +944,7 @@ impl FrameScanner {
                         self.poison(watch);
                         return;
                     }
-                    self.goaway = Some(LastStreamId::default());
+                    self.payload = PayloadState::Goaway(LastStreamId::default());
                 }
                 _ => {}
             }
@@ -967,9 +961,10 @@ impl FrameScanner {
     /// poisoned, meaning the caller must stop scanning.
     #[must_use]
     fn finish_goaway(&mut self, watch: &EndStreamWatch) -> bool {
-        let Some(goaway) = self.goaway.take() else {
+        let PayloadState::Goaway(goaway) = self.payload else {
             return true;
         };
+        self.payload = PayloadState::Skip;
         let Some(last_stream_id) = goaway.get() else {
             // Unreachable: a declared payload shorter than eight octets was
             // already rejected at the frame header, and a payload that never
@@ -1074,6 +1069,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for EndStreamWatchStream<S> {
         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
+
+#[cfg(test)]
+#[path = "end_stream_watch_reference.rs"]
+mod reference;
 
 #[cfg(test)]
 #[path = "end_stream_watch_tests.rs"]

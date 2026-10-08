@@ -153,7 +153,7 @@ Re-open this decision only if:
 ## Reference cases
 
 - H2 whole-change audit 2026-08-26, issue H2-007
-  (`../Edgion/tasks/todo/pingora-h2-end-stream-watch-simplification/issues/`).
+  (`../Edgion/tasks/block/pingora-h2-end-stream-watch-simplification.md`).
 - `pingora-proxy/src/proxy_h2_request_body.rs` — `UPSTREAM_STALL_PROBE_INTERVAL`,
   `write_upstream_body_watching_stall`, `upstream_write_stalled_after_response`,
   `upstream_write_error_outcome`.
@@ -163,3 +163,54 @@ Re-open this decision only if:
 - Related: [h2-local-reset-invalidates-shared-evidence.md](h2-local-reset-invalidates-shared-evidence.md),
   [abandoned-request-body-terminal-event.md](../../../../Edgion/skills/04-review/h2-grpc/abandoned-request-body-terminal-event.md),
   [timeout-honored.md](../../../../Edgion/skills/04-review/h2-grpc/timeout-honored.md).
+
+## H1 downstream close follow-up (2026-10-08)
+
+The Edgion locked `0b0d8bb` consumer with `h2` 0.4.19 reproduced incomplete
+responses in the H1-to-H2 stall and stall-reuse integration cases. Early response
+headers disabled H1 keepalive; `bound_undrained_downstream_body` installed a
+finite drain, but core reuse skipped it because the socket was non-reusable.
+The shared response finalizer now drains this explicitly bounded successful H1
+close even when `Abandoned` returns `Continue`, then denies reuse.
+
+The focused drain regression fails on the original finalizer and passes on the
+candidate. With `h2` 0.4.19, all 229 enabled proxy unit tests and all 14 selected
+stall/reset protocol tests pass on published `e18250e` plus the candidate. Two
+existing proxy unit tests remain ignored. Edgion's isolated candidate Gateway
+passes all 169 HTTPRoute/Transport cases. The canonical Edgion lockfile remains
+unchanged. The final default candidate integration sweep passed 266 checks
+with zero failures and nine existing skips; publication remains pending.
+
+### Git provenance and missed cleanup branch
+
+The current fork stack carries successful stall abandonment in body-relay
+commit `5a6d22b` (authored 2026-09-02, committed 2026-09-25). Its historical
+source is `0dc2714` (2026-08-27): that correction allows a stalled upload to
+stop after qualified response END_STREAM, preserving the response instead of
+failing or waiting forever. Its parent does not accept this stalled-write
+success shape. The historical commit is on the preserved pre-rebuild stack,
+not an ancestor of the current rewritten branch.
+
+The cleanup gap is the assumption that installing `total_drain_timeout` makes
+core perform the drain. Upstream baseline `09696b5` already disabled H1
+keepalive when a response preceded request completion and skipped draining in
+`HttpSession::reuse` when keepalive was disabled. The new successful
+abandonment path therefore needed an explicit bounded close drain. Barrier
+layer `c8b3ee8` subsequently added a finalizer for selected-response application
+termination, but ordinary `Abandoned + Continue` still bypassed it. The
+correction covers this missing successful-close branch without changing the
+accepted stall/response qualification or core's general close policy.
+
+This source history identifies an incomplete fork cleanup contract carried
+from the earlier feature work; it does not identify an October regression or
+prove the first occurrence of every possible unread-upload TCP reset. The
+failure reproduces on both `0b0d8bb` and `e18250e`. The newest October commits
+are not needed for this reproduction.
+
+Edgion added `transport/h2_lifecycle.rs` in `1fb3ef383` on 2026-10-06. Its real
+Gateway cases send a 1 MiB upload, prove exactly 65,535 origin-consumed bytes
+before response completion/cancellation, and exercise a repeated stall on the
+same origin connection. This recently added coverage exposes the older close
+gap. The earlier fork stall tests did not deterministically require response
+headers before remaining H1 upload delivery. The new focused regression pins
+that order and requires the unread bytes to be drained before closing.

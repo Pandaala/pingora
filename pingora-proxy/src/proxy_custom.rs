@@ -30,8 +30,8 @@ use proxy_common::{
     no_downstream_body_to_read, DownstreamStateMachine, PipeState, ResponseStateMachine,
 };
 use pump_termination::{
-    abort_selected_response, finalize_preserved_response_downstream_reuse,
-    release_cache_on_terminate, DownstreamRequestOutcome,
+    abort_selected_response, finalize_response_downstream_reuse, release_cache_on_terminate,
+    DownstreamRequestOutcome,
 };
 use tokio::sync::oneshot;
 
@@ -896,8 +896,7 @@ where
                 }
             }
         }
-        reuse_downstream =
-            finalize_preserved_response_downstream_reuse(session, reuse_downstream).await;
+        reuse_downstream = finalize_response_downstream_reuse(session, reuse_downstream).await;
         // Signal the upstream half that the downstream half completed cleanly before
         // dropping rx, so a resulting task-pipe closure is treated as benign.
         pipe_state.store(PipeState::DownstreamComplete as u8, Ordering::Release);

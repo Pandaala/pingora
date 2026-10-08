@@ -1565,6 +1565,298 @@ fn the_cache_and_the_combined_terminal_path_are_observationally_equivalent() {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ScannerSnapshot {
+    records: Vec<(bool, usize, bool, bool, usize)>,
+    pending: Vec<u32>,
+    ceiling: Option<u32>,
+    poisoned: bool,
+    partial: bool,
+    cached: Vec<u32>,
+    generation: usize,
+}
+
+impl ScannerSnapshot {
+    fn capture(
+        watch: &EndStreamWatch,
+        records: &[Arc<StreamRecord>],
+        partial: bool,
+        cached: Vec<u32>,
+    ) -> Self {
+        let state = watch.state.lock();
+        let (mut pending, ceiling, poisoned) = match &*state {
+            WatchState::Active(active) => (
+                active.pending.keys().copied().collect::<Vec<_>>(),
+                active.goaway_ceiling,
+                false,
+            ),
+            WatchState::Poisoned => (Vec::new(), None, true),
+        };
+        pending.sort_unstable();
+        Self {
+            records: records
+                .iter()
+                .map(|record| {
+                    (
+                        record.end_stream_observed(),
+                        record.data_bytes.load(Ordering::Relaxed),
+                        record.terminal_headers_observed(),
+                        record.invalidated.load(Ordering::Acquire),
+                        Arc::strong_count(record),
+                    )
+                })
+                .collect(),
+            pending,
+            ceiling,
+            poisoned,
+            partial,
+            cached,
+            generation: watch.forget_generation.load(Ordering::Acquire),
+        }
+    }
+}
+
+/// Compare every observation against the independently frozen pre-refactor
+/// parser, including unpublished counts and ownership, after each event.
+struct ScannerDifferential {
+    current: FrameScanner,
+    original: super::reference::FrameScanner,
+    current_watch: EndStreamWatch,
+    original_watch: EndStreamWatch,
+    current_records: Vec<Arc<StreamRecord>>,
+    original_records: Vec<Arc<StreamRecord>>,
+    ids: Vec<u32>,
+}
+
+impl ScannerDifferential {
+    fn new(ids: &[u32]) -> Self {
+        let mut harness = Self {
+            current: FrameScanner::default(),
+            original: super::reference::FrameScanner::default(),
+            current_watch: EndStreamWatch::default(),
+            original_watch: EndStreamWatch::default(),
+            current_records: Vec::new(),
+            original_records: Vec::new(),
+            ids: Vec::new(),
+        };
+        for id in ids {
+            harness.register(*id);
+        }
+        harness
+    }
+
+    fn assert_equal(&self) {
+        let current = ScannerSnapshot::capture(
+            &self.current_watch,
+            &self.current_records,
+            self.current.has_partial_frame(),
+            self.current
+                .data_records
+                .iter()
+                .flatten()
+                .map(|entry| entry.stream_id)
+                .collect(),
+        );
+        let original = ScannerSnapshot::capture(
+            &self.original_watch,
+            &self.original_records,
+            self.original.has_partial_frame(),
+            self.original.cached_ids(),
+        );
+        assert_eq!(current, original, "scanner observations diverged");
+    }
+
+    fn register(&mut self, id: u32) {
+        self.ids.push(id);
+        self.current_records.push(self.current_watch.register(id));
+        self.original_records.push(self.original_watch.register(id));
+        self.assert_equal();
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        self.current.scan(bytes, &self.current_watch);
+        self.original.scan(bytes, &self.original_watch);
+        self.assert_equal();
+    }
+
+    fn forget(&mut self, id: u32) {
+        self.current_watch.forget(id);
+        self.original_watch.forget(id);
+        self.assert_equal();
+    }
+
+    fn invalidate(&mut self, id: u32) {
+        let index = self.ids.iter().position(|known| *known == id).unwrap();
+        self.current_watch
+            .invalidate(id, Some(&self.current_records[index]));
+        self.original_watch
+            .invalidate(id, Some(&self.original_records[index]));
+        self.assert_equal();
+    }
+
+    fn eof(&mut self) {
+        if self.current.has_partial_frame() {
+            self.current.poison(&self.current_watch);
+        }
+        if self.original.has_partial_frame() {
+            self.original.poison(&self.original_watch);
+        }
+        self.assert_equal();
+    }
+
+    fn read_error(&mut self) {
+        self.current.poison(&self.current_watch);
+        self.original.poison(&self.original_watch);
+        self.assert_equal();
+    }
+}
+
+#[test]
+fn payload_states_match_the_frozen_scanner_at_every_split() {
+    let mut cases = vec![
+        frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"hello"),
+        frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b""),
+        padded_data_frame(FLAG_END_STREAM, 1, b"hello", 4),
+        padded_data_frame(FLAG_END_STREAM, 1, b"", 0),
+        padded_data_frame(0, 1, b"hello", 4),
+        frame(FRAME_TYPE_DATA, FLAG_PADDED | FLAG_END_STREAM, 1, b""),
+        frame(FRAME_TYPE_DATA, FLAG_PADDED | FLAG_END_STREAM, 1, &[9]),
+        frame(FRAME_TYPE_HEADERS, FLAG_END_STREAM | 4, 1, b"\x88"),
+        frame(FRAME_TYPE_RST_STREAM, 0, 1, &[0; 4]),
+        frame(FRAME_TYPE_GOAWAY, 0, 0, &goaway_payload(1)),
+        frame(FRAME_TYPE_GOAWAY, 0, 3, &goaway_payload(1)),
+    ];
+    for length in 0..8 {
+        cases.push(frame(FRAME_TYPE_GOAWAY, 0, 0, &vec![0; length]));
+    }
+    let mut increasing = frame(FRAME_TYPE_GOAWAY, 0, 0, &goaway_payload(1));
+    increasing.extend_from_slice(&frame(FRAME_TYPE_GOAWAY, 0, 0, &goaway_payload(3)));
+    cases.push(increasing);
+    let mut with_debug = goaway_payload(3).to_vec();
+    with_debug.extend_from_slice(b"debug");
+    cases.push(frame(FRAME_TYPE_GOAWAY, 0, 0, &with_debug));
+
+    for case in cases {
+        // The following frame exercises the transition back to header parsing
+        // even when both payload completion and the next header share a read.
+        let mut wire = case;
+        wire.extend_from_slice(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 1, b"x"));
+        for split in 0..=wire.len() {
+            let mut harness = ScannerDifferential::new(&[1, 3]);
+            harness.feed(&wire[..split]);
+            harness.feed(&wire[split..]);
+            harness.eof();
+
+            let mut truncated = ScannerDifferential::new(&[1, 3]);
+            truncated.feed(&wire[..split]);
+            truncated.eof();
+            truncated.register(9);
+            truncated.feed(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 9, b"late"));
+            truncated.read_error();
+        }
+    }
+}
+
+#[test]
+fn payload_states_match_the_frozen_scanner_through_lifecycle_events() {
+    for seed in 1..=200 {
+        let (steps, ids) = random_scenario(seed);
+        let mut harness = ScannerDifferential::new(&ids);
+        for (index, step) in steps.iter().enumerate() {
+            match step {
+                Step::Feed(bytes) => harness.feed(bytes),
+                Step::Forget(id) => harness.forget(*id),
+            }
+            if index % 7 == 0 {
+                harness.invalidate(ids[index % ids.len()]);
+            }
+        }
+        harness.eof();
+        harness.read_error();
+        harness.register(11);
+        harness.feed(&frame(FRAME_TYPE_DATA, FLAG_END_STREAM, 11, b"late"));
+    }
+}
+
+#[test]
+fn payload_state_consolidation_reduces_scanner_layout() {
+    let current = std::mem::size_of::<FrameScanner>();
+    let original = std::mem::size_of::<super::reference::FrameScanner>();
+    println!("scanner cfg(test) layout: original={original}, current={current}");
+    assert!(
+        current < original,
+        "payload consolidation must reduce state"
+    );
+}
+
+/// Alternate measurement order in one optimized build. Both scanners share
+/// unchanged watch primitives; only their independent parsing paths differ.
+fn benchmark_payload_state_pair(
+    name: &str,
+    wire: &[u8],
+    split: usize,
+    streams: u32,
+    terminal: bool,
+    iterations: usize,
+) {
+    let current_watch = EndStreamWatch::default();
+    let original_watch = EndStreamWatch::default();
+    let records: Vec<_> = (0..streams)
+        .map(|index| {
+            (
+                current_watch.register(1 + 2 * index),
+                original_watch.register(1 + 2 * index),
+            )
+        })
+        .collect();
+    let mut current = FrameScanner::default();
+    let mut original = super::reference::FrameScanner::default();
+    let mut run_current = || {
+        let record = terminal.then(|| current_watch.register(1));
+        for chunk in black_box(wire).chunks(split.min(wire.len())) {
+            current.scan(chunk, &current_watch);
+        }
+        black_box((&record, &records, &current));
+    };
+    let mut run_original = || {
+        let record = terminal.then(|| original_watch.register(1));
+        for chunk in black_box(wire).chunks(split.min(wire.len())) {
+            original.scan(chunk, &original_watch);
+        }
+        black_box((&record, &records, &original));
+    };
+    for _ in 0..100 {
+        run_original();
+        run_current();
+    }
+    fn sample(iterations: usize, run: &mut impl FnMut()) -> f64 {
+        let start = Instant::now();
+        for _ in 0..iterations {
+            run();
+        }
+        start.elapsed().as_secs_f64() * 1e9 / iterations as f64
+    }
+    let mut original_samples = Vec::new();
+    let mut current_samples = Vec::new();
+    for index in 0..9 {
+        if index % 2 == 0 {
+            original_samples.push(sample(iterations, &mut run_original));
+            current_samples.push(sample(iterations, &mut run_current));
+        } else {
+            current_samples.push(sample(iterations, &mut run_current));
+            original_samples.push(sample(iterations, &mut run_original));
+        }
+    }
+    original_samples.sort_by(f64::total_cmp);
+    current_samples.sort_by(f64::total_cmp);
+    println!(
+        "payload_state_bench {name}: original={:.2} current={:.2} ns/op change={:+.1}%",
+        original_samples[4],
+        current_samples[4],
+        (current_samples[4] / original_samples[4] - 1.0) * 100.0,
+    );
+}
+
 /// Manual release-mode microbenchmark for the incremental scanner cost.
 ///
 /// Run with:
@@ -1638,6 +1930,20 @@ fn benchmark_end_stream_watch() {
     let response_64k = data_run(16, 64 * 1024);
     let streaming = data_run(1024, 1);
 
+    for (name, wire, split, iterations) in [
+        ("one_data_end", &one_data_end, usize::MAX, 200_000),
+        ("streaming", &streaming, usize::MAX, 2_000),
+        ("large_data", &response_16k, usize::MAX, 10_000),
+        ("split_header", &one_data_end, 3, 200_000),
+        ("split_payload", &response_64k, 4096, 1_000),
+    ] {
+        benchmark_payload_state_pair(name, wire, split, 1, true, iterations);
+    }
+    let padded = padded_data_frame(FLAG_END_STREAM, 1, b"hello", 7);
+    benchmark_payload_state_pair("padded", &padded, 3, 1, true, 200_000);
+    let goaway = frame(FRAME_TYPE_GOAWAY, 0, 0, &goaway_payload(1));
+    benchmark_payload_state_pair("goaway", &goaway, 3, 1, false, 200_000);
+
     for (name, wire, iterations) in [
         ("headers_end", &headers_end, 200_000),
         ("one_data_end", &one_data_end, 200_000),
@@ -1709,6 +2015,8 @@ fn benchmark_end_stream_watch() {
         } else {
             format!("round_robin_{stream_count}_streams")
         };
+
+        benchmark_payload_state_pair(&name, &wire, usize::MAX, stream_count, false, 1_000);
 
         let cached_watch = EndStreamWatch::default();
         let cached_records: Vec<_> = (0..stream_count)

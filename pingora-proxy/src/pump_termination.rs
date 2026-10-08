@@ -48,21 +48,35 @@ pub(super) fn bound_undrained_downstream_body(session: &mut Session) {
         .set_total_drain_timeout(Some(ABANDONED_BODY_DRAIN_TIMEOUT));
 }
 
-/// Drain safely before enforcing H1 non-reuse after a selected response was
-/// preserved from application termination.
+/// Drain safely before closing an abandoned H1 upload after response delivery.
+///
+/// Application termination can preserve a selected response; an ordinary H2
+/// upload stall can also preserve it while early-response framing has already
+/// disabled downstream keepalive. Both require the same bounded cleanup.
 ///
 /// Response delivery finishes before this helper runs. Draining then avoids a
 /// reset that could erase queued response bytes, while returning `false` keeps
 /// the abandoned H1 connection out of the reusable pool. H2 and custom
 /// downstream connection ownership is unchanged.
-pub(super) async fn finalize_preserved_response_downstream_reuse(
+pub(super) async fn finalize_response_downstream_reuse(
     session: &mut Session,
     reuse_downstream: bool,
 ) -> bool {
-    if !reuse_downstream
-        || !session.preserved_selected_response_after_request_termination()
-        || session.downstream_session.as_http1().is_none()
-    {
+    if !reuse_downstream || session.downstream_session.as_http1().is_none() {
+        return reuse_downstream;
+    }
+
+    // An early origin response can disable H1 keepalive before the request
+    // pump abandons a stalled upload. The ordinary finish path skips draining
+    // non-reusable sockets, which can reset away the already-written response.
+    // Only the pump's explicit bounded-drain policy authorizes this cleanup.
+    let bounded_close = session
+        .downstream_session
+        .as_http1()
+        .is_some_and(|downstream| {
+            !downstream.will_keepalive() && downstream.get_total_drain_timeout().is_some()
+        });
+    if !session.preserved_selected_response_after_request_termination() && !bounded_close {
         return reuse_downstream;
     }
 
@@ -391,5 +405,45 @@ where
                 Err(error) => DuplexPumpOutcome::Failed(error),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use pingora_http::ResponseHeader;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn bounded_early_response_close_drains_the_unread_upload() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let stream: pingora_core::protocols::Stream = Box::new(server);
+        let mut session = Session::new_h1(stream);
+        client
+            .write_all(b"POST / HTTP/1.1\r\nHost: test\r\nContent-Length: 1024\r\n\r\n")
+            .await
+            .unwrap();
+        session.read_request().await.unwrap();
+        assert!(!session.as_mut().is_body_done());
+        bound_undrained_downstream_body(&mut session);
+        let mut header = ResponseHeader::build(200, None).unwrap();
+        header.insert_header("content-length", "2").unwrap();
+        session
+            .write_response_header(Box::new(header), false)
+            .await
+            .unwrap();
+        session
+            .write_response_body(Some(Bytes::from_static(b"ok")), true)
+            .await
+            .unwrap();
+        assert!(!session
+            .downstream_session
+            .as_http1()
+            .unwrap()
+            .will_keepalive());
+        client.write_all(&[b'u'; 1024]).await.unwrap();
+        assert!(!finalize_response_downstream_reuse(&mut session, true).await);
+        assert!(session.as_mut().is_body_done());
     }
 }

@@ -824,6 +824,8 @@ impl ProxyHttp for ReopeningErrorProxy {
 pub struct SeamPorts {
     /// Plain HTTP/1.1 downstream.
     h1: u16,
+    /// HTTP/1.1 downstream with enough attempts to exercise native replay.
+    retry_h1: u16,
     /// h2c (prior-knowledge HTTP/2) downstream.
     h2c: u16,
     /// HTTP/1.1 downstream in front of [`LegacyHookProxy`].
@@ -835,6 +837,9 @@ pub struct SeamPorts {
 impl SeamPorts {
     pub fn h1_addr(&self) -> String {
         format!("127.0.0.1:{}", self.h1)
+    }
+    pub fn retry_h1_addr(&self) -> String {
+        format!("127.0.0.1:{}", self.retry_h1)
     }
     pub fn h2c_addr(&self) -> String {
         format!("127.0.0.1:{}", self.h2c)
@@ -877,6 +882,7 @@ fn start_seam_server() -> SeamPorts {
 
     let ports = SeamPorts {
         h1: reserve_port(),
+        retry_h1: reserve_port(),
         h2c: reserve_port(),
         legacy: reserve_port(),
         reopening_error: reserve_port(),
@@ -887,7 +893,9 @@ fn start_seam_server() -> SeamPorts {
         ports.legacy_addr(),
         ports.reopening_error_addr(),
     );
+    let retry_h1_addr = ports.retry_h1_addr();
     let addrs = [
+        retry_h1_addr.clone(),
         h1_addr.clone(),
         h2c_addr.clone(),
         legacy_addr.clone(),
@@ -909,6 +917,13 @@ fn start_seam_server() -> SeamPorts {
         h1.app_logic_mut().unwrap().server_options = Some(h1_opts);
         h1.add_tcp(&h1_addr);
 
+        let retry_conf = Arc::new(ServerConf {
+            max_retries: 6,
+            ..Default::default()
+        });
+        let mut retry_h1 = pingora_proxy::http_proxy_service(&retry_conf, SeamProxy {});
+        retry_h1.add_tcp(&retry_h1_addr);
+
         let mut h2c = pingora_proxy::http_proxy_service(&conf, SeamProxy {});
         let logic = h2c.app_logic_mut().unwrap();
         let mut opts = pingora_core::apps::HttpServerOptions::default();
@@ -929,6 +944,7 @@ fn start_seam_server() -> SeamPorts {
 
         let services: Vec<Box<dyn ServiceWithDependents>> = vec![
             Box::new(h1),
+            Box::new(retry_h1),
             Box::new(h2c),
             Box::new(legacy),
             Box::new(reopening_error),
@@ -1396,6 +1412,8 @@ impl Drop for ExercisedUpstream {
 /// A scripted H2 upstream.
 #[derive(Clone)]
 pub enum H2UpstreamStep {
+    /// Refuse the stream before processing any request body.
+    RefusedStream,
     /// Respond 200 with a small body, ending the stream normally.
     Ok200,
     /// Respond 200 with a small body, then keep the REQUEST stream alive.
@@ -1538,6 +1556,14 @@ impl H2StreamRecorder {
 /// handshake and serves streams sequentially; the k-th stream overall
 /// (0-based, across connections) is answered with `script[k]`.
 pub fn spawn_scripted_h2_upstream(script: Vec<H2UpstreamStep>) -> ExercisedUpstream {
+    spawn_scripted_h2_upstream_with_window(script, 65_535)
+}
+
+/// Start with a controlled stream window; the echo step restores normal credit.
+pub fn spawn_scripted_h2_upstream_with_window(
+    script: Vec<H2UpstreamStep>,
+    initial_window: u32,
+) -> ExercisedUpstream {
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_ret = counter.clone();
     let rec = Recorder::new();
@@ -1557,7 +1583,11 @@ pub fn spawn_scripted_h2_upstream(script: Vec<H2UpstreamStep>) -> ExercisedUpstr
             let script = script.clone();
             let rec = rec.clone();
             tokio::spawn(async move {
-                let mut connection = match h2::server::handshake(stream).await {
+                let mut connection = match h2::server::Builder::new()
+                    .initial_window_size(initial_window)
+                    .handshake(stream)
+                    .await
+                {
                     Ok(c) => c,
                     Err(_) => {
                         rec.push(UpEvent::ConnClosed { conn });
@@ -1627,6 +1657,9 @@ pub fn spawn_scripted_h2_upstream(script: Vec<H2UpstreamStep>) -> ExercisedUpstr
 
                     let idx = counter.fetch_add(1, Ordering::SeqCst);
                     let step = script.get(idx).cloned();
+                    if initial_window == 0 && matches!(step, Some(H2UpstreamStep::EchoRequestEos)) {
+                        connection.set_initial_window_size(65_535).unwrap();
+                    }
                     let sr = H2StreamRecorder {
                         rec: rec.clone(),
                         conn,
@@ -1635,6 +1668,9 @@ pub fn spawn_scripted_h2_upstream(script: Vec<H2UpstreamStep>) -> ExercisedUpstr
                     let goaway = goaway_tx.clone();
                     tokio::spawn(async move {
                         match step {
+                            Some(H2UpstreamStep::RefusedStream) => {
+                                send_response.send_reset(Reason::REFUSED_STREAM);
+                            }
                             Some(H2UpstreamStep::Ok200) => {
                                 let response = Response::builder().status(200).body(()).unwrap();
                                 if let Ok(mut send_stream) =

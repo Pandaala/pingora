@@ -53,6 +53,9 @@ The `status` inside each record is authoritative.
 - [Writer stall after response](h2-grpc/h2-writer-capacity-stall-after-response.md)
   (H2-007): complete evidence plus stall permits upload abandonment; neither
   condition alone does.
+- [Native replay refusal evidence](h2-grpc/h2-native-replay-refusal-evidence.md):
+  preserve response-reader retry proof after replay send errors; source history
+  distinguishes the inherited gap from recent fork changes.
 - [Abandonment termination preserves a selected response](h2-grpc/h2-abandonment-terminate-preserves-selected-response.md):
   qualified `Abandoned + Terminate` preserves a complete selected response;
   every selected but incomplete termination explicitly aborts downstream.
@@ -116,6 +119,9 @@ The `status` inside each record is authoritative.
   stale h2 0.4.15 premises were replaced by an audited 0.4.19 handoff checklist;
   the minimum was raised after 0.4.16-0.4.18 reproducibly failed the fork's
   continuing-upload contract.
+- [H2 payload-state consolidation](h2-grpc/h2-payload-state-consolidation.md):
+  bounded scanner representation, frozen differential oracle, guard mutations,
+  and layout/performance evidence; whole-watcher deletion remains deferred.
 - [TLS bind-test error classification](findings/008-low-tls-feature-bind-test-rejects-observed-bind-error.md):
   retain the inherited `InternalError -> BindError -> AddrInUse` production
   chain and use localhost-only deterministic bind/TLS failures in feature tests.

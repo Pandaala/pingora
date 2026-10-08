@@ -116,3 +116,10 @@ bounds, terminal/cache behavior, tests, and docs are fork-owned and must be
 fixed here when defective. Decoder behavior inside `h2` is upstream-owned; keep
 the normal dependency and the boundary in
 [`review/upstream-limitations.md`](review/upstream-limitations.md).
+
+H1 downstream cleanup after H2 upload abandonment uses the pump's bounded drain
+even when early response framing disabled keepalive and the application returned
+`Continue`; see [request-body transport](features/request-body-transport.md#bounded-h1-close-after-upload-abandonment).
+
+The H2 native replay prelude preserves response-reader refusal evidence after
+an upstream send-half closure; see the [retry arbitration record](review/h2-grpc/h2-native-replay-refusal-evidence.md).

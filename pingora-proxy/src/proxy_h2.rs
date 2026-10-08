@@ -20,9 +20,8 @@ use crate::proxy_cache::ServeFromCache;
 use crate::proxy_common::*;
 use crate::pump_termination::{
     bound_undrained_downstream_body, downstream_body_read_is_futile,
-    finalize_preserved_response_downstream_reuse, finish_terminated_response,
-    join_bidirectional_pumps, release_cache_on_terminate,
-    warn_response_body_terminate_content_length_leak,
+    finalize_response_downstream_reuse, finish_terminated_response, join_bidirectional_pumps,
+    release_cache_on_terminate, warn_response_body_terminate_content_length_leak,
     warn_response_body_terminate_without_response, DownstreamRequestOutcome, DuplexPumpOutcome,
 };
 use crate::request_relay::{
@@ -801,9 +800,9 @@ where
                     ctx,
                     &body_write,
                 )
-                .await?;
+                .await;
             match outcome {
-                UpstreamBodyOutcome::Downstream(DownstreamRequestOutcome::Terminate) => {
+                Ok(UpstreamBodyOutcome::Downstream(DownstreamRequestOutcome::Terminate)) => {
                     // No-op for an H2 downstream; required for an H1 downstream proxied
                     // to an H2 upstream, whose unread request bytes must not be drained
                     // and the connection reused.
@@ -812,16 +811,16 @@ where
                     restore_custom_message_reader(session, downstream_custom_message_reader.take());
                     return Ok(DownstreamRequestOutcome::Terminate);
                 }
-                UpstreamBodyOutcome::Downstream(
+                Ok(UpstreamBodyOutcome::Downstream(
                     DownstreamRequestOutcome::AbortSelectedResponse,
-                ) => return Ok(DownstreamRequestOutcome::AbortSelectedResponse),
+                )) => return Ok(DownstreamRequestOutcome::AbortSelectedResponse),
                 // The replayed body could not be written because the upstream
                 // had already answered in full and reset the stream. Failing the
                 // request here would discard that response; the duplex loop
                 // below still has to run to deliver it.
-                UpstreamBodyOutcome::UpstreamDoneReceiving {
+                Ok(UpstreamBodyOutcome::UpstreamDoneReceiving {
                     terminal_event_delivered,
-                } => {
+                }) => {
                     if !terminal_event_delivered {
                         match self
                             .finish_downstream_body_side(session, client_body, ctx, &body_write)
@@ -847,10 +846,23 @@ where
                     downstream_state.maybe_finished(true);
                     bound_undrained_downstream_body(session);
                 }
-                UpstreamBodyOutcome::Downstream(
+                Ok(UpstreamBodyOutcome::Downstream(
                     DownstreamRequestOutcome::Complete(_)
                     | DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(_),
-                ) => {}
+                )) => {}
+                Err(e)
+                    if body_write.disposition != UpstreamRequestBodyDisposition::Bodyless
+                        && e.esource == ErrorSource::Upstream
+                        && matches!(e.etype, H2Error | WriteError) =>
+                {
+                    // Match the live upload path: a closed send half does not
+                    // decide whether the peer refused an unprocessed request.
+                    // Keep reading its response so header-time REFUSED_STREAM
+                    // evidence can make that decision. Deadlines and application
+                    // errors still fail immediately; this error grants no retry.
+                    downstream_state.to_errored();
+                }
+                Err(e) => return Err(e),
             }
         }
 
@@ -1400,8 +1412,7 @@ where
                 }
             }
         }
-        reuse_downstream =
-            finalize_preserved_response_downstream_reuse(session, reuse_downstream).await;
+        reuse_downstream = finalize_response_downstream_reuse(session, reuse_downstream).await;
         // Signal the upstream half that the downstream half completed cleanly before
         // dropping rx, so a resulting task-pipe closure is treated as benign.
         pipe_state.store(PipeState::DownstreamComplete as u8, Ordering::Release);
