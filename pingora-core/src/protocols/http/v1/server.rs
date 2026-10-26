@@ -1448,10 +1448,20 @@ impl HttpSession {
         if !self.body_write_buf.is_empty() {
             self.write_body_buf().await?;
         }
-        let res = self
-            .body_writer
-            .write_trailers(&mut self.underlying_stream, trailers)
-            .await?;
+        let (wire, written) = self.body_writer.prepare_trailers(trailers)?;
+        let write_timeout = self.write_timeout(wire.len());
+        let write =
+            self.body_writer
+                .write_prepared_trailers(&mut self.underlying_stream, wire, written);
+        let res = match write_timeout {
+            Some(t) => match timeout(t, write).await {
+                Ok(res) => res,
+                Err(_) => {
+                    Error::e_explain(WriteTimedout, format!("writing trailers, timeout: {t:?}"))
+                }
+            },
+            None => write.await,
+        }?;
         self.maybe_force_close_body_reader();
         Ok(res)
     }
@@ -2158,9 +2168,12 @@ impl HttpSession {
                     if !trailers.is_empty() && self.response_trailers_supported() =>
                 {
                     let (write_buf, written) = self.body_writer.prepare_trailers(&trailers)?;
-                    self.proxy_task_state
-                        .header_writer()
-                        .send_header_task(write_buf, true, None);
+                    let trailer_timeout = self.write_timeout(write_buf.len());
+                    self.proxy_task_state.header_writer().send_header_task(
+                        write_buf,
+                        true,
+                        trailer_timeout,
+                    );
                     self.proxy_task_state.current_writer =
                         Some(ProxyTaskWriter::WritingTrailers(written));
                 }
@@ -2395,6 +2408,10 @@ mod test_sync {
 #[cfg(test)]
 #[path = "server_test_proxy_tasks.rs"]
 mod test_proxy_tasks;
+
+#[cfg(test)]
+#[path = "server_test_trailer_timeout.rs"]
+mod test_trailer_timeout;
 
 #[cfg(test)]
 mod test_overread {

@@ -83,6 +83,23 @@ written. The cancel-safe proxy task path retains partial write progress through
 the existing persistent writer state. An empty map uses the ordinary
 `0\r\n\r\n` terminator.
 
+For a supported nonempty H1 trailer block, both direct and queued session
+writers apply the existing session write-timeout policy through the block's
+flush. A positive minimum-send-rate takes precedence over the fixed timeout,
+using the serialized trailer wire length and the existing one-second floor;
+without either bound the write remains unbounded. Session owns this policy,
+BodyWriter owns validation/serialization and successful completion, and the
+queued HeaderWriter retains partial progress and its timer across cancellation.
+The existing timer starts on the first pending poll and tries writing before
+checking expiry; this is not a new strict wall-clock deadline contract.
+
+A trailer timeout does not mark the body complete and follows existing
+downstream failure/non-reuse handling. Cache filling may continue after a
+downstream failure under its existing policy. Empty/unsupported trailers and
+ordinary header/finalization writes are outside this trailer-specific bound;
+it does not promise a deadline on every later generic flush. See the
+[ISSUE-001 resolution](../review/http1/h1-trailer-write-timeout.md).
+
 Trailers are representable only for an HTTP/1.1 downstream with the selected
 chunked writer. Content-Length, HEAD, 204, 304, successful upgrade/101, and
 HTTP/1.0 responses safely finish without forwarding the trailer block.

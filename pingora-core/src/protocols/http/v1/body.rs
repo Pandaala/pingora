@@ -1528,19 +1528,16 @@ impl BodyWriter {
         }
     }
 
-    /// Finish a chunked HTTP/1.1 body with a validated trailer section.
-    /// Validation and bounded serialization complete before any bytes are
-    /// written, so malformed trailers cannot partially commit downstream.
-    pub async fn write_trailers<S>(
+    /// Write an already validated trailer block, completing only after its flush.
+    pub(super) async fn write_prepared_trailers<S>(
         &mut self,
         stream: &mut S,
-        trailers: &HeaderMap,
+        wire: Bytes,
+        written: usize,
     ) -> Result<Option<usize>>
     where
         S: AsyncWrite + Unpin + Send,
     {
-        let (wire, written) = self.prepare_trailers(trailers)?;
-
         stream
             .write_all(&wire)
             .await

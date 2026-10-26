@@ -36,6 +36,9 @@ The `status` inside each record is authoritative.
 
 ## Implemented or resolved conclusions
 
+- [H1 trailer write timeout](http1/h1-trailer-write-timeout.md): ISSUE-001;
+  direct and queued nonempty trailer delivery uses the existing session write
+  policy through flush, retaining cancellation progress and terminal accounting.
 - [Empty request-target normalization](http1/empty-request-target-normalization.md):
   normalize empty and fragment-only header targets explicitly, independently
   of the linked URI parser's acceptance of an empty component.

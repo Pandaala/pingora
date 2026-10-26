@@ -538,3 +538,129 @@ fn ordinary_disposition_preserves_request_framing() {
         "gzip"
     );
 }
+
+// Observe the decoded trailer hook independently of the downstream wire. The
+// origin endpoint stays open so neither EOF nor upstream read timeout rescues a
+// blocked downstream trailer write.
+struct TrailerTimeoutProxy;
+
+#[async_trait]
+impl ProxyHttp for TrailerTimeoutProxy {
+    type CTX = usize;
+
+    fn new_ctx(&self) -> Self::CTX {
+        0
+    }
+
+    async fn upstream_peer(&self, _: &mut Session, _: &mut Self::CTX) -> Result<Box<HttpPeer>> {
+        unreachable!("test supplies the upstream session directly")
+    }
+
+    async fn upstream_response_trailer_filter(
+        &self,
+        _: &mut Session,
+        trailers: &mut http::HeaderMap,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        assert_eq!(trailers["x-end"].as_bytes().len(), 8192);
+        *ctx += 1;
+        Ok(())
+    }
+}
+
+async fn run_trailer_timeout_pump(queued: bool, drain: bool) {
+    use tokio::io::AsyncReadExt;
+
+    let proxy = HttpProxy::new(TrailerTimeoutProxy, Arc::new(ServerConf::default()));
+    let (mut client, downstream) = tokio::io::duplex(1024);
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .unwrap();
+    let mut session = Session::new_h1(Box::new(downstream));
+    session.read_request().await.unwrap();
+    session
+        .freeze_request_relay_plan(RequestRelayPlan::ordinary())
+        .unwrap();
+    session.set_proxy_tasks_enabled(queued);
+    session.set_write_timeout(Some(Duration::from_millis(100)));
+    session.set_keepalive(Some(60));
+
+    let (mut origin, upstream) = tokio::io::duplex(32 * 1024);
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nx-end: {}\r\n\r\n",
+        "a".repeat(8192)
+    );
+    origin.write_all(response.as_bytes()).await.unwrap();
+    let mut upstream = HttpSessionV1::new(Box::new(upstream));
+    let peer = HttpPeer::new("127.0.0.1:80", false, String::new());
+    let mut trailer_calls = 0;
+    let mut wire = Vec::new();
+    let pump = proxy.proxy_1to1(&mut session, &mut upstream, &peer, &mut trailer_calls);
+    let result = if drain {
+        // Read only through the terminal marker; a successful keepalive pump
+        // intentionally leaves the stream open.
+        let read = async {
+            let marker = format!("x-end: {}\r\n\r\n", "a".repeat(8192));
+            loop {
+                let mut bytes = [0; 2048];
+                let n = client.read(&mut bytes).await.unwrap();
+                assert_ne!(n, 0, "response ended before its trailer");
+                wire.extend_from_slice(&bytes[..n]);
+                if wire.ends_with(marker.as_bytes()) {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (result, ()) = tokio::join!(pump, read);
+            result
+        })
+        .await
+        .expect("writable pump must finish")
+    } else {
+        tokio::time::timeout(Duration::from_secs(5), pump)
+            .await
+            .expect("trailer write must time out without peer closure")
+    };
+    assert_eq!(trailer_calls, 1, "origin trailer was decoded and processed");
+    assert_eq!(session.body_bytes_sent(), 3);
+    if drain {
+        assert!(result.2.is_none(), "unexpected error: {:?}", result.2);
+        assert!(result.0, "writable downstream should remain reusable");
+        assert!(wire
+            .windows(b"3\r\nabc\r\n0\r\nx-end:".len())
+            .any(|w| w == b"3\r\nabc\r\n0\r\nx-end:"));
+        assert_eq!(
+            wire.windows(b"x-end:".len())
+                .filter(|w| *w == b"x-end:")
+                .count(),
+            1
+        );
+    } else {
+        assert!(
+            !result.0 && !result.1,
+            "failed response must not be reusable"
+        );
+        let error = result.2.expect("downstream timeout must reach pump caller");
+        assert_eq!(error.etype(), &WriteTimedout);
+        assert_eq!(error.esource, pingora_error::ErrorSource::Downstream);
+    }
+    // Prove origin and downstream handles remained alive through observation.
+    drop(origin);
+    drop(client);
+}
+
+#[tokio::test]
+async fn h1_trailer_timeout_ends_pump_after_origin_completion() {
+    for queued in [false, true] {
+        run_trailer_timeout_pump(queued, false).await;
+    }
+}
+
+#[tokio::test]
+async fn h1_trailer_timeout_pump_writable_control() {
+    for queued in [false, true] {
+        run_trailer_timeout_pump(queued, true).await;
+    }
+}

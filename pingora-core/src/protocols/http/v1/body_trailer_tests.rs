@@ -14,6 +14,18 @@
 
 use tokio_test::io::Builder;
 
+async fn write_trailers<S>(
+    writer: &mut BodyWriter,
+    stream: &mut S,
+    trailers: &HeaderMap,
+) -> Result<Option<usize>>
+where
+    S: AsyncWrite + Unpin + Send,
+{
+    let (wire, written) = writer.prepare_trailers(trailers)?;
+    writer.write_prepared_trailers(stream, wire, written).await
+}
+
 #[tokio::test]
 async fn chunked_trailers_are_parsed_with_duplicates_and_overread_preserved() {
     let mut io = Builder::new()
@@ -81,7 +93,7 @@ async fn chunked_trailer_writer_preserves_duplicates_and_rejects_non_chunked() {
     trailers.append("x-a", HeaderValue::from_static("1"));
     trailers.append("x-a", HeaderValue::from_static("2"));
     assert_eq!(
-        writer.write_trailers(&mut io, &trailers).await.unwrap(),
+        write_trailers(&mut writer, &mut io, &trailers).await.unwrap(),
         Some(0)
     );
     assert_eq!(writer.body_mode, BodyMode::Complete(0));
@@ -89,8 +101,7 @@ async fn chunked_trailer_writer_preserves_duplicates_and_rejects_non_chunked() {
     let mut no_write = Builder::new().build();
     let mut content_length = BodyWriter::new();
     content_length.init_content_length(0);
-    assert!(content_length
-        .write_trailers(&mut no_write, &trailers)
+    assert!(write_trailers(&mut content_length, &mut no_write, &trailers)
         .await
         .is_err());
 
@@ -101,8 +112,7 @@ async fn chunked_trailer_writer_preserves_duplicates_and_rejects_non_chunked() {
     let mut no_write = Builder::new().build();
     let mut writer = BodyWriter::new();
     writer.init_chunked();
-    assert!(writer
-        .write_trailers(&mut no_write, &too_many)
+    assert!(write_trailers(&mut writer, &mut no_write, &too_many)
         .await
         .is_err());
 
@@ -114,8 +124,7 @@ async fn chunked_trailer_writer_preserves_duplicates_and_rejects_non_chunked() {
     let mut no_write = Builder::new().build();
     let mut writer = BodyWriter::new();
     writer.init_chunked();
-    assert!(writer
-        .write_trailers(&mut no_write, &too_large)
+    assert!(write_trailers(&mut writer, &mut no_write, &too_large)
         .await
         .is_err());
 }
