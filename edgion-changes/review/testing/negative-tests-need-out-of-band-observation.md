@@ -107,6 +107,51 @@ stops at the error and never emits that `Done`. Verified by mutation:
 Do not report the second row as a test gap: it is covered at the unit level and
 documented as a scope note on the test.
 
+## H1 extra-byte recorder regression guard (ISSUE-004)
+
+The fork-owned `RespondThenRecordExtra` script in
+`pingora-proxy/tests/seam/harness.rs` must include bytes already read beyond
+the selected request header, as well as bytes received during its later read
+window. Previously, header parsing retained surplus in `pending`, but this
+script only recorded fresh socket reads and returned without consuming that
+buffer. The H1-upstream cells of `bodyless_with_a_real_body_fails_closed` could
+therefore miss forbidden bytes depending on read segmentation. This was a
+test-observation defect, not evidence of a production Bodyless forwarding bug.
+
+The corrected branch records nonempty `pending` as `ReqData` for the current
+connection and stream, with its exact length and `end_stream: false`, then
+clears the buffer before writing the response. A failed response write cannot
+erase these already-observed bytes. This terminal script deliberately treats
+all surplus as extra bytes, not as a subsequent pipelined request. Other
+script steps retain their ordinary framing and request-reuse behavior.
+
+`tests/seam/harness/recorder_tests.rs` drives the actual connection handler
+through a private scripted async stream with deterministic read boundaries.
+Its five controls cover header-plus-payload in one read, separate reads, mixed
+surplus and later payload, header-only input, and response-write failure. They
+assert the complete event sequence, byte total, request count and stream
+identity. The private H1 helpers accept async read/write traits solely within
+the test harness; production APIs and dependency declarations are unchanged.
+
+Verification on 2026-10-27 at Pingora `9a85acbe` plus this change: all five
+controls passed. Temporarily removing only the surplus-recording block made
+the three surplus cases fail while separate-read and header-only controls
+passed; the block was restored. This establishes that the observation channel
+detects this omission, independently of TCP scheduling. Historical terminal
+dispatch verification above remains separate evidence.
+
+After restoration, `cargo test --locked -p pingora-proxy --test
+test_request_body_seam` passed all 73 tests (including the five controls).
+`cargo fmt --all -- --check`, `git diff --check`, and proxy all-target
+`cargo check --locked` / `cargo clippy --locked` passed; Clippy retained
+warnings in unchanged code. These are targeted test-harness checks, not a
+fresh core/TLS matrix or sibling Edgion consumer verification.
+
+Re-evaluate this guard if header buffering, the script's terminal behavior, or
+the Bodyless scenario's recorder changes. EOF/reset observations and the
+existing 300ms observation deadline remain separate from the byte count; this
+guard does not claim that bytes arriving outside that window are observed.
+
 ## Re-evaluation Triggers
 
 Re-open this decision only if:

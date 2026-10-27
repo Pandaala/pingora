@@ -92,7 +92,7 @@ The `status` inside each record is authoritative.
   actual-pump termination, framing rejection and stale source EOF tests.
 - [Negative-test observation](testing/negative-tests-need-out-of-band-observation.md):
   failure-path negative assertions need out-of-band evidence and a positive
-  control.
+  control; ISSUE-004 guards H1 recorder surplus from header reads.
 - [Response trailer filter error parity](response-trailer-filter-error-parity.md):
   H1/H2/custom propagate downstream trailer hook failures consistently; cache
   capability and protocol-specific reuse boundaries are recorded explicitly.

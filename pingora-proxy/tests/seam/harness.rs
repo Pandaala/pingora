@@ -30,10 +30,14 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{oneshot, Notify};
+
+#[cfg(test)]
+#[path = "harness/recorder_tests.rs"]
+mod recorder_tests;
 
 pub static RT: Lazy<Runtime> =
     Lazy::new(|| Builder::new_multi_thread().enable_all().build().unwrap());
@@ -1912,7 +1916,7 @@ pub fn spawn_scripted_upstream(script: Vec<UpstreamStep>) -> ExercisedUpstream {
 /// it did before the recorder existed, so no test's timing changed.
 /// [`UpstreamStep::RespondAfterBody`] opts out of that ordering.
 async fn serve_scripted_h1_connection(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     conn: u32,
     rec: &Recorder,
     counter: &AtomicUsize,
@@ -1995,6 +1999,17 @@ async fn serve_scripted_h1_connection(
             }
             Some(UpstreamStep::RespondAfterBody(bytes)) => deferred = Some(bytes),
             Some(UpstreamStep::RespondThenRecordExtra(bytes)) => {
+                // Header reads can also receive unframed payload. Preserve it
+                // even if sending the response fails before the read window.
+                if !pending.is_empty() {
+                    rec.push(UpEvent::ReqData {
+                        conn,
+                        stream: stream_id,
+                        len: pending.len(),
+                        end_stream: false,
+                    });
+                    pending.clear();
+                }
                 if stream.write_all(bytes).await.is_err() {
                     return;
                 }
@@ -2060,7 +2075,7 @@ enum ReadMore {
     Failed,
 }
 
-async fn read_more(stream: &mut TcpStream, pending: &mut Vec<u8>) -> ReadMore {
+async fn read_more(stream: &mut (impl AsyncRead + Unpin), pending: &mut Vec<u8>) -> ReadMore {
     let mut buf = [0u8; 16384];
     match stream.read(&mut buf).await {
         Ok(0) => ReadMore::Eof,
@@ -2085,7 +2100,7 @@ fn h1_header_value(head: &str, name: &str) -> Option<String> {
 /// Consume exactly one request body off the connection, recording every piece
 /// of it. Returns false if the connection died first.
 async fn consume_h1_request_body(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncRead + Unpin),
     pending: &mut Vec<u8>,
     conn: u32,
     stream_id: u32,
@@ -2183,7 +2198,7 @@ async fn consume_h1_request_body(
 
 /// Read one CRLF-terminated line, returning it without the terminator.
 async fn read_h1_line(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncRead + Unpin),
     pending: &mut Vec<u8>,
     conn: u32,
     rec: &Recorder,
