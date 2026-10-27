@@ -753,8 +753,8 @@ where
                 // `Abandoned` event exactly once, with NO permit
                 // so nothing reaches the upstream -- the upstream exchange is
                 // already complete and owes no further request framing.
-                let outcome = self
-                    .send_body_to_pipe(
+                let outcome = response_pipeline
+                    .wait_with_response_head_deadline(self.send_body_to_pipe(
                         session,
                         None,
                         RequestBodyEvent::Abandoned,
@@ -762,8 +762,16 @@ where
                         None,
                         ctx,
                         body_disposition,
-                    )
-                    .await?;
+                    ))
+                    .await
+                    .map_err(|error| {
+                        self.resolve_response_head_wait_error(
+                            session,
+                            ctx,
+                            response_pipeline,
+                            error,
+                        )
+                    })?;
                 if outcome == DownstreamRequestOutcome::AbortSelectedResponse {
                     return Ok(outcome);
                 }
@@ -861,7 +869,9 @@ where
                     }
                     // TODO: consider just drain this if serve_from_cache is set
                     let is_body_done = session.is_body_done();
-                    let outcome = self.send_body_to_pipe(
+                    // A selected upload branch must keep the same Hold deadline
+                    // active while request hooks run; the outer select is suspended.
+                    let outcome = response_pipeline.wait_with_response_head_deadline(self.send_body_to_pipe(
                         session,
                         body,
                         RequestBodyEvent::from(is_body_done),
@@ -869,8 +879,11 @@ where
                         Some(send_permit.unwrap()), // safe because we checked is_ok()
                         ctx,
                         body_disposition,
-                    )
-                    .await?;
+                    ))
+                    .await
+                    .map_err(|error| {
+                        self.resolve_response_head_wait_error(session, ctx, response_pipeline, error)
+                    })?;
                     if outcome == DownstreamRequestOutcome::AbortSelectedResponse {
                         return Ok(outcome);
                     }
@@ -904,8 +917,8 @@ where
                         // owes no further request framing, so nothing may be written. This is
                         // the H1 counterpart of `finish_downstream_body_side` in proxy_h2.rs.
                         // Only the closed case abandons; a merely full pipe still just waits.
-                        let outcome = self
-                            .send_body_to_pipe(
+                        let outcome = response_pipeline
+                            .wait_with_response_head_deadline(self.send_body_to_pipe(
                                 session,
                                 None,
                                 RequestBodyEvent::Abandoned,
@@ -913,8 +926,11 @@ where
                                 None,
                                 ctx,
                                 body_disposition,
-                            )
-                            .await?;
+                            ))
+                            .await
+                            .map_err(|error| {
+                                self.resolve_response_head_wait_error(session, ctx, response_pipeline, error)
+                            })?;
                         if outcome == DownstreamRequestOutcome::AbortSelectedResponse {
                             return Ok(outcome);
                         }

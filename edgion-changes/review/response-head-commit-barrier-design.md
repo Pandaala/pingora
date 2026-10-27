@@ -354,7 +354,9 @@ same absolute Tokio deadline must cover:
 - waiting between tasks;
 - an awaited writable body callback;
 - terminal-body processing; and
-- an awaited trailer companion.
+- an awaited trailer companion; and
+- selected request-side hooks and H2 upload flow-control waits while Hold is
+  active, including request abandonment notifications.
 
 H1 and H2 duplex selects therefore need a barrier deadline branch, and the
 shared pipeline must wrap callback awaits with `timeout_at` while Holding.
@@ -366,6 +368,82 @@ only Fail in v1; it cannot fail-open Release.
 Synchronous CPU cannot be preempted by Tokio. A processor must reserve bounded
 work before performing expensive synchronous work, and outbound calls retain
 their own dependency timeouts inside the overall head deadline.
+
+### Upload deadline regression guard (ISSUE-002)
+
+An outer duplex `select!` deadline does not run while a selected upload handler
+awaits a request hook or H2 capacity. The request-side operation must retain the
+same absolute Hold deadline and route expiration through the typed Timeout
+resolver before ordinary upload-error handling can absorb it. Cancellation
+terminates the exchange: never restart a partially transmitted chunk or renew
+the budget. Protocol cleanup must relinquish the H2 stream's reserved capacity
+without making sibling streams unusable, and the Hold outcome must be reported
+exactly once. This is a fork-owned enforcement requirement, not a replacement
+for peer I/O timeouts or a new whole-exchange timeout on Immediate traffic.
+
+Keep configuration with the application declaring Hold. Guardrail already
+provides `headHoldTimeoutMs`; AI unary conversion has its own `hold_timeout`.
+This correction does not change their defaults or add a TCP-level setting.
+Immediate waits must bypass timer construction; active waits reuse the existing
+absolute-timeout machinery rather than spawning watchdog tasks. A relative
+timeout restarted for every upload chunk is not equivalent.
+
+The `hold_upload_deadline` submodule of `test_upstream_response_body_sink`
+coordinates Hold selection before releasing a real upload. Its four tests cover
+H1/H2 pending request hooks, H2 zero and partial stream credit, progressing
+uploads, and idle responses. They observe one typed Timeout and no origin-head
+commit on failure, origin H1 closure/H2 CANCEL, and exactly one upstream
+attempt. Stalled-hook assertions allow legal TCP fragmentation.
+
+On 2026-10-26, all four tests passed on the local correction to Pingora
+`061a7f91`. Restoring the two pumps to that HEAD made both interruption tests
+fail at their three-second guard; restoring the correction made all four pass
+again. The isolated release `benchmark_response_head_upload_wait` measured
+8.13 ns per Immediate ready wait and 25.01 ns per active-Hold ready wait, with
+zero allocations in both cases. These are local ready-future microbenchmarks,
+not throughput or pending-timer measurements. No sibling manifest or lockfile
+was changed: inspected Edgion `bda681e4` still locks Pingora `1aaa45cc`.
+
+ISSUE-002 is resolved. Independent plan and final reviews approved the change.
+The proxy unit suite passed (231 tests, three ignored manual benchmarks), as
+did the core/proxy build check, proxy all-target Clippy, and formatting. The
+six related integration targets passed: request-body seam (68), response sink
+(66), terminal dispatch (32), H2 reset (10), H2 writer stall (4), and H2
+cache/reuse (8), totaling 188 integration tests.
+
+The first network sweep failed because this macOS host lacked the configured
+source address `127.0.0.2`. For the passing sweep, the fixture temporarily bound
+to `127.0.0.1` and was restored byte-for-byte afterwards. These six targets do
+not assert selection of the distinct `.2` source address; excluded `test_basic`
+and `test_upstream` do. Independent review confirmed this adaptation preserves
+the relevant timeout, stream cleanup, cache, and connection-reuse assertions.
+This is not an unchanged full core/TLS or source-IP-selection matrix result.
+
+Consumer verification also passed on 2026-10-26 in the separate
+`/Volumes/ExtStore/ws5/Edgion` checkout at `bda681e4`. A temporary Cargo patch
+resolved all 15 active Pingora-family packages to this local candidate; metadata
+and source hashes were captured before testing. The normal integration prepare
+script rebuilt the binaries. The existing `ai_unary_hold_transport` target,
+run with `--features test-util`, passed its real Edgion H1/H2 conversion, absolute
+deadline, cancellation, and reuse matrix. One shared Gateway/Controller topology
+then passed 256 cases: Guardrail (11), GuardrailEncoding (2), GrpcJsonTranscoder
+(40), AnthropicProvider (9), SingleProvider (23), SseStreaming (2), and full
+Transport (169). Final residue validation wiped 179 resources with zero errors
+and found all checked caches empty.
+
+The first direct GrpcJsonTranscoder invocation was rejected before executing
+tests because the client lacked the Gateway-capability environment. Repeating
+it with capabilities queried from the candidate binary passed all 40 cases;
+the original failed invocation remains in the run evidence. Runtime services
+and the owned Redis fixture were stopped. Edgion's manifest and lockfile were
+restored byte-for-byte, and its source-policy check again resolved the official
+dependency to `1aaa45cc`. No Edgion production code or formal dependency revision
+changed. The ws3 Edgion checkout was not modified. Evidence is under
+`/Volumes/ExtStore/ws5/Edgion/tmp/issue002-consumer/` (`final-summary.json`,
+`provenance.json`, `pingora-sources.json`, per-suite JSON/logs) and
+`tmp/integration_testing/testing_20261026_215501/` in that checkout. Its built
+debug artifacts remain candidate binaries; rebuild before testing the original
+locked dependency.
 
 ## Task ordering
 

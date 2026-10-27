@@ -52,11 +52,19 @@ that a header reached the wire.
 - application work units; and
 - one absolute wall-clock deadline.
 
-The deadline spans cross-batch retention, idle waits for more origin data, and
-awaited body/terminal/trailer callbacks. The pipeline wakes at the deadline; it
+The deadline spans cross-batch retention, idle waits for more origin data,
+awaited body/terminal/trailer callbacks, and concurrent request-side waits in
+the H1/H2 pumps (including request hooks and H2 upload flow control). Upload
+progress never renews the Hold budget. The pipeline wakes at the deadline; it
 does not depend on another origin event. Reservations and usage survive sink
 batch resets. Limit overflow is atomic: the candidate that crosses a limit is
 not partially retained.
+
+The application supplies the finite Hold duration through
+`ResponseHeadHoldLimits`; Pingora adds no listener/TCP default or new product
+configuration. Existing peer I/O timeouts remain independent. Immediate
+responses construct no Hold timer, and deadline waits use the existing Tokio
+absolute-timeout mechanism without a background watchdog.
 
 `ResponseBodySink` is the callback-local decision surface. An armed Hold has no
 decision yet. `Release`, `Replace`, and `Fail` remain pending until the shared

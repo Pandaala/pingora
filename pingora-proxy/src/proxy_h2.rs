@@ -906,8 +906,8 @@ where
                 // fail because the upstream already sent RFC 9113 §8.1's
                 // RST_STREAM(NO_ERROR); that costs nothing here (the response is
                 // complete) and is ignored, see `eos_write_optional`.
-                let outcome = self
-                    .send_body_to2(
+                let outcome = response_pipeline
+                    .wait_with_response_head_deadline(self.send_body_to2(
                         session,
                         None,
                         RequestBodyEvent::Abandoned,
@@ -918,8 +918,19 @@ where
                             eos_write_optional: true,
                             ..body_write.clone()
                         },
-                    )
-                    .await?;
+                    ))
+                    .await
+                    .map_err(|error| {
+                        if response_pipeline.response_head_wait_timed_out() {
+                            client_body.reserve_capacity(0);
+                        }
+                        self.resolve_response_head_wait_error(
+                            session,
+                            ctx,
+                            response_pipeline,
+                            error,
+                        )
+                    })?;
                 if outcome == UpstreamBodyOutcome::Downstream(DownstreamRequestOutcome::Terminate) {
                     session.set_keepalive(None);
                     finish_terminated_response(session).await;
@@ -1014,8 +1025,10 @@ where
                         }
                     };
                     let is_body_done = session.is_body_done();
-                    match self
-                        .send_body_to2(
+                    // Bound both request hooks and a blocked H2 capacity wait
+                    // while the selected branch suspends the outer Hold timer.
+                    let outcome = response_pipeline
+                        .wait_with_response_head_deadline(self.send_body_to2(
                             session,
                             body,
                             RequestBodyEvent::from(is_body_done),
@@ -1023,9 +1036,18 @@ where
                             client_body,
                             ctx,
                             &body_write,
-                        )
-                        .await
-                    {
+                        ))
+                        .await;
+                    match outcome {
+                        Err(error) if response_pipeline.response_head_wait_timed_out() => {
+                            // The write future may have sent a prefix. Never resume
+                            // or replay it, and release its outstanding reservation
+                            // before the failed exchange tears down the stream.
+                            client_body.reserve_capacity(0);
+                            return Err(self.resolve_response_head_wait_error(
+                                session, ctx, response_pipeline, error,
+                            ));
+                        },
                         Ok(UpstreamBodyOutcome::Downstream(
                             DownstreamRequestOutcome::Complete(request_done)
                             | DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(request_done),
@@ -1071,15 +1093,18 @@ where
                         // the loop would otherwise cost it.
                         Ok(UpstreamBodyOutcome::UpstreamDoneReceiving { terminal_event_delivered }) => {
                             if !terminal_event_delivered {
-                                match self
-                                    .finish_downstream_body_side(
+                                let outcome = response_pipeline
+                                    .wait_with_response_head_deadline(self.finish_downstream_body_side(
                                         session,
                                         client_body,
                                         ctx,
                                         &body_write,
-                                    )
-                                    .await?
-                                {
+                                    ))
+                                    .await
+                                    .map_err(|error| {
+                                        self.resolve_response_head_wait_error(session, ctx, response_pipeline, error)
+                                    })?;
+                                match outcome {
                                     DownstreamRequestOutcome::Terminate => {
                                         session.set_keepalive(None);
                                         finish_terminated_response(session).await;

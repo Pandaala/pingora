@@ -117,7 +117,7 @@ impl ResponsePipelineState {
                 self.upstream_reusable = false;
                 Error::e_explain(
                     InternalError,
-                    "response head barrier callback exceeded its absolute deadline",
+                    "response head barrier operation exceeded its absolute deadline",
                 )
             }
         }
@@ -130,6 +130,10 @@ impl ResponsePipelineState {
         let deadline = self.response_head_deadline();
         let waited = await_response_head_deadline(deadline, future).await;
         self.finish_head_deadline_wait(waited)
+    }
+
+    pub(crate) fn response_head_wait_timed_out(&self) -> bool {
+        self.pending_head_boundary == Some(ResponseHeadBoundary::Timeout)
     }
 
     fn take_pending_head_boundary(&mut self) -> Option<ResponseHeadBoundary> {

@@ -75,6 +75,9 @@ use tokio::net::{TcpListener, TcpStream};
 #[path = "upstream_response_body_sink/custom_request_contract.rs"]
 mod custom_request_contract;
 
+#[path = "upstream_response_body_sink/hold_upload_deadline.rs"]
+mod hold_upload_deadline;
+
 const ORIGIN_BODY: &[u8] = b"hello world";
 
 /// What every client of a `terminate`-exercising path must see if (and only

@@ -1543,6 +1543,67 @@ async fn bodyless_status_hold_is_rejected_before_output() {
     }
 }
 
+/// Measures the wrapper used around selected upload operations. No timing
+/// threshold is asserted: hosts differ, but Immediate must stay allocation-free.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "manual upload deadline wrapper benchmark"]
+async fn benchmark_response_head_upload_wait() {
+    const ITERATIONS: usize = 100_000;
+    for hold in [false, true] {
+        let mut state = ResponsePipelineState::default();
+        if hold {
+            state
+                .head_barrier
+                .select(ResponseHeadCommitPlan::hold(ResponseHeadHoldLimits::new(
+                    1024,
+                    1024,
+                    16,
+                    32,
+                    4096,
+                    32,
+                    std::time::Duration::from_secs(60),
+                )))
+                .unwrap();
+        }
+        for _ in 0..2_000 {
+            black_box(
+                state
+                    .wait_with_response_head_deadline(async { Ok(black_box(1usize)) })
+                    .await
+                    .unwrap(),
+            );
+        }
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            black_box(
+                state
+                    .wait_with_response_head_deadline(async { Ok(black_box(1usize)) })
+                    .await
+                    .unwrap(),
+            );
+        }
+        let elapsed = started.elapsed();
+        crate::test_allocator::start_counting();
+        for _ in 0..ITERATIONS {
+            black_box(
+                state
+                    .wait_with_response_head_deadline(async { Ok(black_box(1usize)) })
+                    .await
+                    .unwrap(),
+            );
+        }
+        let allocations = crate::test_allocator::stop_counting();
+        println!(
+            "upload wait hold={hold}: {:.2} ns/wait, {:.4} allocations/wait",
+            elapsed.as_nanos() as f64 / ITERATIONS as f64,
+            allocations as f64 / ITERATIONS as f64
+        );
+        if !hold {
+            assert_eq!(allocations, 0);
+        }
+    }
+}
+
 /// Microbenchmark the actual shared H1 per-body-task path.
 ///
 /// Kept ignored because wall-clock output is evidence for a review, not a
