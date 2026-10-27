@@ -119,6 +119,13 @@ paths from running those modules again. Informational responses do not replace
 the final capability; status 101 is final. The latch resets on every keepalive
 request, and debug builds assert that planned and actual capabilities agree.
 
+This ordering also applies when Hold releases a retained header/body/trailer
+sequence at `TerminalBeforeTrailers`: selected-header modules and capability
+planning run before downstream body/trailer hooks. An undecided Hold still
+does not prepare a header. Terminal-header and replacement responses retain
+body filtering and length reconciliation before preparation; those paths do
+not carry retained origin trailers. See the [pipeline regression guard](../review/response-task-pipeline-consolidation.md#held-response-trailer-capability).
+
 ## Source merge and retained fork strengths
 
 The behavior was transplanted from the uncommitted response-trailer patch in

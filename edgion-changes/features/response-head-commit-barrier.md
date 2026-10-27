@@ -27,6 +27,12 @@ No final header is prepared, queued, or handed to a writer before the Hold
 decision. Release is only permission to start writer handoff; it is not proof
 that a header reached the wire.
 
+For ordinary Release output, `will_commit` and downstream header preparation
+precede downstream body/trailer hooks, including when the release occurs at
+`TerminalBeforeTrailers`. Trailer hooks therefore query the capability of the
+selected header after header modules. Terminal-header and bounded replacement
+output still reconcile filtered body length before preparing the header.
+
 ## Generic Pingora mechanics
 
 `ProxyHttp` exposes five narrow response-head seams:

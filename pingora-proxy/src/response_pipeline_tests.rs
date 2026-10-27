@@ -32,6 +32,9 @@ struct PipelineBenchProxy;
 #[path = "response_pipeline_downstream_tests.rs"]
 mod downstream;
 
+#[path = "response_pipeline_trailer_capability_tests.rs"]
+mod trailer_capability;
+
 struct HoldReleaseCtx {
     response_filter_complete: bool,
     plan_calls: AtomicUsize,
@@ -39,6 +42,9 @@ struct HoldReleaseCtx {
     body_calls: usize,
     downstream_body_calls: usize,
     downstream_trailer_calls: usize,
+    trailer_capabilities: Vec<bool>,
+    fail_downstream_trailer: bool,
+    immediate: bool,
     release_on_body_call: Option<usize>,
     emit_extra_on_body_call: Option<usize>,
     stall_on_body_call: Option<usize>,
@@ -65,6 +71,9 @@ impl Default for HoldReleaseCtx {
             body_calls: 0,
             downstream_body_calls: 0,
             downstream_trailer_calls: 0,
+            trailer_capabilities: Vec::new(),
+            fail_downstream_trailer: false,
+            immediate: false,
             release_on_body_call: None,
             emit_extra_on_body_call: None,
             stall_on_body_call: None,
@@ -124,6 +133,9 @@ impl ProxyHttp for HoldReleaseProxy {
             "head plan must run after the final response filter"
         );
         ctx.plan_calls.fetch_add(1, Ordering::Relaxed);
+        if ctx.immediate {
+            return Ok(ResponseHeadCommitPlan::Immediate);
+        }
         Ok(ResponseHeadCommitPlan::Hold(
             ResponseHeadHoldPlan::new_for_test(ResponseHeadHoldLimits::new_full_for_test(
                 ctx.max_input_bytes,
@@ -239,11 +251,16 @@ impl ProxyHttp for HoldReleaseProxy {
 
     async fn response_trailer_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         _trailers: &mut http::HeaderMap,
         ctx: &mut Self::CTX,
     ) -> Result<Option<Bytes>> {
         ctx.downstream_trailer_calls += 1;
+        ctx.trailer_capabilities
+            .push(session.as_downstream().response_trailers_supported());
+        if ctx.fail_downstream_trailer {
+            return Error::e_explain(InternalError, "downstream trailer failure marker");
+        }
         Ok(None)
     }
 }

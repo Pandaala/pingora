@@ -101,7 +101,8 @@ The `status` inside each record is authoritative.
   per pump batch.
 - [Shared response-task pipeline](response-task-pipeline-consolidation.md): H1,
   H2, and custom share hook/cache/terminal/sink semantics while retaining
-  explicit protocol framing and upgrade policy.
+  explicit protocol framing and upgrade policy; ISSUE-003 guards released-head
+  capability planning before downstream trailer hooks.
 - [Response processor driver ownership](response-processor-driver-ownership.md):
   final response processors remain Edgion-owned in one request-local driver;
   body/trailer execution leases distinguish callback cancellation from normal

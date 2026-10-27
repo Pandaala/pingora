@@ -74,6 +74,55 @@ Validated suites and exact counts are maintained in
 
 ## Revisit triggers
 
+### Held response trailer capability
+
+ISSUE-003 is a fork-owned ordering defect corrected on 2026-10-27
+(regression guard). Hold released at `TerminalBeforeTrailers` previously ran
+downstream trailer hooks before selected-header preparation. An H1 hook saw
+an uninitialized planned capability as false even when the selected writer
+would use chunked framing. This violates the existing
+[same-batch planning contract](../features/response-trailers.md#same-batch-planning).
+
+Ordinary released output now performs writer claim and header preparation
+before downstream body/trailer filters. Undecided Hold remains unprepared;
+header modules still run exactly once. Terminal-header and replacement output
+retain filtering and length reconciliation before preparation: they have no
+retained origin trailer sequence and must compute the final body length first.
+
+`response_pipeline_trailer_capability_tests.rs` exercises H1/H2 origin policies
+with an actual H1 downstream writer, Immediate, release on data, and release
+on trailer, HTTP/1.0 and fixed-length negative cases, and header modules that
+switch framing in both directions. It checks capability inside the hook,
+exact trailer delivery, and one module invocation through writer handoff.
+Its failure-path case verifies that a downstream trailer-hook error propagates
+after preparation without committing the head or writing response bytes.
+
+Verification on the corrected working tree: proxy library 233 passed, three
+existing ignored tests; focused core H1 library 389 passed; the six proxy
+integration suites (request seam, terminal dispatch, body sink, H2 reset,
+H2 stalled response, H2 cache/reuse) passed 68/32/66/10/4/8 cases. The new
+capability test fails on the original implementation with `false` instead of
+`true` for trailer-triggered Release. Core/proxy all-target compilation and
+Clippy passed (existing warnings remain); formatting and diff checks passed.
+Three independent read-only reviewers checked ordering, protocols/cache, and
+the Edgion consumer; none found a blocking issue.
+
+The first integration attempt failed because this macOS host lacks the
+fixture's `127.0.0.2` source-bind alias. Passing integration runs used the same
+built test executables with a copied fixture directory whose source bind was
+`127.0.0.1`; repository fixtures and host network configuration were unchanged.
+These results do not claim a full core/TLS matrix or a rebuilt Edgion binary.
+
+Consumer inspection used Pingora `6422c882` and Edgion `60699637`; Edgion's
+lockfile selects Pingora `1aaa45cc`. Its downstream trailer hook does not query
+capability; no deployed Edgion failure or consumer adoption is claimed.
+This does not change the separately recorded upstream h2 decoder limitation.
+
+Revisit when Release filtering, terminal reconciliation, or header-module
+preparation moves, especially if replacement responses gain trailers.
+
+### Other pipeline changes
+
 - a fourth response transport or a new protocol-specific task variant;
 - a change to cache admission, terminal task ordering, or sink drain ordering;
 - enabling custom upstreams in Edgion, especially before resolving the

@@ -461,14 +461,6 @@ where
                     if replacement {
                         state.suppress_downstream_body = true;
                     }
-                } else if filter_downstream_body {
-                    self.downstream_response_filter_tasks_in_order(
-                        session,
-                        &mut out_tasks[start..],
-                        &mut state.downstream_terminal_body,
-                        ctx,
-                    )
-                    .await?;
                 }
                 if let Some(header) = out_tasks[start..].iter().find_map(|task| match task {
                     HttpTask::Header(header, _)
@@ -485,6 +477,19 @@ where
                 session
                     .prepare_response_headers(&mut out_tasks[start..])
                     .await?;
+                // A released Hold can contain both the selected head and trailers.
+                // Plan framing after header modules before trailer hooks query it.
+                // Terminal/replacement bodies above must instead be reconciled
+                // before header preparation and must not be filtered twice.
+                if !terminal_header && !replacement && filter_downstream_body {
+                    self.downstream_response_filter_tasks_in_order(
+                        session,
+                        &mut out_tasks[start..],
+                        &mut state.downstream_terminal_body,
+                        ctx,
+                    )
+                    .await?;
+                }
             }
             ResponseHeadBarrierOutput::Held => {}
         }
