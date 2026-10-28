@@ -406,6 +406,7 @@ where
             pipe_up_to_down_response(client_session, tx, pipe_state),
         )
         .await;
+        self.cancel_response_head_hold(session, ctx, &mut response_pipeline);
 
         if let Some(custom_session) = session.downstream_session.as_custom_mut() {
             if let Some(downstream_custom_message_writer) = downstream_custom_message_writer {
@@ -582,8 +583,20 @@ where
         let mut tasks = tasks.into_iter();
         for mut t in tasks.by_ref() {
             let task_source_done = t.is_end();
-
-            let revalidated = self.revalidate_or_stale(session, &mut t, ctx).await;
+            if self
+                .enforce_response_head_source_input(session, &t, ctx, pipeline, &mut filtered_tasks)
+                .await?
+            {
+                break;
+            }
+            let revalidated = pipeline
+                .wait_with_response_head_deadline(async {
+                    Ok(self.revalidate_or_stale(session, &mut t, ctx).await)
+                })
+                .await
+                .map_err(|error| {
+                    self.resolve_response_head_wait_error(session, ctx, pipeline, error)
+                })?;
             if revalidated {
                 serve_from_cache.enable();
                 response_state.enable_cached_response();
@@ -592,12 +605,25 @@ where
             }
             #[cfg(feature = "upstream_modules")]
             if let HttpTask::Header(header, end_of_stream) = &t {
-                self.inner
-                    .adjust_upstream_modules(session, header, *end_of_stream, ctx)
-                    .await?;
+                pipeline
+                    .wait_with_response_head_deadline(self.inner.adjust_upstream_modules(
+                        session,
+                        header,
+                        *end_of_stream,
+                        ctx,
+                    ))
+                    .await
+                    .map_err(|error| {
+                        self.resolve_response_head_wait_error(session, ctx, pipeline, error)
+                    })?;
             }
             #[cfg(feature = "upstream_modules")]
-            session.upstream_modules_filter_task(&mut t).await?;
+            pipeline
+                .wait_with_response_head_deadline(session.upstream_modules_filter_task(&mut t))
+                .await
+                .map_err(|error| {
+                    self.resolve_response_head_wait_error(session, ctx, pipeline, error)
+                })?;
             let compression_prefix = session
                 .upstream_compression
                 .response_filter_with_preceding(&mut t);
@@ -613,6 +639,9 @@ where
                     &mut filtered_tasks,
                 )
                 .await?;
+                if pipeline.origin_abandoned {
+                    break;
+                }
             }
             if !pipeline.sink.is_terminated() {
                 self.response_task_pipeline(
@@ -627,7 +656,9 @@ where
                 )
                 .await?;
             }
-
+            if pipeline.origin_abandoned {
+                break;
+            }
             source_done |= task_source_done;
             if serve_from_cache.is_miss_header() {
                 response_state.enable_cached_response();
@@ -662,10 +693,15 @@ where
             session.write_response_tasks(filtered_tasks).await?;
         }
 
-        Ok(Some(ResponseTaskBatchOutcome::Progress {
-            source_done,
-            terminated: pipeline.sink.is_terminated() && !source_done,
-        }))
+        if pipeline.origin_abandoned {
+            abort_cache_after_response_source_failure(session, false);
+            Ok(Some(ResponseTaskBatchOutcome::OriginAbandoned))
+        } else {
+            Ok(Some(ResponseTaskBatchOutcome::Progress {
+                source_done,
+                terminated: pipeline.sink.is_terminated() && !source_done,
+            }))
+        }
     }
 
     // returns whether server (downstream) session can be reused
@@ -870,8 +906,8 @@ where
                 // fail because the upstream already sent RFC 9113 §8.1's
                 // RST_STREAM(NO_ERROR); that costs nothing here (the response is
                 // complete) and is ignored, see `eos_write_optional`.
-                let outcome = self
-                    .send_body_to2(
+                let outcome = response_pipeline
+                    .wait_with_response_head_deadline(self.send_body_to2(
                         session,
                         None,
                         RequestBodyEvent::Abandoned,
@@ -882,8 +918,19 @@ where
                             eos_write_optional: true,
                             ..body_write.clone()
                         },
-                    )
-                    .await?;
+                    ))
+                    .await
+                    .map_err(|error| {
+                        if response_pipeline.response_head_wait_timed_out() {
+                            client_body.reserve_capacity(0);
+                        }
+                        self.resolve_response_head_wait_error(
+                            session,
+                            ctx,
+                            response_pipeline,
+                            error,
+                        )
+                    })?;
                 if outcome == UpstreamBodyOutcome::Downstream(DownstreamRequestOutcome::Terminate) {
                     session.set_keepalive(None);
                     finish_terminated_response(session).await;
@@ -917,6 +964,10 @@ where
                 .as_mut()
                 .map(|reader| reader.next())
                 .into();
+            let response_head_timeout: OptionFuture<_> = response_pipeline
+                .response_head_deadline()
+                .map(tokio::time::sleep_until)
+                .into();
 
             // partial read support, this check will also be false if cache is disabled.
             let support_cache_partial_read =
@@ -926,7 +977,13 @@ where
             // Similar logic in h1 need to reserve capacity first to avoid deadlock
             // But we don't need to do the same because the h2 client_body pipe is unbounded (never block)
             tokio::select! {
-
+                Some(()) = response_head_timeout => {
+                    return Err(self.resolve_response_head_idle_timeout(
+                        session,
+                        ctx,
+                        response_pipeline,
+                    ));
+                },
 
                 // NOTE: cannot avoid this copy since h2 owns the buf
                 body = session.downstream_session.read_body_or_idle(downstream_state.is_done()), if downstream_state.can_poll() && !upstream_stopped_receiving => {
@@ -968,7 +1025,10 @@ where
                         }
                     };
                     let is_body_done = session.is_body_done();
-                    let outcome = self.send_body_to2(
+                    // Bound both request hooks and a blocked H2 capacity wait
+                    // while the selected branch suspends the outer Hold timer.
+                    let outcome = response_pipeline
+                        .wait_with_response_head_deadline(self.send_body_to2(
                             session,
                             body,
                             RequestBodyEvent::from(is_body_done),
@@ -976,10 +1036,18 @@ where
                             client_body,
                             ctx,
                             &body_write,
-                        )
+                        ))
                         .await;
                     match outcome {
-
+                        Err(error) if response_pipeline.response_head_wait_timed_out() => {
+                            // The write future may have sent a prefix. Never resume
+                            // or replay it, and release its outstanding reservation
+                            // before the failed exchange tears down the stream.
+                            client_body.reserve_capacity(0);
+                            return Err(self.resolve_response_head_wait_error(
+                                session, ctx, response_pipeline, error,
+                            ));
+                        },
                         Ok(UpstreamBodyOutcome::Downstream(
                             DownstreamRequestOutcome::Complete(request_done)
                             | DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(request_done),
@@ -1025,13 +1093,17 @@ where
                         // the loop would otherwise cost it.
                         Ok(UpstreamBodyOutcome::UpstreamDoneReceiving { terminal_event_delivered }) => {
                             if !terminal_event_delivered {
-                                let outcome = self.finish_downstream_body_side(
+                                let outcome = response_pipeline
+                                    .wait_with_response_head_deadline(self.finish_downstream_body_side(
                                         session,
                                         client_body,
                                         ctx,
                                         &body_write,
-                                    )
-                                    .await?;
+                                    ))
+                                    .await
+                                    .map_err(|error| {
+                                        self.resolve_response_head_wait_error(session, ctx, response_pipeline, error)
+                                    })?;
                                 match outcome {
                                     DownstreamRequestOutcome::Terminate => {
                                         session.set_keepalive(None);
@@ -1131,6 +1203,7 @@ where
                                 }
                                 source_done
                             }
+                            ResponseTaskBatchOutcome::OriginAbandoned => true,
                         };
                         if session.was_upgraded() {
                             return Error::e_explain(H2Error, "upgraded while proxying to h2 session");
@@ -1169,6 +1242,7 @@ where
                                 }
                                 source_done
                             }
+                            ResponseTaskBatchOutcome::OriginAbandoned => true,
                         };
                         if session.was_upgraded() {
                             // it is very weird if the downstream session decides to upgrade

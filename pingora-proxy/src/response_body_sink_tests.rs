@@ -28,6 +28,147 @@ fn push_accumulates_and_take_drains() {
 }
 
 #[test]
+fn head_release_is_disarmed_by_default() {
+    let mut sink = ResponseBodySink::new();
+    assert!(!sink.release_response_head());
+    assert!(sink.take_response_head_decision().is_none());
+}
+
+#[test]
+fn armed_head_release_latches_once() {
+    let mut sink = ResponseBodySink::new();
+    assert!(sink.arm_response_head_release());
+    assert!(sink.release_response_head());
+    assert!(!sink.release_response_head());
+    assert!(matches!(
+        sink.take_response_head_decision(),
+        Some(ResponseHeadDecision::Release)
+    ));
+    assert!(!sink.release_response_head());
+    assert!(sink.take_response_head_decision().is_none());
+}
+
+#[test]
+fn reset_batch_preserves_head_release_state() {
+    let mut armed = ResponseBodySink::new();
+    assert!(armed.arm_response_head_release());
+    armed.reset_batch();
+    assert!(armed.release_response_head());
+
+    let mut requested = ResponseBodySink::new();
+    assert!(requested.arm_response_head_release());
+    assert!(requested.release_response_head());
+    requested.reset_batch();
+    assert!(matches!(
+        requested.take_response_head_decision(),
+        Some(ResponseHeadDecision::Release)
+    ));
+}
+
+#[test]
+fn disarm_prevents_late_release() {
+    let mut sink = ResponseBodySink::new();
+    assert!(sink.arm_response_head_release());
+    sink.disarm_response_head_release();
+    assert!(!sink.release_response_head());
+}
+
+#[test]
+fn release_can_be_upgraded_to_replace_or_fail() {
+    let mut replace = ResponseBodySink::new();
+    assert!(replace.arm_response_head_release());
+    assert!(replace.release_response_head());
+    replace
+        .replace_response_head(ResponseHeadReplacement::new(
+            Box::new(pingora_http::ResponseHeader::build(403, None).unwrap()),
+            vec![Bytes::from_static(b"blocked")],
+        ))
+        .unwrap();
+    assert!(matches!(
+        replace.take_response_head_decision(),
+        Some(ResponseHeadDecision::Replace(_))
+    ));
+
+    let mut fail = ResponseBodySink::new();
+    assert!(fail.arm_response_head_release());
+    assert!(fail.release_response_head());
+    fail.fail_response_head(Error::explain(InternalError, "decision failure"))
+        .unwrap();
+    assert!(matches!(
+        fail.take_response_head_decision(),
+        Some(ResponseHeadDecision::Fail(error)) if error.to_string().contains("decision failure")
+    ));
+}
+
+#[test]
+fn only_staged_head_decisions_are_reported_as_pending() {
+    let mut sink = ResponseBodySink::new();
+    assert!(!sink.response_head_decision_pending());
+
+    assert!(sink.arm_response_head_release());
+    assert!(sink.response_head_is_held());
+    assert!(!sink.response_head_decision_pending());
+
+    assert!(sink.release_response_head());
+    assert!(sink.response_head_decision_pending());
+    assert!(matches!(
+        sink.take_response_head_decision(),
+        Some(ResponseHeadDecision::Release)
+    ));
+    assert!(!sink.response_head_decision_pending());
+
+    assert!(sink.arm_response_head_release());
+    sink.replace_response_head(ResponseHeadReplacement::new(
+        Box::new(pingora_http::ResponseHeader::build(403, None).unwrap()),
+        Vec::new(),
+    ))
+    .unwrap();
+    assert!(sink.response_head_decision_pending());
+    assert!(matches!(
+        sink.take_response_head_decision(),
+        Some(ResponseHeadDecision::Replace(_))
+    ));
+
+    assert!(sink.arm_response_head_release());
+    sink.fail_response_head(Error::explain(InternalError, "decision failure"))
+        .unwrap();
+    assert!(sink.response_head_decision_pending());
+    assert!(matches!(
+        sink.take_response_head_decision(),
+        Some(ResponseHeadDecision::Fail(_))
+    ));
+}
+
+#[test]
+fn pending_release_keeps_charging_the_hold_work_budget() {
+    let mut sink = ResponseBodySink::new();
+    assert!(sink.arm_response_head_release_with_work_limit(2));
+    sink.reserve_response_head_work(1).unwrap();
+    assert!(sink.release_response_head());
+
+    sink.reserve_response_head_work(1).unwrap();
+    assert_eq!(sink.response_head_work_units(), Some(2));
+    assert!(sink.reserve_response_head_work(1).is_err());
+    assert!(sink.response_head_work_limit_exceeded());
+    assert!(sink.response_head_decision_pending());
+}
+
+#[test]
+fn conflicting_terminal_head_decisions_fail_closed() {
+    let mut sink = ResponseBodySink::new();
+    assert!(sink.arm_response_head_release());
+    sink.replace_response_head(ResponseHeadReplacement::new(
+        Box::new(pingora_http::ResponseHeader::build(403, None).unwrap()),
+        Vec::new(),
+    ))
+    .unwrap();
+    assert!(sink
+        .fail_response_head(Error::explain(InternalError, "late fail"))
+        .is_err());
+    assert!(sink.response_head_is_held());
+}
+
+#[test]
 fn budget_is_consumed_and_exhaustion_errors() {
     let mut sink = ResponseBodySink::new();
     assert_eq!(sink.remaining_budget(), RESPONSE_BODY_EMIT_BUDGET);

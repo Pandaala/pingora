@@ -55,8 +55,8 @@ use pingora_core::utils::tls::CertKey;
 use pingora_error::{Error, ErrorSource, ErrorType::*, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{
-    FailToProxy, ProxyHttp, ProxyWarnLogContext, ResponseBodySink, Session,
-    UpstreamResponseBodyEvent,
+    FailToProxy, ProxyHttp, ProxyWarnLogContext, ResponseBodySink, ResponseHeadCommitPlan,
+    ResponseHeadSource, Session, UpstreamResponseBodyEvent,
 };
 use std::collections::HashSet;
 use std::sync::{
@@ -353,6 +353,16 @@ impl ProxyHttp for ExampleProxyHttp {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         response_filter_common(session, upstream_response, ctx)
+    }
+
+    fn response_head_commit_plan(
+        &self,
+        session: &Session,
+        _source: ResponseHeadSource,
+        _response: &ResponseHeader,
+        _ctx: &Self::CTX,
+    ) -> Result<ResponseHeadCommitPlan> {
+        response_feature_support::http_response_head_commit_plan(session)
     }
 
     async fn request_body_filter(

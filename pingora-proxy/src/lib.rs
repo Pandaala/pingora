@@ -102,6 +102,7 @@ mod pump_termination;
 mod request_relay;
 mod response_body_sink;
 mod response_cache_relay;
+mod response_head_barrier;
 mod response_pipeline;
 mod response_reconciliation;
 pub mod subrequest;
@@ -125,12 +126,19 @@ pub use proxy_trait::{
 pub use response_body_sink::{
     ResponseBodySink, RESPONSE_BODY_EMIT_BUDGET, RESPONSE_BODY_EMIT_CHUNK_BUDGET,
 };
+pub use response_head_barrier::{
+    ResponseHeadBoundary, ResponseHeadBoundaryAction, ResponseHeadCommitPlan,
+    ResponseHeadHoldLimits, ResponseHeadHoldPlan, ResponseHeadOutcome, ResponseHeadReplacement,
+    ResponseHeadSource, ResponseHeadUsage,
+};
 
 pub mod prelude {
     pub use crate::{
         http_proxy, http_proxy_service, ProxyHttp, ProxyWarnLogContext, RequestBodyAction,
-        RequestRelayPlan, RequestRelayRetryState, RequestReplayPolicy, Session,
-        UpstreamRequestBodyDisposition, UpstreamResponseBodyEvent,
+        RequestRelayPlan, RequestRelayRetryState, RequestReplayPolicy, ResponseHeadBoundary,
+        ResponseHeadBoundaryAction, ResponseHeadCommitPlan, ResponseHeadHoldLimits,
+        ResponseHeadHoldPlan, ResponseHeadOutcome, ResponseHeadReplacement, ResponseHeadSource,
+        ResponseHeadUsage, Session, UpstreamRequestBodyDisposition, UpstreamResponseBodyEvent,
     };
 }
 
@@ -734,7 +742,10 @@ pub struct Session {
     /// Number of response header tasks whose downstream module filtering was
     /// completed early so a same-batch trailer hook can query planned framing.
     prepared_response_headers: usize,
-    /// A final response was selected for downstream writer handoff.
+    /// A final upstream response has activated the bounded head barrier. The
+    /// response processor set may already have consumed body input even though
+    /// no downstream final header has been written, so this request must never
+    /// start another upstream attempt.
     response_head_attempt_selected: bool,
     preserved_selected_response_after_request_termination: bool,
     /// Flag that is set when the shutdown process has begun.
@@ -776,12 +787,17 @@ impl Session {
         }
     }
 
+    pub(crate) fn mark_response_head_attempt_selected(&mut self) {
+        self.response_head_attempt_selected = true;
+    }
+
     pub(crate) fn mark_response_head_writer_handoff(&mut self) {
         self.response_head_attempt_selected = true;
     }
 
     /// Whether the response pipeline selected a final response for this
-    /// request at downstream writer handoff.
+    /// request, even if a response-head hold has not handed it to the writer
+    /// yet.
     ///
     /// This deliberately excludes responses written directly by application
     /// request hooks. Callers that arbitrate a late local reply against an

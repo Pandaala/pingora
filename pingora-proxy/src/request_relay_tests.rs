@@ -411,7 +411,7 @@ async fn qualified_abandoned_terminate_preserves_a_response_selected_before_the_
         let log = Arc::new(Mutex::new(Vec::new()));
         let proxy = make_proxy(HookBehavior::Terminate, HookBehavior::Continue, log);
         let (mut session, _client) = empty_request_session().await;
-        session.mark_response_head_writer_handoff();
+        session.mark_response_head_attempt_selected();
 
         let outcome = proxy
             .request_relay_event_with_abandonment_policy(
@@ -440,7 +440,7 @@ async fn selected_incomplete_response_is_explicitly_aborted() {
             let log = Arc::new(Mutex::new(Vec::new()));
             let proxy = make_proxy(HookBehavior::Terminate, HookBehavior::Continue, log);
             let (mut session, _client) = empty_request_session().await;
-            session.mark_response_head_writer_handoff();
+            session.mark_response_head_attempt_selected();
 
             let outcome = proxy
                 .request_relay_event(protocol, &mut session, None, event, &mut Vec::new())
@@ -589,7 +589,7 @@ async fn trailer_terminate_aborts_a_preselected_response_but_keeps_a_hook_local_
         Arc::new(Mutex::new(Vec::new())),
     );
     let (mut session, _client) = trailer_request_session().await;
-    session.mark_response_head_writer_handoff();
+    session.mark_response_head_attempt_selected();
     let outcome = proxy
         .request_relay_event(
             RequestRelayProtocol::H2,

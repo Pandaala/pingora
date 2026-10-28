@@ -42,6 +42,46 @@ fn relay_plan_defaults_to_ordinary_replayable() {
 }
 
 #[test]
+fn response_head_hooks_have_fail_closed_defaults() {
+    let io = tokio_test::io::Builder::new().build();
+    let session = Session::new_h1(Box::new(io));
+    let header = ResponseHeader::build(200, None).unwrap();
+    let mut ctx = ();
+
+    assert!(matches!(
+        DefaultsOnly
+            .response_head_commit_plan(&session, ResponseHeadSource::Origin, &header, &ctx,)
+            .unwrap(),
+        ResponseHeadCommitPlan::Immediate
+    ));
+    DefaultsOnly
+        .response_head_will_commit(&session, &header, &mut ctx)
+        .unwrap();
+
+    match DefaultsOnly.response_head_hold_boundary(
+        &session,
+        ResponseHeadBoundary::Timeout,
+        &mut ctx,
+    ) {
+        ResponseHeadBoundaryAction::Fail(error) => {
+            assert_eq!(error.etype(), &InternalError);
+            assert!(!error.retry());
+            assert!(error.to_string().contains("timeout"));
+        }
+        ResponseHeadBoundaryAction::Replace(_) => {
+            panic!("default Hold boundary must fail closed")
+        }
+    }
+
+    DefaultsOnly.response_head_hold_outcome(
+        &session,
+        ResponseHeadOutcome::Failed(ResponseHeadBoundary::Timeout),
+        ResponseHeadUsage::default(),
+        &mut ctx,
+    );
+}
+
+#[test]
 fn proxy_http_remains_object_compatible() {
     fn accept_dyn(_proxy: &dyn ProxyHttp<CTX = ()>) {}
 

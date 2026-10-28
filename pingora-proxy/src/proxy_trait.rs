@@ -479,6 +479,18 @@ pub trait ProxyHttp {
         Ok(())
     }
 
+    /// Whether this request may select a response-head Hold after cache lookup.
+    ///
+    /// The cache layer checks this request-stage fact after
+    /// [`Self::request_cache_filter`] and before cache-key generation or
+    /// lookup. A true value disables cache lookup and admission for the
+    /// request, because Hold and entity caching are mutually exclusive in the
+    /// initial response-head barrier contract. The default preserves existing
+    /// cache behavior.
+    fn response_head_may_hold(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
+        false
+    }
+
     /// This callback generates the cache key.
     ///
     /// This callback is called only when cache is enabled for this request.
@@ -723,6 +735,79 @@ pub trait ProxyHttp {
         Self::CTX: Send + Sync,
     {
         Ok(())
+    }
+
+    /// Select how the final downstream response head is committed.
+    ///
+    /// This synchronous hook runs after [`Self::response_filter`] succeeds, so
+    /// the application sees the final post-filter status and headers. It runs
+    /// before downstream module header preparation or writer handoff. Interim
+    /// informational responses do not call it.
+    ///
+    /// The default [`ResponseHeadCommitPlan::Immediate`] preserves existing
+    /// behavior without allocating. Applications may construct a bounded Hold
+    /// for supported ordinary final origin responses. Unsupported cache,
+    /// custom, upgrade, or tunnel shapes reach the typed boundary hook and
+    /// never degrade silently to Immediate.
+    fn response_head_commit_plan(
+        &self,
+        _session: &Session,
+        _source: ResponseHeadSource,
+        _response: &ResponseHeader,
+        _ctx: &Self::CTX,
+    ) -> Result<ResponseHeadCommitPlan> {
+        Ok(ResponseHeadCommitPlan::Immediate)
+    }
+
+    /// Observe the exact final response head selected for downstream commit.
+    ///
+    /// The response pipeline calls this synchronously after an Immediate,
+    /// Release, or Replace decision has selected its final head, but before
+    /// downstream module preparation, task queueing, or writer handoff. An
+    /// error aborts the uncommitted response.
+    fn response_head_will_commit(
+        &self,
+        _session: &Session,
+        _chosen_header: &ResponseHeader,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Resolve a terminal or resource boundary reached while Hold is active.
+    ///
+    /// This hook is synchronous so it remains callable after cancellation of
+    /// an async response processor. The default fails closed with a
+    /// non-retryable internal error. A source [`HttpTask::Failed`] preserves
+    /// its original error and does not pass through this mapper.
+    fn response_head_hold_boundary(
+        &self,
+        _session: &Session,
+        boundary: ResponseHeadBoundary,
+        _ctx: &mut Self::CTX,
+    ) -> ResponseHeadBoundaryAction {
+        let mut error = Error::explain(
+            InternalError,
+            format!(
+                "response head Hold reached an unresolved {} boundary",
+                boundary.as_str()
+            ),
+        );
+        error.set_retry(false);
+        ResponseHeadBoundaryAction::Fail(error)
+    }
+
+    /// Observe the final Hold disposition and aggregate resource usage.
+    ///
+    /// This is a notification hook, not another decision point. It receives no
+    /// body content and defaults to a no-op.
+    fn response_head_hold_outcome(
+        &self,
+        _session: &Session,
+        _outcome: ResponseHeadOutcome,
+        _usage: ResponseHeadUsage,
+        _ctx: &mut Self::CTX,
+    ) {
     }
 
     // custom_forwarding is called when downstream and upstream connections are successfully established.

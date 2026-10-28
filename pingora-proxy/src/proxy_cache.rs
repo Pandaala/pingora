@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::response_pipeline::ResponsePipelineState;
 use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
 use http::{Method, StatusCode};
 use pingora_cache::key::CacheHashKey;
@@ -81,6 +82,12 @@ where
                 "Fail to request_cache_filter: {e}, {}",
                 self.inner.request_summary(session, ctx)
             );
+        }
+
+        if session.cache.enabled() && self.inner.response_head_may_hold(session, ctx) {
+            session
+                .cache
+                .disable(NoCacheReason::Custom("ResponseHeadMayHold"));
         }
 
         // cache key logic, should this be part of request_cache_filter?
@@ -381,6 +388,61 @@ where
                     }
                 }
                 header_only |= filtered_body_forbidden;
+                let plan = match self.inner.response_head_commit_plan(
+                    session,
+                    ResponseHeadSource::Cache,
+                    &header,
+                    ctx,
+                ) {
+                    Ok(plan) => plan,
+                    Err(error) => return (true, Some(error)),
+                };
+                if let ResponseHeadCommitPlan::Hold(_) = &plan {
+                    let mut state = ResponsePipelineState::default();
+                    if let Err(error) = state.head_barrier.select(plan) {
+                        return (true, Some(error));
+                    }
+                    session.mark_response_head_attempt_selected();
+                    let mut tasks = Vec::new();
+                    let output = match self.resolve_response_head_boundary(
+                        session,
+                        ResponseHeadBoundary::Unsupported,
+                        ctx,
+                        &mut state,
+                        &mut tasks,
+                        0,
+                    ) {
+                        Ok(output) => output,
+                        Err(error) => return (true, Some(error)),
+                    };
+                    if let Err(error) = self
+                        .prepare_response_head_output(
+                            session, ctx, &mut state, &mut tasks, output, true, true,
+                        )
+                        .await
+                    {
+                        return (true, Some(error));
+                    }
+                    if let Err(error) = session.write_response_tasks(tasks).await {
+                        return (false, Some(error));
+                    }
+                    if let Err(error) = session.cache.finish_hit_handler().await {
+                        warn!("Error during finish_hit_handler: {error}");
+                    }
+                    return match session.as_mut().finish_body().await {
+                        Ok(_) => (true, None),
+                        Err(error) => (false, Some(error)),
+                    };
+                }
+                self.inner.response_head_hold_outcome(
+                    session,
+                    ResponseHeadOutcome::Immediate,
+                    Default::default(),
+                    ctx,
+                );
+                if let Err(error) = self.inner.response_head_will_commit(session, &header, ctx) {
+                    return (true, Some(error));
+                }
                 session.mark_response_head_writer_handoff();
                 if let Err(e) = session
                     .downstream_modules_ctx
@@ -2698,12 +2760,15 @@ mod tests {
     use super::*;
     use pingora_cache::{
         predictor::{CacheablePredictor, Predictor},
-        CacheKey, CacheMeta, CachePhase, MemCache, RespCacheable,
+        CacheKey, CacheMeta, CachePhase, HitStatus, MemCache, RespCacheable, Storage,
     };
     use pingora_http::ResponseHeader;
-    use std::sync::{Arc, LazyLock};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, LazyLock, Mutex,
+    };
     use std::time::Duration;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Stands in for a caller-defined `NoCacheReason::Custom` that has nothing to do with size.
     const AUTHORIZATION_HEADER: &str = "AuthorizationHeader";
@@ -2743,6 +2808,8 @@ mod tests {
             )))
         }
     }
+
+    include!("proxy_cache_head_barrier_tests.rs");
 
     /// Build a session that the predictor has bypassed, exactly as `proxy_cache` would:
     /// the key is remembered as uncacheable for `reason`, so lookup is skipped.

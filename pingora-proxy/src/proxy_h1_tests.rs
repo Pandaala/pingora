@@ -237,7 +237,10 @@ async fn run_terminating_batch(
     let ResponseTaskBatchOutcome::Progress {
         source_done,
         terminated,
-    } = outcome;
+    } = outcome
+    else {
+        panic!("terminate test must not abandon the origin")
+    };
 
     (
         source_done,

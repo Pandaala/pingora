@@ -23,8 +23,8 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorType::InternalError, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{
-    ProxyHttp, ResponseBodySink, Session, UpstreamResponseBodyEvent,
-    RESPONSE_BODY_EMIT_CHUNK_BUDGET,
+    ProxyHttp, ResponseBodySink, ResponseHeadCommitPlan, ResponseHeadHoldLimits,
+    ResponseHeadReplacement, Session, UpstreamResponseBodyEvent, RESPONSE_BODY_EMIT_CHUNK_BUDGET,
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -35,6 +35,7 @@ pub(super) struct HttpResponseFeatureState {
     withheld_body: Vec<u8>,
     terminal_before_trailers_seen: bool,
     emitted_chunk_limit: bool,
+    response_head_decided: bool,
 }
 
 #[derive(Default)]
@@ -152,6 +153,21 @@ pub(super) fn record_eos_dispatch(session: &Session) {
     *EOS_PROBES.lock().unwrap().entry(probe).or_insert(0) += 1;
 }
 
+pub(super) fn http_response_head_commit_plan(session: &Session) -> Result<ResponseHeadCommitPlan> {
+    if session.get_header_bytes("x-response-head-hold").is_empty() {
+        return Ok(ResponseHeadCommitPlan::Immediate);
+    }
+    Ok(ResponseHeadCommitPlan::hold(ResponseHeadHoldLimits::new(
+        64 * 1024,
+        64 * 1024,
+        64,
+        128,
+        64 * 1024,
+        128,
+        Duration::from_secs(2),
+    )))
+}
+
 pub(super) async fn http_upstream_response_body_filter(
     session: &mut Session,
     body: &mut Option<Bytes>,
@@ -159,6 +175,26 @@ pub(super) async fn http_upstream_response_body_filter(
     sink: &mut ResponseBodySink,
     state: &mut HttpResponseFeatureState,
 ) -> Result<Option<Duration>> {
+    if !state.response_head_decided {
+        match session.get_header_bytes("x-response-head-hold") {
+            b"release" => {
+                assert!(sink.release_response_head());
+                state.response_head_decided = true;
+            }
+            b"replace" => {
+                let mut replacement = ResponseHeader::build(403, Some(3))?;
+                replacement.insert_header("content-type", "text/plain")?;
+                replacement.insert_header("content-length", "7")?;
+                replacement.insert_header("x-response-head-replacement", "true")?;
+                sink.replace_response_head(ResponseHeadReplacement::new(
+                    Box::new(replacement),
+                    vec![Bytes::from_static(b"blocked")],
+                ))?;
+                state.response_head_decided = true;
+            }
+            _ => {}
+        }
+    }
     if end_of_stream {
         record_eos_dispatch(session);
     }

@@ -261,6 +261,7 @@ where
             self.proxy_handle_upstream(client_session, tx_upstream, rx_downstream, pipe_state),
         )
         .await;
+        self.cancel_response_head_hold(session, ctx, &mut response_pipeline);
 
         if let Some(custom_session) = session.downstream_session.as_custom_mut() {
             if let Some(downstream_custom_message_writer) = downstream_custom_message_writer {
@@ -508,8 +509,20 @@ where
         let mut tasks = tasks.into_iter();
         for mut t in tasks.by_ref() {
             let task_source_done = t.is_end();
-
-            let revalidated = self.revalidate_or_stale(session, &mut t, ctx).await;
+            if self
+                .enforce_response_head_source_input(session, &t, ctx, pipeline, &mut filtered_tasks)
+                .await?
+            {
+                break;
+            }
+            let revalidated = pipeline
+                .wait_with_response_head_deadline(async {
+                    Ok(self.revalidate_or_stale(session, &mut t, ctx).await)
+                })
+                .await
+                .map_err(|error| {
+                    self.resolve_response_head_wait_error(session, ctx, pipeline, error)
+                })?;
             if revalidated {
                 serve_from_cache.enable();
                 response_state.enable_cached_response();
@@ -518,12 +531,25 @@ where
             }
             #[cfg(feature = "upstream_modules")]
             if let HttpTask::Header(header, end_of_stream) = &t {
-                self.inner
-                    .adjust_upstream_modules(session, header, *end_of_stream, ctx)
-                    .await?;
+                pipeline
+                    .wait_with_response_head_deadline(self.inner.adjust_upstream_modules(
+                        session,
+                        header,
+                        *end_of_stream,
+                        ctx,
+                    ))
+                    .await
+                    .map_err(|error| {
+                        self.resolve_response_head_wait_error(session, ctx, pipeline, error)
+                    })?;
             }
             #[cfg(feature = "upstream_modules")]
-            session.upstream_modules_filter_task(&mut t).await?;
+            pipeline
+                .wait_with_response_head_deadline(session.upstream_modules_filter_task(&mut t))
+                .await
+                .map_err(|error| {
+                    self.resolve_response_head_wait_error(session, ctx, pipeline, error)
+                })?;
             let compression_prefix = session
                 .upstream_compression
                 .response_filter_with_preceding(&mut t);
@@ -539,6 +565,9 @@ where
                     &mut filtered_tasks,
                 )
                 .await?;
+                if pipeline.origin_abandoned {
+                    break;
+                }
             }
             if !pipeline.sink.is_terminated() {
                 self.response_task_pipeline(
@@ -553,7 +582,9 @@ where
                 )
                 .await?;
             }
-
+            if pipeline.origin_abandoned {
+                break;
+            }
             source_done |= task_source_done;
             if serve_from_cache.is_miss_header() {
                 response_state.enable_cached_response();
@@ -589,10 +620,15 @@ where
             session.write_response_tasks(filtered_tasks).await?;
         }
 
-        Ok(Some(ResponseTaskBatchOutcome::Progress {
-            source_done,
-            terminated: pipeline.sink.is_terminated() && !source_done,
-        }))
+        if pipeline.origin_abandoned {
+            abort_cache_after_response_source_failure(session, false);
+            Ok(Some(ResponseTaskBatchOutcome::OriginAbandoned))
+        } else {
+            Ok(Some(ResponseTaskBatchOutcome::Progress {
+                source_done,
+                terminated: pipeline.sink.is_terminated() && !source_done,
+            }))
+        }
     }
 
     // todo use this function to replace bidirection_1to2()
@@ -717,8 +753,8 @@ where
                 // `Abandoned` event exactly once, with NO permit
                 // so nothing reaches the upstream -- the upstream exchange is
                 // already complete and owes no further request framing.
-                let outcome = self
-                    .send_body_to_pipe(
+                let outcome = response_pipeline
+                    .wait_with_response_head_deadline(self.send_body_to_pipe(
                         session,
                         None,
                         RequestBodyEvent::Abandoned,
@@ -726,8 +762,16 @@ where
                         None,
                         ctx,
                         body_disposition,
-                    )
-                    .await?;
+                    ))
+                    .await
+                    .map_err(|error| {
+                        self.resolve_response_head_wait_error(
+                            session,
+                            ctx,
+                            response_pipeline,
+                            error,
+                        )
+                    })?;
                 if outcome == DownstreamRequestOutcome::AbortSelectedResponse {
                     return Ok(outcome);
                 }
@@ -756,6 +800,10 @@ where
                 .as_mut()
                 .map(|reader| reader.next())
                 .into();
+            let response_head_timeout: OptionFuture<_> = response_pipeline
+                .response_head_deadline()
+                .map(tokio::time::sleep_until)
+                .into();
 
             // partial read support, this check will also be false if cache is disabled.
             let support_cache_partial_read =
@@ -763,7 +811,13 @@ where
             let upgraded = session.was_upgraded();
 
             tokio::select! {
-
+                Some(()) = response_head_timeout => {
+                    return Err(self.resolve_response_head_idle_timeout(
+                        session,
+                        ctx,
+                        response_pipeline,
+                    ));
+                },
 
                 // only try to send to pipe if there is capacity to avoid deadlock
                 // Otherwise deadlock could happen if both upstream and downstream are blocked
@@ -815,7 +869,9 @@ where
                     }
                     // TODO: consider just drain this if serve_from_cache is set
                     let is_body_done = session.is_body_done();
-                    let outcome = self.send_body_to_pipe(
+                    // A selected upload branch must keep the same Hold deadline
+                    // active while request hooks run; the outer select is suspended.
+                    let outcome = response_pipeline.wait_with_response_head_deadline(self.send_body_to_pipe(
                         session,
                         body,
                         RequestBodyEvent::from(is_body_done),
@@ -823,8 +879,11 @@ where
                         Some(send_permit.unwrap()), // safe because we checked is_ok()
                         ctx,
                         body_disposition,
-                    )
-                    .await?;
+                    ))
+                    .await
+                    .map_err(|error| {
+                        self.resolve_response_head_wait_error(session, ctx, response_pipeline, error)
+                    })?;
                     if outcome == DownstreamRequestOutcome::AbortSelectedResponse {
                         return Ok(outcome);
                     }
@@ -858,7 +917,8 @@ where
                         // owes no further request framing, so nothing may be written. This is
                         // the H1 counterpart of `finish_downstream_body_side` in proxy_h2.rs.
                         // Only the closed case abandons; a merely full pipe still just waits.
-                        let outcome = self.send_body_to_pipe(
+                        let outcome = response_pipeline
+                            .wait_with_response_head_deadline(self.send_body_to_pipe(
                                 session,
                                 None,
                                 RequestBodyEvent::Abandoned,
@@ -866,8 +926,11 @@ where
                                 None,
                                 ctx,
                                 body_disposition,
-                            )
-                            .await?;
+                            ))
+                            .await
+                            .map_err(|error| {
+                                self.resolve_response_head_wait_error(session, ctx, response_pipeline, error)
+                            })?;
                         if outcome == DownstreamRequestOutcome::AbortSelectedResponse {
                             return Ok(outcome);
                         }
@@ -914,7 +977,9 @@ where
                                 }
                                 response_state.maybe_set_upstream_done(source_done);
                             }
-
+                            ResponseTaskBatchOutcome::OriginAbandoned => {
+                                response_state.maybe_set_upstream_done(true);
+                            }
                         }
                         // unsuccessful upgrade response may force the request done
                         downstream_state.maybe_finished(session.is_body_done());
@@ -952,6 +1017,7 @@ where
                                 }
                                 source_done
                             }
+                            ResponseTaskBatchOutcome::OriginAbandoned => true,
                         };
                         if !upgraded && session.was_upgraded() && downstream_state.can_poll() {
                             // TODO: write can happen async now
