@@ -187,6 +187,21 @@ pub(crate) fn is_chunked_encoding_from_headers(headers: &HMap) -> bool {
     find_last_te_token(bytes).eq_ignore_ascii_case(b"chunked")
 }
 
+/// Whether Transfer-Encoding consists of exactly one `chunked` coding.
+///
+/// This is the only transfer coding an HTTP/1.0 downstream can safely remove:
+/// the H1 reader has already decoded chunk framing, while any preceding coding
+/// (for example `gzip, chunked`) still describes the payload bytes.
+pub(crate) fn is_only_chunked_transfer_encoding(headers: &HMap) -> bool {
+    let mut tokens = headers
+        .get_all(http::header::TRANSFER_ENCODING)
+        .iter()
+        .flat_map(|value| value.as_bytes().split(|byte| *byte == b','))
+        .map(|token| token.trim_ascii());
+    matches!(tokens.next(), Some(token) if token.eq_ignore_ascii_case(b"chunked"))
+        && tokens.next().is_none()
+}
+
 pub fn is_upgrade_req(req: &RequestHeader) -> bool {
     req.version == http::Version::HTTP_11 && req.headers.get(header::UPGRADE).is_some()
 }
@@ -632,6 +647,18 @@ mod test {
         let mut headers = HMap::new();
         headers.insert(TRANSFER_ENCODING, value.try_into().unwrap());
         assert_eq!(is_chunked_encoding_from_headers(&headers), expected);
+    }
+
+    #[rstest]
+    #[case::single("chunked", true)]
+    #[case::whitespace("  chunked  ", true)]
+    #[case::preceded("gzip, chunked", false)]
+    #[case::duplicate("chunked, chunked", false)]
+    #[case::empty_then_chunked(", chunked", false)]
+    fn test_is_only_chunked_transfer_encoding(#[case] value: &str, #[case] expected: bool) {
+        let mut headers = HMap::new();
+        headers.insert(TRANSFER_ENCODING, value.try_into().unwrap());
+        assert_eq!(is_only_chunked_transfer_encoding(&headers), expected);
     }
 
     #[rstest]

@@ -16,6 +16,7 @@
 
 pub mod authority;
 pub mod body_buffer;
+pub use body_buffer::{InMemoryRequestBodyBuffer, RequestBodyBuffer};
 pub mod bridge;
 pub mod client;
 pub mod compression;
