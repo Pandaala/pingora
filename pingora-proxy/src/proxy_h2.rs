@@ -16,15 +16,39 @@ use futures::future::OptionFuture;
 use futures::StreamExt;
 
 use super::*;
-use crate::proxy_cache::{range_filter::RangeBodyFilter, ServeFromCache};
+use crate::proxy_cache::ServeFromCache;
 use crate::proxy_common::*;
+use crate::pump_termination::{
+    bound_undrained_downstream_body, downstream_body_read_is_futile,
+    finalize_response_downstream_reuse, finish_terminated_response, join_bidirectional_pumps,
+    release_cache_on_terminate, warn_response_body_terminate_content_length_leak,
+    warn_response_body_terminate_without_response, DownstreamRequestOutcome, DuplexPumpOutcome,
+};
+use crate::request_relay::{
+    safe_upstream_disposition, validate_streamed_upstream_disposition, AbandonmentResponsePolicy,
+};
+use crate::response_pipeline::{ResponsePipelineState, ResponseProtocol, ResponseTaskBatchOutcome};
+
+#[path = "proxy_h2_request_body.rs"]
+mod request_body;
 use http::{header::CONTENT_LENGTH, Method, StatusCode};
-use pingora_cache::CachePhase;
 use pingora_core::protocols::http::authority::{
     raw_target_authority, validate_request_authority, RawTargetAuthority,
 };
 use pingora_core::protocols::http::custom::CUSTOM_MESSAGE_QUEUE_SIZE;
-use pingora_core::protocols::http::v2::{client::Http2Session, write_body};
+use pingora_core::protocols::http::v2::client::Http2Session;
+#[cfg(test)]
+use pingora_core::protocols::http::v2::client::PeerEndStream;
+use request_body::{
+    apply_upstream_body_disposition, upstream_empty_data_end_stream, upstream_framing_body_empty,
+    upstream_headers_end_stream, UpstreamBodyOutcome, UpstreamBodyWrite,
+};
+#[cfg(test)]
+use request_body::{
+    cancel_abandoned_upstream_body_capacity, effective_upstream_write_timeout,
+    upstream_write_error_outcome, upstream_write_failed_because_stream_gone,
+    upstream_write_stalled_after_response, DEFAULT_H2_UPSTREAM_WRITE_TIMEOUT,
+};
 
 /// Derive H2 `:path`, separating H1 absolute-form components ([RFC 9113 section 8.3.1]).
 ///
@@ -182,6 +206,43 @@ where
             }
         }
 
+        // The disposition is resolved AFTER `begin_request_body_replay()`,
+        // because a registered replay buffer changes the "does this request
+        // have a body" fact the coercion below depends on.
+        if let Err(e) = session.as_mut().begin_request_body_replay().await {
+            return (false, Some(e));
+        }
+
+        // TWO different "empty body" facts are needed here, and conflating them
+        // is what an earlier revision of this file got wrong.
+        //
+        // `DispositionFacts::body_empty` (`is_body_empty() && is_body_done()`)
+        // is "this request has NO body at all", a fact the client cannot
+        // retract. That is the one the anti-smuggling coercion in
+        // `safe_disposition` must key on -- collected (via
+        // `safe_upstream_disposition`, below) only when `disposition` is
+        // non-`Ordinary`, since `Ordinary` is that coercion's fixed point.
+        //
+        // The DECLARATION (`is_body_empty()` alone) is the other one, and which
+        // of the two the upstream FRAMING is built from depends on the
+        // disposition -- see `upstream_framing_body_empty`, which is the only
+        // place that choice is made.
+        //
+        // The downstream READ side always keeps the strict transport fact (see
+        // `DownstreamStateMachine::new` and the bodyless prelude in
+        // `bidirection_down_to_up`), so the client's real end of stream is still
+        // read and still produces exactly one application terminal event.
+        let disposition = session.frozen_request_relay_plan().requested.disposition;
+        let body_empty_declared = session.as_mut().is_body_empty();
+        // The H2 pump always sends HTTP/2 upstream, so there is no below-1.1
+        // case here (unlike the H1 pump).
+        if let Err(e) = validate_streamed_upstream_disposition(disposition, session, &req, false) {
+            return (false, Some(e));
+        }
+        let body_disposition = safe_upstream_disposition(disposition, session, &req, false);
+        let body_empty = upstream_framing_body_empty(body_disposition, body_empty_declared);
+        apply_upstream_body_disposition(&mut req, body_disposition);
+
         if authority_policy.is_standard() {
             if let Err(e) = reconcile_upstream_authority(&mut req) {
                 return (false, Some(e.into_in()));
@@ -227,7 +288,6 @@ where
         let host = req.remove_header(&http::header::HOST);
 
         session.upstream_compression.request_filter(&req);
-        let body_empty = session.as_mut().is_body_empty();
 
         // whether we support sending END_STREAM on HEADERS if body is empty
         let send_end_stream = req.send_end_stream().expect("req must be h2");
@@ -250,15 +310,18 @@ where
         debug!("Request to h2: {req:?}");
 
         // send END_STREAM on HEADERS
-        let send_header_eos = send_end_stream && body_empty;
-        debug!("send END_STREAM on HEADERS: {send_end_stream}");
+        let send_header_eos =
+            upstream_headers_end_stream(body_disposition, send_end_stream, body_empty);
+        debug!("send END_STREAM on HEADERS: {send_header_eos}");
 
         let req = Box::new(RequestHeader::from(req));
         if let Err(e) = client_session.write_request_header(req, send_header_eos) {
             return (false, Some(e.into_up()));
         }
 
-        if !send_end_stream && body_empty {
+        let send_empty_data_eos = !send_header_eos
+            && upstream_empty_data_end_stream(body_disposition, send_end_stream, body_empty);
+        if send_empty_data_eos {
             // send END_STREAM on empty DATA frame
             match client_session.write_request_body(Bytes::new(), true).await {
                 Ok(()) => debug!("sent empty DATA frame to h2"),
@@ -267,6 +330,25 @@ where
                 }
             }
         }
+
+        // The upstream request stream is already closed: every EOS decision
+        // that fires here is final, so the pump below must never write another
+        // byte of request body (h2 answers a DATA frame on a locally
+        // half-closed stream with `UnexpectedFrameType`). Three shapes reach
+        // this state with downstream body events still to come:
+        // - `Bodyless` with a real downstream body -- the application declared
+        //   there is no upstream body, so the body events still have to reach
+        //   the application hooks while nothing goes on the wire. That is what
+        //   the H1 pump gets for free from its zero-length body writer.
+        // - a request with no body at all, whose EOS rode on the HEADERS frame
+        //   while the prelude below still owes the application its single
+        //   `Complete` event.
+        // - a request that DECLARED an empty body (`Content-Length: 0`) whose
+        //   downstream stream has not ended yet: the declaration was forwarded
+        //   upstream, and the client's real end-of-stream still has to be read
+        //   downstream. Suppressing the write is what keeps that from becoming
+        //   a second, standalone END_STREAM.
+        let upstream_body_closed = send_header_eos || send_empty_data_eos;
 
         client_session.read_timeout = peer.options.read_timeout;
 
@@ -294,7 +376,7 @@ where
 
         let (tx, rx) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
 
-        session.as_mut().enable_retry_buffering();
+        session.enable_request_relay_retry_buffer();
 
         // Shared signal so the upstream half can distinguish an expected task-pipe
         // closure (the downstream half finished and dropped rx) from an unexpected one.
@@ -302,19 +384,28 @@ where
 
         /* read downstream body and upstream response at the same time */
 
-        let ret = tokio::try_join!(
+        let mut response_pipeline = ResponsePipelineState::default();
+        let ret = join_bidirectional_pumps(
             self.bidirection_down_to_up(
                 session,
                 &mut client_body,
                 rx,
                 ctx,
-                write_timeout,
                 &mut downstream_custom_message_writer,
                 &mut downstream_custom_message_reader,
                 pipe_state.clone(),
+                UpstreamBodyWrite {
+                    timeout: write_timeout,
+                    stream_closed: upstream_body_closed,
+                    eos_write_optional: false,
+                    disposition: body_disposition,
+                    upstream_response_ended: client_session.peer_end_stream(),
+                },
+                &mut response_pipeline,
             ),
-            pipe_up_to_down_response(client_session, tx, pipe_state)
-        );
+            pipe_up_to_down_response(client_session, tx, pipe_state),
+        )
+        .await;
 
         if let Some(custom_session) = session.downstream_session.as_custom_mut() {
             if let Some(downstream_custom_message_writer) = downstream_custom_message_writer {
@@ -338,17 +429,69 @@ where
         }
 
         match ret {
-            Ok((downstream_can_reuse, _upstream)) => (downstream_can_reuse, None),
-            Err(e) => {
+            DuplexPumpOutcome::ApplicationTerminate { upstream: None } => {
+                // The sibling upstream future was dropped mid-flight, so the request
+                // stream is still open: reset it to stop the upstream from working on
+                // a request nobody will read.
+                // A locally reset stream may no longer be judged by the wire
+                // END_STREAM record: `h2` starts DROPPING the DATA it decodes,
+                // while a peer RST_STREAM landing afterwards can still surface
+                // as a remote NO_ERROR. Nothing reads this stream after this
+                // point, so this is enforcement of an invariant rather than a
+                // fix -- see `Http2Session::note_local_reset`, which also
+                // explains why it has to run BEFORE the reset is queued.
+                client_session.note_local_reset();
+                client_body.send_reset(h2::Reason::CANCEL);
+                release_cache_on_terminate(session);
+                // Downstream hygiene is keyed by the DOWNSTREAM protocol, not by the
+                // upstream one this pump was selected for: an H1 client proxied to an
+                // H2 upstream lands here too, and its connection holds request bytes
+                // the application refused to read. Reporting non-reuse is a no-op for
+                // an H2 downstream (only this stream ended; the connection lives on,
+                // see `h2c_downstream_terminate_keeps_connection`) and is what keeps
+                // an H1 downstream from being drained-and-reused.
+                (false, None)
+            }
+            DuplexPumpOutcome::ApplicationTerminate { upstream: Some(()) } => {
+                // The upstream half completed cleanly before application
+                // termination, so the stream already saw END_STREAM. Avoid a
+                // gratuitous reset that some origins count toward H2 abuse
+                // heuristics.
+                release_cache_on_terminate(session);
+                (false, None)
+            }
+            DuplexPumpOutcome::Complete {
+                downstream_can_reuse,
+                upstream: (),
+            } => (downstream_can_reuse, None),
+            DuplexPumpOutcome::OriginAbandoned {
+                downstream_can_reuse,
+            } => {
+                // Invalidate before resetting; see `note_local_reset`.
+                client_session.note_local_reset();
+                client_body.send_reset(h2::Reason::CANCEL);
+                (downstream_can_reuse, None)
+            }
+            DuplexPumpOutcome::Failed(e) => {
                 let upstream_read_timeout =
                     e.esource == ErrorSource::Upstream && matches!(e.etype, ReadTimedout);
+                let upstream_write_timeout =
+                    e.esource == ErrorSource::Upstream && matches!(e.etype, WriteTimedout);
                 let downstream_error = e.esource == ErrorSource::Downstream;
-                // On application level upstream read timeouts, send RST_STREAM CANCEL,
-                // we know we have not received END_STREAM at this point since we read timed out.
+                // On upstream read/write timeouts, send RST_STREAM CANCEL: a
+                // timeout that reaches this arm has no qualified END_STREAM
+                // evidence and the exchange is being failed.
                 // Also cancel the upstream stream when downstream goes away/resets so the
                 // upstream peer can release the stream promptly.
-                // TODO: implement for write timeouts?
-                if upstream_read_timeout || downstream_error {
+                // Whether or not the explicit reset below is sent, this arm
+                // abandons the upstream request stream: `client_body` is
+                // dropped on return and `h2` cancels a still-open stream when
+                // its last handle goes away. Source (iv) is given up either
+                // way, so record it unconditionally -- and ahead of the reset,
+                // because a record published in between could no longer be
+                // retracted. See `Http2Session::note_local_reset`.
+                client_session.note_local_reset();
+                if upstream_read_timeout || upstream_write_timeout || downstream_error {
                     client_body.send_reset(h2::Reason::CANCEL);
                     if upstream_read_timeout {
                         // Mark the underlying H2 connection for shutdown so it's not used
@@ -407,9 +550,9 @@ where
         initial_task: HttpTask,
         rx: &mut mpsc::Receiver<HttpTask>,
         serve_from_cache: &mut ServeFromCache,
-        range_body_filter: &mut proxy_cache::range_filter::RangeBodyFilter,
         response_state: &mut ResponseStateMachine,
-    ) -> Result<Option<bool>>
+        pipeline: &mut ResponsePipelineState,
+    ) -> Result<Option<ResponseTaskBatchOutcome>>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
@@ -432,11 +575,16 @@ where
                 break; // upstream closed
             }
         }
-
         /* run filters before sending to downstream */
         let mut filtered_tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
-        for mut t in tasks {
-            if self.revalidate_or_stale(session, &mut t, ctx).await {
+        let mut source_done = false;
+        pipeline.sink.reset_batch();
+        let mut tasks = tasks.into_iter();
+        for mut t in tasks.by_ref() {
+            let task_source_done = t.is_end();
+
+            let revalidated = self.revalidate_or_stale(session, &mut t, ctx).await;
+            if revalidated {
                 serve_from_cache.enable();
                 response_state.enable_cached_response();
                 // skip downstream filtering entirely as the 304 will not be sent
@@ -450,28 +598,59 @@ where
             }
             #[cfg(feature = "upstream_modules")]
             session.upstream_modules_filter_task(&mut t).await?;
-            session.upstream_compression.response_filter(&mut t);
-            // check error and abort
-            // otherwise the error is surfaced via write_response_tasks()
-            if !serve_from_cache.should_send_to_downstream() {
-                if let HttpTask::Failed(e) = t {
-                    return Err(e);
-                }
+            let compression_prefix = session
+                .upstream_compression
+                .response_filter_with_preceding(&mut t);
+            if let Some(prefix) = compression_prefix {
+                self.response_task_pipeline(
+                    ResponseProtocol::H2,
+                    session,
+                    prefix,
+                    ctx,
+                    serve_from_cache,
+                    false,
+                    pipeline,
+                    &mut filtered_tasks,
+                )
+                .await?;
             }
-            filtered_tasks.push(
-                self.h2_response_filter(
+            if !pipeline.sink.is_terminated() {
+                self.response_task_pipeline(
+                    ResponseProtocol::H2,
                     session,
                     t,
                     ctx,
                     serve_from_cache,
-                    range_body_filter,
                     false,
+                    pipeline,
+                    &mut filtered_tasks,
                 )
-                .await?,
-            );
+                .await?;
+            }
+
+            source_done |= task_source_done;
             if serve_from_cache.is_miss_header() {
                 response_state.enable_cached_response();
             }
+            if pipeline.sink.is_terminated() {
+                break;
+            }
+        }
+
+        if pipeline.sink.is_terminated() {
+            for dropped in tasks {
+                if let HttpTask::Failed(e) = dropped {
+                    abort_cache_after_response_source_failure(session, false);
+                    warn!("dropping upstream error after response terminate: {e}");
+                }
+            }
+        }
+
+        if serve_from_cache.is_on() && pipeline.sink.is_terminated() {
+            return Error::e_explain(
+                InternalError,
+                "response-body terminate is not supported while serving from a streaming cache readback",
+            );
         }
 
         if !serve_from_cache.should_send_to_downstream() {
@@ -479,9 +658,14 @@ where
             return Ok(None);
         }
 
-        let response_done = session.write_response_tasks(filtered_tasks).await?;
+        if !filtered_tasks.is_empty() {
+            session.write_response_tasks(filtered_tasks).await?;
+        }
 
-        Ok(Some(response_done))
+        Ok(Some(ResponseTaskBatchOutcome::Progress {
+            source_done,
+            terminated: pipeline.sink.is_terminated() && !source_done,
+        }))
     }
 
     // returns whether server (downstream) session can be reused
@@ -492,13 +676,14 @@ where
         client_body: &mut h2::SendStream<bytes::Bytes>,
         mut rx: mpsc::Receiver<HttpTask>,
         ctx: &mut SV::CTX,
-        write_timeout: Option<Duration>,
         downstream_custom_message_writer: &mut Option<Box<dyn CustomMessageWrite>>,
         downstream_custom_message_reader: &mut Option<
             Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>,
         >,
         pipe_state: Arc<AtomicU8>,
-    ) -> Result<bool>
+        body_write: UpstreamBodyWrite,
+        response_pipeline: &mut ResponsePipelineState,
+    ) -> Result<DownstreamRequestOutcome>
     where
         SV: ProxyHttp + Send + Sync,
         SV::CTX: Send + Sync,
@@ -525,18 +710,124 @@ where
         }
 
         let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
+        // Set once the upstream has stopped receiving the request body after
+        // flagging its response complete (RFC 9113 §8.1). It takes the read side
+        // out of the loop for good: the state machine says "finished reading",
+        // which is what keeps the downstream connection out of the errored path,
+        // and this flag is what stops the loop from polling a read side it has
+        // just declared done -- `read_body_or_idle` answers such a poll with
+        // "Sent data after end of body" as soon as the client sends its next
+        // byte, and the loop would turn that into a downstream error, failing
+        // the very exchange this is saving.
+        //
+        // The guard is CONDITIONAL: it only bites while the loop is still
+        // running for the RESPONSE's sake, i.e. while `response_state` is not
+        // yet done. That window is narrow and easy to miss -- most shapes of
+        // this exchange have the response fully written downstream by the time
+        // the request-body write fails, and then the loop exits at once and
+        // this flag is dead code. Do not take the file's other tests as
+        // coverage; the one that enters the window on purpose is
+        // `h2_upstream_no_error_reset_keeps_streaming_while_the_client_uploads`,
+        // and it is the only one that fails when this guard is deleted.
+        //
+        // Not folded into `DownstreamStateMachine`: that type is shared with the
+        // H1 pump, whose `Errored`/`ReadingFinished` distinction means other
+        // things there.
+        let mut upstream_stopped_receiving = false;
 
-        // retry, send buffer if it exists
-        if let Some(buffer) = session.as_mut().get_retry_buffer() {
-            self.send_body_to2(
-                session,
-                Some(buffer),
-                downstream_state.is_done(),
-                client_body,
-                ctx,
-                write_timeout,
-            )
-            .await?;
+        let buffer = session.request_relay_retry_buffer();
+        // Native retry-buffer path. Registered app buffers are replayed through
+        // `read_body_or_idle()` below, one bounded chunk at a time.
+        //
+        // The bodyless prelude is identical to the H1 pump's: it fires one
+        // immediate `(None, end)` body event so that a request with no body
+        // reaches `request_body_filter_action` / `request_trailer_filter`
+        // exactly once, whichever upstream protocol was selected (design 4.4).
+        // It must require the transport fact (`is_body_done()`) and not just
+        // `is_body_empty()`, which still infers emptiness from
+        // `Content-Length: 0`: an H2 downstream request declaring
+        // `Content-Length: 0` without END_STREAM is not bodyless (design 4.3),
+        // so the loop below reads on to the real EOS and would deliver a
+        // SECOND terminal event. Requiring both facts delivers exactly
+        // one. The upstream EOS for exactly this shape already rode on the
+        // HEADERS frame (or on the empty DATA frame), which is why
+        // `body_write.stream_closed` suppresses the write side here.
+        if buffer.is_some() || (session.as_mut().is_body_empty() && session.as_mut().is_body_done())
+        {
+            let outcome = self
+                .send_body_to2(
+                    session,
+                    buffer,
+                    RequestBodyEvent::from(downstream_state.is_done()),
+                    AbandonmentResponsePolicy::Abort,
+                    client_body,
+                    ctx,
+                    &body_write,
+                )
+                .await;
+            match outcome {
+                Ok(UpstreamBodyOutcome::Downstream(DownstreamRequestOutcome::Terminate)) => {
+                    // No-op for an H2 downstream; required for an H1 downstream proxied
+                    // to an H2 upstream, whose unread request bytes must not be drained
+                    // and the connection reused.
+                    session.set_keepalive(None);
+                    finish_terminated_response(session).await;
+                    restore_custom_message_reader(session, downstream_custom_message_reader.take());
+                    return Ok(DownstreamRequestOutcome::Terminate);
+                }
+                Ok(UpstreamBodyOutcome::Downstream(
+                    DownstreamRequestOutcome::AbortSelectedResponse,
+                )) => return Ok(DownstreamRequestOutcome::AbortSelectedResponse),
+                // The replayed body could not be written because the upstream
+                // had already answered in full and reset the stream. Failing the
+                // request here would discard that response; the duplex loop
+                // below still has to run to deliver it.
+                Ok(UpstreamBodyOutcome::UpstreamDoneReceiving {
+                    terminal_event_delivered,
+                }) => {
+                    if !terminal_event_delivered {
+                        match self
+                            .finish_downstream_body_side(session, client_body, ctx, &body_write)
+                            .await?
+                        {
+                            DownstreamRequestOutcome::Terminate => {
+                                session.set_keepalive(None);
+                                finish_terminated_response(session).await;
+                                restore_custom_message_reader(
+                                    session,
+                                    downstream_custom_message_reader.take(),
+                                );
+                                return Ok(DownstreamRequestOutcome::Terminate);
+                            }
+                            DownstreamRequestOutcome::AbortSelectedResponse => {
+                                return Ok(DownstreamRequestOutcome::AbortSelectedResponse);
+                            }
+                            DownstreamRequestOutcome::Complete(_)
+                            | DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(_) => {}
+                        }
+                    }
+                    upstream_stopped_receiving = true;
+                    downstream_state.maybe_finished(true);
+                    bound_undrained_downstream_body(session);
+                }
+                Ok(UpstreamBodyOutcome::Downstream(
+                    DownstreamRequestOutcome::Complete(_)
+                    | DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(_),
+                )) => {}
+                Err(e)
+                    if body_write.disposition != UpstreamRequestBodyDisposition::Bodyless
+                        && e.esource == ErrorSource::Upstream
+                        && matches!(e.etype, H2Error | WriteError) =>
+                {
+                    // Match the live upload path: a closed send half does not
+                    // decide whether the peer refused an unprocessed request.
+                    // Keep reading its response so header-time REFUSED_STREAM
+                    // evidence can make that decision. Deadlines and application
+                    // errors still fail immediately; this error grants no retry.
+                    downstream_state.to_errored();
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         let mut response_state = ResponseStateMachine::new();
@@ -544,8 +835,13 @@ where
         // these two below can be wrapped into an internal ctx
         // use cache when upstream revalidates (or TODO: error)
         let mut serve_from_cache = ServeFromCache::new();
-        let mut range_body_filter = proxy_cache::range_filter::RangeBodyFilter::new();
-
+        // Shared across every batch drained from upstream for this response;
+        // the per-batch byte budget is reset at each batch boundary (see
+        // `ResponseBodySink::reset_batch`), but a `terminate()` signal stays
+        // sticky for the rest of this response.
+        // Also shared across every batch: `Trailer` and the `Done` behind it
+        // can land in different batches, so the latch that keeps the terminal
+        // body callback to exactly one delivery must outlive a single batch.
         let mut next_upstream_task: Option<HttpTask> = None;
 
         /* duplex mode
@@ -556,6 +852,62 @@ where
             || downstream_custom_read && !downstream_state.is_errored()
             || downstream_custom_write
         {
+            if downstream_body_read_is_futile(session, &downstream_state, &response_state) {
+                // Abandoning the read must not cost the application its single
+                // terminal event (invariant B): run the hooks with one
+                // `Abandoned` event exactly once.
+                //
+                // `body_write` is passed through UNCHANGED on purpose. Forcing
+                // `stream_closed: true` here would skip the terminating
+                // END_STREAM in exactly the case where the upstream request
+                // stream is genuinely still open (`stream_closed` is false
+                // precisely because the pump still owes that frame), and
+                // dropping `client_body` afterwards would make h2 emit a
+                // gratuitous RST_STREAM(CANCEL) per request instead -- the
+                // opposite of the abuse-counter hygiene documented at the
+                // terminate arms above. When the stream really is already
+                // closed the existing suppression still applies. The write may
+                // fail because the upstream already sent RFC 9113 §8.1's
+                // RST_STREAM(NO_ERROR); that costs nothing here (the response is
+                // complete) and is ignored, see `eos_write_optional`.
+                let outcome = self
+                    .send_body_to2(
+                        session,
+                        None,
+                        RequestBodyEvent::Abandoned,
+                        AbandonmentResponsePolicy::PreserveSelected,
+                        client_body,
+                        ctx,
+                        &UpstreamBodyWrite {
+                            eos_write_optional: true,
+                            ..body_write.clone()
+                        },
+                    )
+                    .await?;
+                if outcome == UpstreamBodyOutcome::Downstream(DownstreamRequestOutcome::Terminate) {
+                    session.set_keepalive(None);
+                    finish_terminated_response(session).await;
+                    restore_custom_message_reader(session, downstream_custom_message_reader.take());
+                    return Ok(DownstreamRequestOutcome::Terminate);
+                }
+                if outcome
+                    == UpstreamBodyOutcome::Downstream(
+                        DownstreamRequestOutcome::AbortSelectedResponse,
+                    )
+                {
+                    return Ok(DownstreamRequestOutcome::AbortSelectedResponse);
+                }
+                // `UpstreamDoneReceiving` needs nothing extra here. The
+                // terminal event this branch exists to deliver has just been
+                // delivered (`Abandoned` above), so the only thing the arms in
+                // the loop below add -- `finish_downstream_body_side` -- would
+                // be a second delivery. The read side is already being
+                // finished, and `eos_write_optional` has already swallowed the
+                // same write failure on the normal path.
+                downstream_state.maybe_finished(true);
+                continue;
+            }
+
             // Use optional futures to allow using optional channels in select branches
             let custom_inject_rx_recv: OptionFuture<_> = downstream_custom_message_inject_rx
                 .as_mut()
@@ -574,12 +926,21 @@ where
             // Similar logic in h1 need to reserve capacity first to avoid deadlock
             // But we don't need to do the same because the h2 client_body pipe is unbounded (never block)
             tokio::select! {
+
+
                 // NOTE: cannot avoid this copy since h2 owns the buf
-                body = session.downstream_session.read_body_or_idle(downstream_state.is_done()), if downstream_state.can_poll() => {
+                body = session.downstream_session.read_body_or_idle(downstream_state.is_done()), if downstream_state.can_poll() && !upstream_stopped_receiving => {
                     debug!("downstream event");
                     let body = match body {
                         Ok(b) => b,
                         Err(e) => {
+                            if session.downstream_session.request_body_buffer_replaying() {
+                                // The error came from the registered request body buffer
+                                // (replay path), not the client stream: a gateway-local
+                                // failure that must not be booked as a client abort nor
+                                // swallowed as an ignorable downstream error during caching.
+                                return Err(e.into_in());
+                            }
                             let wait_for_cache_fill = (!serve_from_cache.is_on() && support_cache_partial_read)
                                 || serve_from_cache.is_miss();
                             if wait_for_cache_fill {
@@ -607,8 +968,22 @@ where
                         }
                     };
                     let is_body_done = session.is_body_done();
-                    match self.send_body_to2(session, body, is_body_done, client_body, ctx, write_timeout).await {
-                        Ok(request_done) =>  {
+                    let outcome = self.send_body_to2(
+                            session,
+                            body,
+                            RequestBodyEvent::from(is_body_done),
+                            AbandonmentResponsePolicy::Abort,
+                            client_body,
+                            ctx,
+                            &body_write,
+                        )
+                        .await;
+                    match outcome {
+
+                        Ok(UpstreamBodyOutcome::Downstream(
+                            DownstreamRequestOutcome::Complete(request_done)
+                            | DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(request_done),
+                        )) =>  {
                             downstream_state.maybe_finished(request_done);
                         },
                         Err(e) if e.esource == ErrorSource::Downstream => {
@@ -640,7 +1015,85 @@ where
                             // downstream session anyway.
                             session.downstream_session.on_proxy_failure(e);
                         },
+                        // The upstream answered in full and reset the stream while
+                        // this side was still uploading (RFC 9113 §8.1). The
+                        // exchange is NOT failed over it: the response is already
+                        // in hand, and whether it is complete was decided by the
+                        // read half. All that is left is to stop feeding a write
+                        // half that is gone -- and, first, to pay the application
+                        // the terminal event that taking the read side out of
+                        // the loop would otherwise cost it.
+                        Ok(UpstreamBodyOutcome::UpstreamDoneReceiving { terminal_event_delivered }) => {
+                            if !terminal_event_delivered {
+                                let outcome = self.finish_downstream_body_side(
+                                        session,
+                                        client_body,
+                                        ctx,
+                                        &body_write,
+                                    )
+                                    .await?;
+                                match outcome {
+                                    DownstreamRequestOutcome::Terminate => {
+                                        session.set_keepalive(None);
+                                        finish_terminated_response(session).await;
+                                        restore_custom_message_reader(
+                                            session,
+                                            downstream_custom_message_reader.take(),
+                                        );
+                                        return Ok(DownstreamRequestOutcome::Terminate);
+                                    }
+                                    DownstreamRequestOutcome::AbortSelectedResponse => {
+                                        return Ok(
+                                            DownstreamRequestOutcome::AbortSelectedResponse,
+                                        );
+                                    }
+                                    DownstreamRequestOutcome::Complete(_)
+                                    | DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(_) => {}
+                                }
+                            }
+                            upstream_stopped_receiving = true;
+                            downstream_state.maybe_finished(true);
+                            bound_undrained_downstream_body(session);
+                        },
+                        Ok(UpstreamBodyOutcome::Downstream(DownstreamRequestOutcome::Terminate)) => {
+                            // See the prelude terminate above: hygiene follows the
+                            // downstream protocol, which may be H1 here.
+                            session.set_keepalive(None);
+                            finish_terminated_response(session).await;
+                            restore_custom_message_reader(session, downstream_custom_message_reader.take());
+                            return Ok(DownstreamRequestOutcome::Terminate);
+                        },
+                        Ok(UpstreamBodyOutcome::Downstream(
+                            DownstreamRequestOutcome::AbortSelectedResponse,
+                        )) => return Ok(DownstreamRequestOutcome::AbortSelectedResponse),
+                        Err(e)
+                            if e.esource == ErrorSource::Upstream
+                                && matches!(e.etype, WriteTimedout) =>
+                        {
+                            // This is the bounded failure policy when the peer
+                            // has NOT flagged its response complete. Waiting
+                            // for the read half here would defeat the write
+                            // deadline if that peer also withholds response
+                            // END_STREAM.
+                            //
+                            // The qualified END_STREAM case never reaches this
+                            // arm: `upstream_write_error_outcome` converts it
+                            // to `UpstreamDoneReceiving` above so the complete
+                            // response can still be delivered.
+                            return Err(e);
+                        },
                         Err(e) => {
+                            // Under `Bodyless` the upstream request stream is already
+                            // closed before this loop starts, so nothing in
+                            // `send_body_to2` can write to it: an error here is the
+                            // application's -- the `Bodyless` contract violation, or one
+                            // of its own body filters -- never an upstream write failure.
+                            // Absorbing it as one would let the request finish 200 with
+                            // the client's body silently dropped, which is exactly what
+                            // failing closed exists to prevent.
+                            if body_write.disposition == UpstreamRequestBodyDisposition::Bodyless {
+                                return Err(e);
+                            }
                             // mark request done, attempt to drain receive
                             warn!("Upstream h2 body send error: {e}");
                             // upstream is what actually errored but we don't want to continue
@@ -654,17 +1107,30 @@ where
                 task = async { next_upstream_task.take() }, if next_upstream_task.is_some() => {
                     debug!("buffered upstream event: {:?}", task);
                     if let Some(t) = task {
-                        let Some(response_done) = self.process_upstream_tasks_h2(
+                        let Some(batch_outcome) = self.process_upstream_tasks_h2(
                             session,
                             ctx,
                             t,
                             &mut rx,
                             &mut serve_from_cache,
-                            &mut range_body_filter,
                             &mut response_state,
+                            response_pipeline,
                         ).await? else {
                             // nothing sent downstream e.g. serve_from_cache
                             continue;
+                        };
+                        let response_done = match batch_outcome {
+                            ResponseTaskBatchOutcome::Progress { source_done, terminated } => {
+                                if terminated {
+                                    session.set_keepalive(None);
+                                    warn_response_body_terminate_without_response(session, "upstream_response_body_filter");
+                                    warn_response_body_terminate_content_length_leak(session, "upstream_response_body_filter");
+                                    finish_terminated_response(session).await;
+                                    restore_custom_message_reader(session, downstream_custom_message_reader.take());
+                                    return Ok(DownstreamRequestOutcome::Terminate);
+                                }
+                                source_done
+                            }
                         };
                         if session.was_upgraded() {
                             return Error::e_explain(H2Error, "upgraded while proxying to h2 session");
@@ -679,17 +1145,30 @@ where
                 task = rx.recv(), if !response_state.upstream_done() && next_upstream_task.is_none() => {
                     debug!("upstream event: {:?}", task);
                     if let Some(t) = task {
-                        let Some(response_done) = self.process_upstream_tasks_h2(
+                        let Some(batch_outcome) = self.process_upstream_tasks_h2(
                             session,
                             ctx,
                             t,
                             &mut rx,
                             &mut serve_from_cache,
-                            &mut range_body_filter,
                             &mut response_state,
+                            response_pipeline,
                         ).await? else {
                             // nothing sent downstream e.g. serve_from_cache
                             continue;
+                        };
+                        let response_done = match batch_outcome {
+                            ResponseTaskBatchOutcome::Progress { source_done, terminated } => {
+                                if terminated {
+                                    session.set_keepalive(None);
+                                    warn_response_body_terminate_without_response(session, "upstream_response_body_filter");
+                                    warn_response_body_terminate_content_length_leak(session, "upstream_response_body_filter");
+                                    finish_terminated_response(session).await;
+                                    restore_custom_message_reader(session, downstream_custom_message_reader.take());
+                                    return Ok(DownstreamRequestOutcome::Terminate);
+                                }
+                                source_done
+                            }
                         };
                         if session.was_upgraded() {
                             // it is very weird if the downstream session decides to upgrade
@@ -703,22 +1182,35 @@ where
                     }
                 },
 
-                task = serve_from_cache.next_http_task(&mut session.cache, &mut range_body_filter, upgraded),
+                task = serve_from_cache.next_http_task(
+                    &mut session.cache,
+                    &mut response_pipeline.range_body_filter,
+                    upgraded,
+                ),
                     if !response_state.cached_done()
                         && !downstream_state.is_errored()
                         && serve_from_cache.is_on()
                         && !session.has_pending_downstream_tasks() => { // backpressure: don't queue if pending writes
 
-                    let task = self.h2_response_filter(session, task?, ctx,
+                    let task = task?;
+                    let cache_source_done = task.is_end();
+                    let mut cached_tasks = Vec::with_capacity(1);
+                    self.response_task_pipeline(ResponseProtocol::H2, session, task, ctx,
                         &mut serve_from_cache,
-                        &mut range_body_filter, true).await?;
-                    debug!("serve_from_cache task {task:?}");
+                        true, response_pipeline, &mut cached_tasks).await?;
+                    debug!("serve_from_cache task {cached_tasks:?}");
 
                     if session.downstream_session.supports_proxy_task_api() {
-                        session.send_downstream_proxy_task(task).await?;
+                        if cached_tasks.is_empty() {
+                            response_state.maybe_set_cache_done(cache_source_done);
+                        } else {
+                            for task in cached_tasks {
+                                session.send_downstream_proxy_task(task).await?;
+                            }
+                        }
                     } else {
-                        match session.write_response_tasks(vec![task]).await {
-                            Ok(b) => response_state.maybe_set_cache_done(b),
+                        match session.write_response_tasks(cached_tasks).await {
+                            Ok(_) => response_state.maybe_set_cache_done(cache_source_done),
                             Err(e) => if serve_from_cache.is_miss() {
                                 // give up writing to downstream but wait for upstream cache write to finish
                                 downstream_state.to_errored();
@@ -858,6 +1350,7 @@ where
             }
         }
 
+        restore_custom_message_reader(session, downstream_custom_message_reader.take());
         let mut reuse_downstream = !downstream_state.is_errored();
         if reuse_downstream {
             match session.as_mut().finish_body().await {
@@ -870,243 +1363,15 @@ where
                 }
             }
         }
+        reuse_downstream = finalize_response_downstream_reuse(session, reuse_downstream).await;
         // Signal the upstream half that the downstream half completed cleanly before
         // dropping rx, so a resulting task-pipe closure is treated as benign.
         pipe_state.store(PipeState::DownstreamComplete as u8, Ordering::Release);
-        Ok(reuse_downstream)
-    }
-
-    async fn h2_response_filter(
-        &self,
-        session: &mut Session,
-        mut task: HttpTask,
-        ctx: &mut SV::CTX,
-        serve_from_cache: &mut ServeFromCache,
-        range_body_filter: &mut RangeBodyFilter,
-        from_cache: bool, // are the task from cache already
-    ) -> Result<HttpTask>
-    where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
-    {
-        if !from_cache {
-            if let Some(duration) = self.upstream_filter(session, &mut task, ctx).await? {
-                trace!("delaying upstream response for {duration:?}");
-                time::sleep(duration).await;
-            }
-
-            // cache the original response before any downstream transformation
-            // requests that bypassed cache still need to run filters to see if the response has become cacheable
-            if session.cache.enabled() || session.cache.bypassing() {
-                if let Err(e) = self
-                    .cache_http_task(session, &task, ctx, serve_from_cache)
-                    .await
-                {
-                    session.cache.disable(NoCacheReason::StorageError);
-                    if serve_from_cache.is_miss_body() {
-                        // if the response stream cache body during miss but write fails, it has to
-                        // give up the entire request
-                        return Err(e);
-                    } else {
-                        // otherwise, continue processing the response
-                        warn!(
-                            "Fail to cache response: {}, {}",
-                            e,
-                            self.inner.request_summary(session, ctx)
-                        );
-                    }
-                }
-            }
-            // skip the downstream filtering if these tasks are just for cache admission
-            if !serve_from_cache.should_send_to_downstream() {
-                return Ok(task);
-            }
-        } // else: cached/local response, no need to trigger upstream filters and caching
-
-        // normally max file size is tracked in cache_http_task filters (when cache enabled),
-        // we will track it in these filters before sending to downstream on specific conditions
-        // when cache is disabled
-        let track_max_cache_size = matches!(
-            session.cache.phase(),
-            CachePhase::Disabled(NoCacheReason::PredictedResponseTooLarge)
-        );
-
-        let res = match task {
-            HttpTask::Header(mut header, eos) => {
-                /* Downstream revalidation, only needed when cache is on because otherwise origin
-                 * will handle it */
-                if session.upstream_headers_mutated_for_cache() {
-                    self.downstream_response_conditional_filter(
-                        serve_from_cache,
-                        session,
-                        &mut header,
-                        ctx,
-                    );
-                    if !session.ignore_downstream_range {
-                        let range_type = self.inner.range_header_filter(session, &mut header, ctx);
-                        range_body_filter.set(range_type);
-                    }
-                }
-
-                self.inner
-                    .response_filter(session, &mut header, ctx)
-                    .await?;
-                /* Downgrade the version so that write_response_header won't panic */
-                header.set_version(Version::HTTP_11);
-
-                // these status codes / method cannot have body, so no need to add chunked encoding
-                let no_body = session.req_header().method == "HEAD"
-                    || matches!(header.status.as_u16(), 204 | 304);
-
-                /* Add chunked header to tell downstream to use chunked encoding
-                 * during the absent of content-length in h2 */
-                if !no_body
-                    && !header.status.is_informational()
-                    && header.headers.get(http::header::CONTENT_LENGTH).is_none()
-                {
-                    header.insert_header(http::header::TRANSFER_ENCODING, "chunked")?;
-                }
-                Ok(HttpTask::Header(header, eos))
-            }
-            HttpTask::Body(data, eos) => {
-                if track_max_cache_size {
-                    session
-                        .cache
-                        .track_body_bytes_for_max_file_size(data.as_ref().map_or(0, |d| d.len()));
-                }
-
-                let mut data = range_body_filter.filter_body(data);
-                if let Some(duration) = self
-                    .inner
-                    .response_body_filter(session, &mut data, eos, ctx)?
-                {
-                    trace!("delaying downstream response for {duration:?}");
-                    time::sleep(duration).await;
-                }
-                Ok(HttpTask::Body(data, eos))
-            }
-            HttpTask::UpgradedBody(..) => {
-                // An h2 session should not be able to send an h2 upgraded response body,
-                // and logically that is impossible unless there is a bug in the client v2 session
-                panic!("Unexpected UpgradedBody task while proxy h2");
-            }
-            HttpTask::Trailer(mut trailers) => {
-                let trailer_buffer = match trailers.as_mut() {
-                    Some(trailers) => {
-                        debug!("Parsing response trailers..");
-                        match self
-                            .inner
-                            .response_trailer_filter(session, trailers, ctx)
-                            .await
-                        {
-                            Ok(buf) => buf,
-                            Err(e) => {
-                                error!(
-                                    "Encountered error while filtering upstream trailers {:?}",
-                                    e
-                                );
-                                None
-                            }
-                        }
-                    }
-                    _ => None,
-                };
-                // if we have a trailer buffer write it to the downstream response body
-                if let Some(buffer) = trailer_buffer {
-                    // write_body will not write additional bytes after reaching the content-length
-                    // for gRPC H2 -> H1 this is not a problem but may be a problem for non gRPC code
-                    // https://http2.github.io/http2-spec/#malformed
-                    Ok(HttpTask::Body(Some(buffer), true))
-                } else {
-                    Ok(HttpTask::Trailer(trailers))
-                }
-            }
-            HttpTask::Done => Ok(task),
-            HttpTask::Failed(_) => Ok(task), // Do nothing just pass the error down
-        };
-        // On end, check if the response (based on file size) can be considered cacheable again
-        if let Ok(task) = res.as_ref() {
-            if track_max_cache_size
-                && task.is_end()
-                && !matches!(task, HttpTask::Failed(_))
-                && !session.cache.exceeded_max_file_size()
-            {
-                session.cache.response_became_cacheable();
-            }
-        }
-        res
-    }
-
-    async fn send_body_to2(
-        &self,
-        session: &mut Session,
-        mut data: Option<Bytes>,
-        end_of_body: bool,
-        client_body: &mut h2::SendStream<bytes::Bytes>,
-        ctx: &mut SV::CTX,
-        write_timeout: Option<Duration>,
-    ) -> Result<bool>
-    where
-        SV: ProxyHttp + Send + Sync,
-        SV::CTX: Send + Sync,
-    {
-        session
-            .downstream_modules_ctx
-            .request_body_filter(&mut data, end_of_body)
-            .await?;
-
-        self.inner
-            .request_body_filter(session, &mut data, end_of_body, ctx)
-            .await?;
-
-        /* it is normal to get 0 bytes because of multi-chunk parsing or request_body_filter.
-         * Although there is no harm writing empty byte to h2, unlike h1, we ignore it
-         * for consistency */
-        if !end_of_body && data.as_ref().is_some_and(|d| d.is_empty()) {
-            return Ok(false);
-        }
-
-        let (data, end) = match data {
-            Some(data) => {
-                debug!("Write {} bytes body to h2 upstream", data.len());
-                (data, end_of_body)
-            }
-            None => {
-                debug!("Read downstream body done");
-                /* send a standalone END_STREAM flag */
-                (Bytes::new(), true)
-            }
-        };
-
-        /* For H2 downstreams, race the upstream write against downstream stream
-         * closure. A write blocked on upstream flow control would otherwise keep the
-         * downstream stream handles referenced while a downstream RST_STREAM goes
-         * unobserved, pinning the downstream connection window credit until the
-         * write completes. */
-        if let Some(stream_close) = session.downstream_session.watch_h2_stream_close() {
-            tokio::select! {
-                biased;
-                res = write_body(client_body, data, end, write_timeout) => {
-                    res.map_err(|e| e.into_up())?;
-                }
-                close_result = stream_close => {
-                    return match close_result {
-                        Ok(reason) => Error::e_explain(
-                            H2Error,
-                            format!("downstream H2 stream closed (reason: {reason}) while writing body to upstream"),
-                        ),
-                        Err(e) => Err(e),
-                    }
-                    .map_err(|e| e.into_down());
-                }
-            }
+        Ok(if response_pipeline.upstream_reusable {
+            DownstreamRequestOutcome::Complete(reuse_downstream)
         } else {
-            write_body(client_body, data, end, write_timeout)
-                .await
-                .map_err(|e| e.into_up())?;
-        }
-
-        Ok(end_of_body)
+            DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(reuse_downstream)
+        })
     }
 }
 
@@ -1389,3 +1654,10 @@ fn test_h2_path_is_rooted_for_targets_with_no_authority() {
         );
     }
 }
+
+#[cfg(test)]
+include!("proxy_h2_request_body_tests.rs");
+
+#[cfg(test)]
+#[path = "proxy_h2_response_batch_tests.rs"]
+mod response_batch_tests;

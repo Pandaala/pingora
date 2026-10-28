@@ -65,7 +65,7 @@ pub trait Encode {
 /// # Currently supported algorithms and actions
 /// - Brotli decompression: if the response is br compressed, this ctx can decompress it
 /// - Gzip compression: if the response is uncompressed, this ctx can compress it with gzip
-pub struct ResponseCompressionCtx(CtxInner);
+pub struct ResponseCompressionCtx(CtxInner, bool);
 
 /// Dictionary data for [RFC 9842](https://datatracker.ietf.org/doc/html/rfc9842) shared dictionary compression.
 #[derive(Clone, Debug)]
@@ -94,13 +94,16 @@ impl ResponseCompressionCtx {
     /// The `preserve_etag` flag indicates whether the ctx should avoid modifying the etag,
     /// which will otherwise be weakened if the flag is false and (de)compression is applied.
     pub fn new(compression_level: u32, decompress_enable: bool, preserve_etag: bool) -> Self {
-        Self(CtxInner::HeaderPhase {
-            accept_encoding: Vec::new(),
-            encoding_levels: [compression_level; Algorithm::COUNT],
-            decompress_enable: [decompress_enable; Algorithm::COUNT],
-            preserve_etag: [preserve_etag; Algorithm::COUNT],
-            dictionary: None,
-        })
+        Self(
+            CtxInner::HeaderPhase {
+                accept_encoding: Vec::new(),
+                encoding_levels: [compression_level; Algorithm::COUNT],
+                decompress_enable: [decompress_enable; Algorithm::COUNT],
+                preserve_etag: [preserve_etag; Algorithm::COUNT],
+                dictionary: None,
+            },
+            false,
+        )
     }
 
     /// Whether the encoder is enabled.
@@ -391,7 +394,11 @@ impl ResponseCompressionCtx {
     ///
     /// Return None if compression is not enabled.
     pub fn response_body_filter(&mut self, data: Option<&Bytes>, end: bool) -> Option<Bytes> {
-        match &mut self.0 {
+        if self.1 {
+            return None;
+        }
+
+        let output = match &mut self.0 {
             CtxInner::HeaderPhase { .. } => panic!("Wrong phase: HeaderPhase"),
             CtxInner::BodyPhase(compressor) => {
                 let result = compressor
@@ -410,24 +417,56 @@ impl ResponseCompressionCtx {
                     None
                 })
             }
+        };
+        if end {
+            // Encoders are not required to accept a second finalization. More
+            // importantly, a terminal task that follows trailers must remain a
+            // protocol marker instead of producing another body task.
+            self.1 = true;
         }
+        output
     }
 
     // TODO: retire this function, replace it with the two functions above
     /// Feed the response into this ctx.
     /// This filter will mutate the response accordingly if encoding is needed.
     pub fn response_filter(&mut self, t: &mut HttpTask) {
+        let _ = self.response_filter_inner(t, false);
+    }
+
+    /// Feed a response task into this ctx while preserving trailer ordering.
+    ///
+    /// When a trailer terminates an encoded response, the returned body task
+    /// contains bytes that must be processed immediately before `t`. The
+    /// trailer itself remains unchanged and carries the response termination.
+    pub fn response_filter_with_preceding(&mut self, t: &mut HttpTask) -> Option<HttpTask> {
+        self.response_filter_inner(t, true)
+    }
+
+    fn response_filter_inner(
+        &mut self,
+        t: &mut HttpTask,
+        finalize_before_trailers: bool,
+    ) -> Option<HttpTask> {
         if !self.is_enabled() {
-            return;
+            return None;
         }
         match t {
-            HttpTask::Header(resp, end) => self.response_header_filter(resp, *end),
+            HttpTask::Header(resp, end) => {
+                self.response_header_filter(resp, *end);
+                None
+            }
             HttpTask::Body(data, end) => {
                 let compressed = self.response_body_filter(data.as_ref(), *end);
                 if compressed.is_some() {
                     *t = HttpTask::Body(compressed, *end);
                 }
+                None
             }
+            HttpTask::Trailer(_) if finalize_before_trailers => self
+                .response_body_filter(None, true)
+                .filter(|footer| !footer.is_empty())
+                .map(|footer| HttpTask::Body(Some(footer), false)),
             HttpTask::Done => {
                 // try to finish/flush compression
                 let compressed = self.response_body_filter(None, true);
@@ -435,8 +474,9 @@ impl ResponseCompressionCtx {
                     // compressor has more data to flush
                     *t = HttpTask::Body(compressed, true);
                 }
+                None
             }
-            _ => { /* Trailer, Failed: do nothing? */ }
+            HttpTask::Trailer(_) | HttpTask::Failed(_) | HttpTask::UpgradedBody(_, _) => None,
         }
     }
 }
@@ -874,6 +914,45 @@ fn resp_for_test(status: u16, content_encoding: Option<&str>) -> ResponseHeader 
         resp.insert_header("content-encoding", ce).unwrap();
     }
     resp
+}
+
+#[test]
+fn compression_footer_is_emitted_before_trailers_and_only_once() {
+    use std::io::Read;
+
+    let input = Bytes::from(vec![b'a'; 1000]);
+    let mut ctx = ctx_for_test(6, false, Some("gzip"));
+
+    let mut header = HttpTask::Header(Box::new(resp_for_test(200, None)), false);
+    assert!(ctx.response_filter_with_preceding(&mut header).is_none());
+
+    let mut body = HttpTask::Body(Some(input.clone()), false);
+    assert!(ctx.response_filter_with_preceding(&mut body).is_none());
+    let HttpTask::Body(Some(first), false) = body else {
+        panic!("compression must preserve a non-terminal body task")
+    };
+
+    let mut trailers = HttpTask::Trailer(Some(Box::default()));
+    let footer = ctx
+        .response_filter_with_preceding(&mut trailers)
+        .expect("gzip must emit its footer before trailers");
+    let HttpTask::Body(Some(footer), false) = footer else {
+        panic!("the pre-trailer compression footer must be a non-terminal body task")
+    };
+    assert!(matches!(trailers, HttpTask::Trailer(_)));
+
+    let mut done = HttpTask::Done;
+    assert!(ctx.response_filter_with_preceding(&mut done).is_none());
+    assert!(matches!(done, HttpTask::Done));
+
+    let mut encoded = Vec::with_capacity(first.len() + footer.len());
+    encoded.extend_from_slice(&first);
+    encoded.extend_from_slice(&footer);
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(encoded.as_slice())
+        .read_to_end(&mut decoded)
+        .unwrap();
+    assert_eq!(decoded, input);
 }
 
 #[test]

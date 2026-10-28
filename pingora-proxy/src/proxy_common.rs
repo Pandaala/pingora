@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::Session;
+use bytes::Bytes;
 use http::header::{self, HeaderName};
+use log::warn;
 use pingora_core::protocols::http::authority::{raw_target_authority, RawTargetAuthority};
 use pingora_core::upstreams::peer::{H1UpgradePolicy, HttpUpstreamRequestPolicy};
 use pingora_error::{Error, ErrorType::InvalidHTTPHeader, OrErr, Result};
@@ -54,6 +57,26 @@ impl AuthorityPolicy {
     pub(crate) fn is_custom(self) -> bool {
         self == Self::Custom
     }
+}
+
+/// Whether an externally received HTTP/1 request uses transfer coding the proxy can forward
+/// without changing the payload semantics.
+///
+/// Pingora's HTTP/1 body reader removes chunk framing, but it does not decode transfer codings
+/// that precede `chunked`. The proxy's normal hop-by-hop sanitization then removes the complete
+/// `Transfer-Encoding` field. Accepting anything other than one `chunked` field would therefore
+/// forward coded bytes under different metadata.
+pub(crate) fn h1_transfer_encoding_is_forwardable(req: &RequestHeader) -> bool {
+    let mut values = req.headers.get_all(header::TRANSFER_ENCODING).iter();
+    let Some(value) = values.next() else {
+        return true;
+    };
+
+    values.next().is_none()
+        && value
+            .as_bytes()
+            .trim_ascii()
+            .eq_ignore_ascii_case(b"chunked")
 }
 
 /// Whether `byte` is a `tchar`, the character set of an HTTP `token` (RFC 9110 §5.6.2). Checked
@@ -544,7 +567,7 @@ impl PipeState {
 }
 
 #[cfg(test)]
-mod tests {
+mod upstream_tests {
     use super::*;
 
     fn request_with_headers(headers: &[(&str, &str)]) -> RequestHeader {
@@ -893,3 +916,62 @@ mod tests {
         assert!(!ds.can_poll());
     }
 }
+
+/// Whether a pump that has no end-of-stream handling of its own has nothing to
+/// read from the downstream request body.
+///
+/// This is the pre-tightening meaning of `is_body_done()`: "ended OR declared
+/// empty". The H1/H2 upstream pumps deliberately no longer use it -- they gained
+/// a bodyless prelude and a futile-read guard so that they can tell an H2
+/// request declaring `Content-Length: 0` (empty, but whose stream has NOT ended,
+/// design 4.3) apart from a genuinely finished one, and they need the strict
+/// transport fact for that.
+///
+/// The custom-connector pump and the subrequest pipe implement neither. They
+/// also derive their UPSTREAM end-of-stream from the declaration
+/// (`is_body_empty()`), so with the strict fact their two halves contradict each
+/// other: the upstream request is closed at header time while the downstream
+/// state machine still believes a body is coming, and -- because these two
+/// session types carry no downstream request-body idle timeout of their own
+/// (the H1 and H2 sessions do, 60s by default, but a custom session's
+/// `set_read_timeout` is `unreachable!()` and the subrequest pipe has no
+/// transport to bound) -- the pump parks forever on a read that can never
+/// yield, pinning the task, both streams and the upstream session.
+/// Restoring the union here makes the two halves agree again, which is exactly
+/// how both pumps behaved before the tightening.
+pub(crate) fn no_downstream_body_to_read(session: &mut Session) -> bool {
+    session.as_mut().is_body_done() || session.as_mut().is_body_empty()
+}
+
+/// A downstream custom-message reader, taken out of the session for the
+/// duration of a pump and put back on every exit path.
+pub(crate) type CustomMessageReader =
+    Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>;
+
+/// Put the custom-message reader back into the downstream session.
+///
+/// Both pumps take it out for the duration of the duplex loop and restore it
+/// on normal exit; the terminate early-returns must do the same, or a Custom
+/// downstream session is left asymmetric (its writer IS restored by the outer
+/// function) and a later reuse would trip the
+/// `"...should be empty"` expectation.
+pub(crate) fn restore_custom_message_reader(
+    session: &mut Session,
+    reader: Option<CustomMessageReader>,
+) {
+    let (Some(custom_session), Some(reader)) = (session.downstream_session.as_custom_mut(), reader)
+    else {
+        return;
+    };
+    if let Err(e) = custom_session.restore_custom_message_reader(reader) {
+        warn!("Error restoring the downstream custom message reader: {e}");
+    }
+}
+
+#[cfg(test)]
+#[path = "proxy_common_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "proxy_common_terminal_body_dispatch_tests.rs"]
+mod terminal_body_dispatch_tests;

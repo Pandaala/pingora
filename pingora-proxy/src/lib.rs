@@ -42,6 +42,7 @@ use futures::future::FutureExt;
 use http::{header, version::Version, Method};
 use log::{debug, error, trace, warn};
 use once_cell::sync::Lazy;
+pub use pingora_core::modules::http::RequestBodyEvent;
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::fmt::Debug;
 use std::future::{poll_fn, Future};
@@ -54,6 +55,10 @@ use std::task::Poll;
 use std::time::Duration;
 use tokio::sync::{mpsc, Notify};
 use tokio::time;
+
+#[cfg(test)]
+#[path = "response_reconciliation_tests.rs"]
+mod downstream_body_suppression_tests;
 
 use pingora_cache::NoCacheReason;
 use pingora_core::apps::{
@@ -93,16 +98,40 @@ mod proxy_h1;
 mod proxy_h2;
 mod proxy_purge;
 mod proxy_trait;
+mod pump_termination;
+mod request_relay;
+mod response_body_sink;
+mod response_cache_relay;
+mod response_pipeline;
+mod response_reconciliation;
 pub mod subrequest;
+#[cfg(test)]
+mod test_allocator;
 
 use subrequest::{BodyMode, Ctx as SubrequestCtx};
 
+use response_reconciliation::{
+    abort_cache_after_response_source_failure, downstream_response_body_forbidden,
+    is_downstream_followup, reconcile_terminal_cache_header, reconcile_terminal_response_tasks,
+};
+
 pub use proxy_cache::range_filter::{range_header_filter, MultiRangeInfo, RangeType};
 pub use proxy_purge::PurgeStatus;
-pub use proxy_trait::{FailToProxy, ProxyHttp, ProxyWarnLogContext};
+pub use proxy_trait::{
+    FailToProxy, ProxyHttp, ProxyWarnLogContext, RequestAttemptId, RequestBodyAction,
+    RequestRelayPlan, RequestRelayRetryState, RequestReplayPolicy, UpstreamRequestBodyDisposition,
+    UpstreamResponseBodyEvent,
+};
+pub use response_body_sink::{
+    ResponseBodySink, RESPONSE_BODY_EMIT_BUDGET, RESPONSE_BODY_EMIT_CHUNK_BUDGET,
+};
 
 pub mod prelude {
-    pub use crate::{http_proxy, http_proxy_service, ProxyHttp, ProxyWarnLogContext, Session};
+    pub use crate::{
+        http_proxy, http_proxy_service, ProxyHttp, ProxyWarnLogContext, RequestBodyAction,
+        RequestRelayPlan, RequestRelayRetryState, RequestReplayPolicy, Session,
+        UpstreamRequestBodyDisposition, UpstreamResponseBodyEvent,
+    };
 }
 
 pub type ProcessCustomSession<SV, C> = Arc<
@@ -458,23 +487,29 @@ where
                         (server_reused, error)
                     }
                     ClientSession::Custom(mut c) => {
-                        let (server_reused, error) = self
+                        let (server_reused, client_reuse, error) = self
                             .proxy_to_custom_upstream(session, &mut c, client_reused, &peer, ctx)
                             .await;
-                        let session = ClientSession::Custom(c);
-                        self.client_upstream
-                            .release_http_session(session, &*peer, peer.idle_timeout())
-                            .await;
+                        if client_reuse {
+                            let session = ClientSession::Custom(c);
+                            self.client_upstream
+                                .release_http_session(session, &*peer, peer.idle_timeout())
+                                .await;
+                        }
                         (server_reused, error)
                     }
                 };
-                (
-                    server_reused,
-                    error.map(|e| {
-                        self.inner
-                            .error_while_proxy(&peer, session, e, ctx, client_reused)
-                    }),
-                )
+                let error = error.map(|mut e| {
+                    // Product hooks may consume retry budget or advance an
+                    // attempt scheduler. Close retry before invoking them once
+                    // a final response selected the bounded head processor.
+                    if session.response_head_retry_closed() {
+                        e.retry = false.into();
+                    }
+                    self.inner
+                        .error_while_proxy(&peer, session, e, ctx, client_reused)
+                });
+                (server_reused, error)
             }
             Err(mut e) => {
                 e.as_up();
@@ -488,6 +523,7 @@ where
         &self,
         session: &mut Session,
         task: &mut HttpTask,
+        sink: &mut ResponseBodySink,
         ctx: &mut SV::CTX,
     ) -> Result<Option<Duration>>
     where
@@ -495,19 +531,24 @@ where
         SV::CTX: Send + Sync,
     {
         let duration = match task {
-            HttpTask::Header(header, _eos) => {
+            HttpTask::Header(header, eos) => {
                 self.inner
-                    .upstream_response_filter(session, header, ctx)
+                    .upstream_response_header_filter_event(session, header, *eos, ctx)
                     .await?;
                 None
             }
-            HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => self
-                .inner
-                .upstream_response_body_filter(session, data, *eos, ctx)?,
-            HttpTask::Trailer(Some(trailers)) => {
+            HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => {
                 self.inner
-                    .upstream_response_trailer_filter(session, trailers, ctx)?;
-                None
+                    .upstream_response_body_filter_event(
+                        session,
+                        data,
+                        UpstreamResponseBodyEvent::Data {
+                            end_of_stream: *eos,
+                        },
+                        sink,
+                        ctx,
+                    )
+                    .await?
             }
             _ => {
                 // task does not support a filter
@@ -516,6 +557,79 @@ where
         };
 
         Ok(duration)
+    }
+
+    /// Dispatch the terminal body event carried by a final Header task.
+    ///
+    /// Protocol pumps call this only after `response_filter` succeeds, matching
+    /// the ordering of an ordinary terminal Body task. The returned current
+    /// chunk is not sink output and therefore is not charged against the
+    /// bounded extra-chunk budget.
+    async fn terminal_upstream_body_filter(
+        &self,
+        session: &mut Session,
+        event: UpstreamResponseBodyEvent,
+        sink: &mut ResponseBodySink,
+        ctx: &mut SV::CTX,
+    ) -> Result<Option<Duration>>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        let mut body = None;
+        let duration = self
+            .inner
+            .upstream_response_body_filter_event(session, &mut body, event, sink, ctx)
+            .await?;
+        if let Some(body) = body {
+            sink.prepend_current(body);
+        }
+        // The source is already naturally complete. A terminate request at
+        // this boundary must not turn a reusable upstream into an abort.
+        sink.consume_terminate();
+        Ok(duration)
+    }
+
+    async fn downstream_response_body_filter_tasks(
+        &self,
+        session: &mut Session,
+        tasks: &mut [HttpTask],
+        terminal: &mut response_pipeline::TerminalBodyDispatch,
+        ctx: &mut SV::CTX,
+    ) -> Result<()>
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        for task in tasks {
+            let terminal_event = terminal.claim_for(task);
+            let duration = match task {
+                HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => {
+                    self.inner.response_body_filter(session, data, *eos, ctx)?
+                }
+                _ if terminal_event.is_some() => {
+                    // Notify the observer without adding a wire-level EOS before
+                    // trailers. There are no original bytes to replace here.
+                    let mut body = None;
+                    let duration = self
+                        .inner
+                        .response_body_filter(session, &mut body, true, ctx)?;
+                    if body.as_ref().is_some_and(|body| !body.is_empty()) {
+                        return Error::e_explain(
+                            InternalError,
+                            "downstream terminal body observation cannot produce bytes",
+                        );
+                    }
+                    duration
+                }
+                _ => None,
+            };
+            if let Some(duration) = duration {
+                trace!("delaying downstream response for {duration:?}");
+                time::sleep(duration).await;
+            }
+        }
+        Ok(())
     }
 
     async fn finish(
@@ -605,6 +719,24 @@ pub struct Session {
     downstream_task_seen_upgraded: bool,
     /// Upstream write pending time. Set by proxy layer (HTTP/1.x only).
     upstream_write_pending_time: Duration,
+    /// Latch so that `ProxyHttp::request_trailer_filter` fires at most once
+    /// per downstream request. Without it a retry attempt (whose replayed EOF
+    /// also has `data == None` while the trailer fact stays true) would
+    /// re-fire the hook.
+    pub(crate) request_trailer_filter_fired: bool,
+    /// Request-scoped relay policy and core-derived source, frozen before the
+    /// upstream retry loop.
+    frozen_request_relay_plan: Option<request_relay::FrozenRequestRelayPlan>,
+    /// Canonical identity of the current upstream attempt.
+    request_attempt_id: Option<RequestAttemptId>,
+    /// Whether native retry capture has started for the live source.
+    native_retry_buffer_state: request_relay::NativeRetryBufferState,
+    /// Number of response header tasks whose downstream module filtering was
+    /// completed early so a same-batch trailer hook can query planned framing.
+    prepared_response_headers: usize,
+    /// A final response was selected for downstream writer handoff.
+    response_head_attempt_selected: bool,
+    preserved_selected_response_after_request_termination: bool,
     /// Flag that is set when the shutdown process has begun.
     shutdown_flag: Arc<AtomicBool>,
 }
@@ -633,8 +765,49 @@ impl Session {
             upstream_body_bytes_sent: None,
             downstream_task_seen_upgraded: false,
             upstream_write_pending_time: Duration::ZERO,
+            request_trailer_filter_fired: false,
+            frozen_request_relay_plan: None,
+            request_attempt_id: None,
+            native_retry_buffer_state: request_relay::NativeRetryBufferState::NotStarted,
+            prepared_response_headers: 0,
+            response_head_attempt_selected: false,
+            preserved_selected_response_after_request_termination: false,
             shutdown_flag,
         }
+    }
+
+    pub(crate) fn mark_response_head_writer_handoff(&mut self) {
+        self.response_head_attempt_selected = true;
+    }
+
+    /// Whether the response pipeline selected a final response for this
+    /// request at downstream writer handoff.
+    ///
+    /// This deliberately excludes responses written directly by application
+    /// request hooks. Callers that arbitrate a late local reply against an
+    /// origin response need the owner of the response, not merely
+    /// [`Self::response_written`].
+    pub fn response_head_selected_by_pipeline(&self) -> bool {
+        self.response_head_attempt_selected
+    }
+
+    pub(crate) fn mark_preserved_selected_response_after_request_termination(&mut self) {
+        self.preserved_selected_response_after_request_termination = true;
+    }
+
+    pub(crate) fn preserved_selected_response_after_request_termination(&self) -> bool {
+        self.preserved_selected_response_after_request_termination
+    }
+
+    /// Whether retry is permanently closed by final-response selection or
+    /// commit for this request.
+    ///
+    /// Product retry hooks must check this before consuming retry budget or
+    /// advancing an attempt scheduler. Pingora also enforces it after the hook,
+    /// but that later guard cannot roll back product-side effects.
+    pub fn response_head_retry_closed(&self) -> bool {
+        self.response_head_selected_by_pipeline()
+            || final_response_committed(self.response_written())
     }
 
     /// Create a new [Session] from the given [Stream]
@@ -733,7 +906,23 @@ impl Session {
         self.downstream_modules_ctx
             .response_header_filter(&mut resp, end_of_stream)
             .await?;
+        self.downstream_session.prepare_response_header(&mut resp)?;
         self.downstream_session.write_response_header(resp).await
+    }
+
+    /// Run final downstream response-header filters before a same-batch
+    /// trailer hook, then latch the resulting H1 framing capability.
+    pub(crate) async fn prepare_response_headers(&mut self, tasks: &mut [HttpTask]) -> Result<()> {
+        for task in tasks {
+            if let HttpTask::Header(resp, end) = task {
+                self.downstream_modules_ctx
+                    .response_header_filter(resp, *end)
+                    .await?;
+                self.downstream_session.prepare_response_header(resp)?;
+                self.prepared_response_headers += 1;
+            }
+        }
+        Ok(())
     }
 
     /// Similar to `write_response_header()`, this fn will clone the `resp` internally
@@ -781,9 +970,14 @@ impl Session {
                 if *seen_upgraded {
                     return reject_unexpected_task_after_h1_upgrade(self, "header", *seen_upgraded);
                 }
-                self.downstream_modules_ctx
-                    .response_header_filter(resp, *end)
-                    .await?;
+                if self.prepared_response_headers > 0 {
+                    self.prepared_response_headers -= 1;
+                } else {
+                    self.downstream_modules_ctx
+                        .response_header_filter(resp, *end)
+                        .await?;
+                    self.downstream_session.prepare_response_header(resp)?;
+                }
                 reject_mismatched_h1_upgrade_101(self, resp, "downstream_module_header_filter")
                     .map_err(|e| e.into_in())?;
                 if resp.status == http::StatusCode::SWITCHING_PROTOCOLS
@@ -1141,6 +1335,12 @@ static BAD_GATEWAY: Lazy<ResponseHeader> = Lazy::new(|| {
     resp
 });
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DownstreamErrorReuse {
+    ApplicationControlled,
+    ForceClose,
+}
+
 impl<SV, C> HttpProxy<SV, C>
 where
     C: custom::Connector,
@@ -1272,6 +1472,16 @@ where
             }
         }
 
+        // Body policy is request-scoped. Freeze it exactly once after every
+        // pre-upstream request hook has completed, but before any attempt can
+        // select a peer or mutate attempt-local headers.
+        let relay_plan = self.inner.request_relay_plan(&session, &ctx);
+        if let Err(e) = session.freeze_request_relay_plan(relay_plan) {
+            return self
+                .handle_error(session, &mut ctx, e, "Error freezing request relay plan:")
+                .await;
+        }
+
         let mut retries: usize = 0;
 
         let mut server_reuse = false;
@@ -1279,12 +1489,22 @@ where
 
         while retries < self.max_retries {
             retries += 1;
+            session.begin_request_relay_attempt(retries);
 
             let (reuse, e) = self.proxy_to_upstream(&mut session, &mut ctx).await;
             server_reuse = reuse;
 
             match e {
-                Some(error) => {
+                Some(mut error) => {
+                    if session.response_head_retry_closed() {
+                        error.retry = false.into();
+                    }
+                    if !session.request_relay_retry_state().can_start_next_attempt() {
+                        // Preserve the final error's observable classification:
+                        // fail_to_proxy/logging must not see a retryable error
+                        // after the relay backing vetoed the retry.
+                        error.retry = false.into();
+                    }
                     let retry = error.retry();
                     // only log error that will be retried here, the final error will be logged below
                     if retry
@@ -1366,7 +1586,7 @@ where
 
     async fn handle_error(
         &self,
-        mut session: Session,
+        session: Session,
         ctx: &mut <SV as ProxyHttp>::CTX,
         e: Box<Error>,
         context: &str,
@@ -1375,7 +1595,36 @@ where
         SV: ProxyHttp + Send + Sync + 'static,
         <SV as ProxyHttp>::CTX: Send + Sync,
     {
+        self.handle_error_with_downstream_reuse(
+            session,
+            ctx,
+            e,
+            context,
+            DownstreamErrorReuse::ApplicationControlled,
+        )
+        .await
+    }
+
+    async fn handle_error_with_downstream_reuse(
+        &self,
+        mut session: Session,
+        ctx: &mut <SV as ProxyHttp>::CTX,
+        e: Box<Error>,
+        context: &str,
+        downstream_reuse: DownstreamErrorReuse,
+    ) -> Option<ReusedHttpStream>
+    where
+        SV: ProxyHttp + Send + Sync + 'static,
+        <SV as ProxyHttp>::CTX: Send + Sync,
+    {
+        let force_close_downstream = downstream_reuse == DownstreamErrorReuse::ForceClose;
         let res = self.inner.fail_to_proxy(&mut session, &e, ctx).await;
+        if force_close_downstream {
+            // Admission has already decided that unread request bytes make reuse unsafe. A custom
+            // error renderer has mutable Session access and may change keepalive while writing its
+            // response, so re-assert the transport boundary after the hook returns.
+            session.set_keepalive(None);
+        }
         if !self.inner.suppress_error_log(&session, ctx, &e) {
             error!(
                 "{context} {}, status: {}, {}",
@@ -1388,8 +1637,16 @@ where
         self.cleanup_sub_req(&mut session);
 
         session.downstream_session.on_proxy_failure(e);
+        if force_close_downstream {
+            // Keep this as the final mutable write before reuse is evaluated. In particular,
+            // `logging` also receives `&mut Session` and may have changed keepalive after the
+            // renderer-level re-assertion above.
+            session.set_keepalive(None);
+        }
 
-        if res.can_reuse_downstream {
+        let can_reuse_downstream = res.can_reuse_downstream
+            && downstream_reuse == DownstreamErrorReuse::ApplicationControlled;
+        if can_reuse_downstream {
             let mut persistent_settings = HttpPersistentSettings::for_session(&session);
             if let Some(uc) = self.inner.persist_connection_context(&session, ctx) {
                 persistent_settings.set_user_context(uc);
@@ -1585,6 +1842,31 @@ where
         }
 
         let mut ctx = self.inner.new_ctx();
+
+        if session.downstream_session.as_http1().is_some()
+            && !proxy_common::h1_transfer_encoding_is_forwardable(session.req_header())
+        {
+            // The request body has not been consumed. Close the H1 connection even when a custom
+            // `fail_to_proxy` implementation would otherwise allow reuse, so unread coded bytes
+            // can never be interpreted as another request. This must also precede
+            // `on_connection_reuse`, whose mutable Session access could otherwise rewrite the
+            // external header before admission validates it.
+            session.set_keepalive(None);
+            let e = Error::explain(
+                HTTPStatus(501),
+                "unsupported HTTP/1 request Transfer-Encoding",
+            )
+            .into_down();
+            return self
+                .handle_error_with_downstream_reuse(
+                    session,
+                    &mut ctx,
+                    e,
+                    "Fail closed on unsupported request transfer coding:",
+                    DownstreamErrorReuse::ForceClose,
+                )
+                .await;
+        }
 
         // Deliver user context from the previous request on this reused connection
         if let Some(prev_ctx) = prev_user_ctx {
@@ -2002,6 +2284,9 @@ mod tests {
         client_reused: bool,
     ) -> bool {
         let mut session = new_request_session(request, Arc::new(Mutex::new(Vec::new()))).await;
+        session
+            .freeze_request_relay_plan(RequestRelayPlan::ordinary())
+            .unwrap();
         default_policy_would_retry_for_session(&mut session, retry, client_reused)
     }
 
@@ -2012,7 +2297,10 @@ mod tests {
         request.resize(request.len() + body_len, b'a');
 
         let mut session = new_request_session(&request, Arc::new(Mutex::new(Vec::new()))).await;
-        session.enable_retry_buffering();
+        session
+            .freeze_request_relay_plan(RequestRelayPlan::ordinary())
+            .unwrap();
+        session.enable_request_relay_retry_buffer();
         while session.read_request_body().await.unwrap().is_some() {}
         session
     }
@@ -2626,5 +2914,50 @@ mod tests {
         .await
         .expect("read_request parked after shutdown");
         assert!(session.is_none());
+    }
+}
+
+/// Whether a final downstream response has been committed, which forbids any
+/// further upstream retry: the client has already received bytes from this
+/// attempt, and a retry would concatenate two upstream responses into one
+/// downstream body.
+///
+/// A 1xx informational response is not final — the H1 downstream session can
+/// store one in `response_written()` — except 101, which switches protocols
+/// and is final. The H2 session never stores a 1xx, so the informational
+/// check is inert there.
+fn final_response_committed(resp: Option<&ResponseHeader>) -> bool {
+    resp.is_some_and(|r| {
+        !r.status.is_informational() || r.status == http::StatusCode::SWITCHING_PROTOCOLS
+    })
+}
+
+#[cfg(test)]
+mod retry_guard_tests {
+    use super::*;
+
+    fn resp(code: u16) -> ResponseHeader {
+        ResponseHeader::build(code, None).unwrap()
+    }
+
+    #[test]
+    fn no_committed_response_permits_retry() {
+        assert!(!final_response_committed(None));
+    }
+
+    #[test]
+    fn retry_guard_ignores_1xx_but_not_101() {
+        // H1 can store a 1xx informational response in response_written();
+        // it is not final and must not block a retry.
+        assert!(!final_response_committed(Some(&resp(100))));
+        assert!(!final_response_committed(Some(&resp(103))));
+        // 101 is a final response despite being 1xx.
+        assert!(final_response_committed(Some(&resp(101))));
+    }
+
+    #[test]
+    fn final_statuses_forbid_retry() {
+        assert!(final_response_committed(Some(&resp(200))));
+        assert!(final_response_committed(Some(&resp(502))));
     }
 }

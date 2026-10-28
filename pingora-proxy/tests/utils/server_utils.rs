@@ -14,10 +14,19 @@
 
 #[cfg(feature = "any_tls")]
 use super::cert;
+#[path = "response_feature_support.rs"]
+mod response_feature_support;
+
+pub use response_feature_support::{
+    cache_entry_state, take_downstream_body_observation, take_downstream_trailer_filter_calls,
+    take_downstream_trailer_logging_error, take_emit_chunk_limit_logging_error,
+    take_eos_dispatches, CacheEntryState,
+};
+
 use async_trait::async_trait;
+use bytes::Bytes;
 use clap::Parser;
 use http::header::{ACCEPT_ENCODING, CONNECTION, CONTENT_LENGTH, TRANSFER_ENCODING, UPGRADE, VARY};
-use http::HeaderValue;
 use log::error;
 use once_cell::sync::Lazy;
 use pingora_cache::admission::{AdmissionPolicy, Decision};
@@ -35,7 +44,7 @@ use pingora_cache::{
     CacheOptionOverrides, ForcedFreshness, HitHandler, PurgeAction, PurgeType, VarianceBuilder,
 };
 use pingora_core::apps::{HttpServerApp, HttpServerOptions};
-use pingora_core::modules::http::compression::ResponseCompression;
+use pingora_core::modules::http::{compression::ResponseCompression, RequestBodyEvent};
 use pingora_core::protocols::{
     http::error_resp::gen_error_response, l4::socket::SocketAddr, Digest,
 };
@@ -45,8 +54,11 @@ use pingora_core::upstreams::peer::{H1UpgradePolicy, HttpPeer, HttpUpstreamReque
 use pingora_core::utils::tls::CertKey;
 use pingora_error::{Error, ErrorSource, ErrorType::*, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
-use pingora_proxy::{FailToProxy, ProxyHttp, ProxyWarnLogContext, Session};
-use std::collections::{HashMap, HashSet};
+use pingora_proxy::{
+    FailToProxy, ProxyHttp, ProxyWarnLogContext, ResponseBodySink, Session,
+    UpstreamResponseBodyEvent,
+};
+use std::collections::HashSet;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -65,6 +77,7 @@ pub struct CTX {
     conn_reused: bool,
     upstream_client_addr: Option<SocketAddr>,
     upstream_server_addr: Option<SocketAddr>,
+    response_features: response_feature_support::HttpResponseFeatureState,
 }
 
 // Common logic for both ProxyHttp(s) types
@@ -346,7 +359,7 @@ impl ProxyHttp for ExampleProxyHttp {
         &self,
         session: &mut Session,
         body: &mut Option<bytes::Bytes>,
-        _end_of_stream: bool,
+        _event: RequestBodyEvent,
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
         if session
@@ -409,6 +422,96 @@ impl ProxyHttp for ExampleProxyHttp {
         Ok(())
     }
 
+    async fn upstream_response_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        sink: &mut ResponseBodySink,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        response_feature_support::http_upstream_response_body_filter(
+            session,
+            body,
+            end_of_stream,
+            sink,
+            &mut ctx.response_features,
+        )
+        .await
+    }
+
+    async fn upstream_response_body_filter_event(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        event: UpstreamResponseBodyEvent,
+        sink: &mut ResponseBodySink,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        response_feature_support::http_upstream_response_body_filter_event(
+            session,
+            body,
+            event,
+            sink,
+            &mut ctx.response_features,
+        )
+        .await
+    }
+
+    async fn upstream_response_trailer_filter(
+        &self,
+        session: &mut Session,
+        trailers: &mut http::HeaderMap,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        response_feature_support::http_upstream_response_trailer_filter(
+            session,
+            trailers,
+            &mut ctx.response_features,
+        )
+        .await
+    }
+
+    fn response_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        response_feature_support::http_response_body_filter(session, body, end_of_stream)
+    }
+
+    async fn response_trailer_filter(
+        &self,
+        session: &mut Session,
+        _trailers: &mut http::HeaderMap,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<Bytes>> {
+        response_feature_support::http_response_trailer_filter(session, _trailers).await
+    }
+
+    async fn logging(&self, session: &mut Session, error: Option<&Error>, _ctx: &mut Self::CTX) {
+        response_feature_support::http_logging(session, error).await;
+    }
+
+    async fn upstream_response_header_filter_event(
+        &self,
+        session: &mut Session,
+        upstream_response: &mut ResponseHeader,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        response_feature_support::http_upstream_response_header_filter_event(
+            self,
+            session,
+            upstream_response,
+            end_of_stream,
+            ctx,
+        )
+        .await
+    }
+
     async fn upstream_peer(
         &self,
         session: &mut Session,
@@ -459,6 +562,15 @@ impl ProxyHttp for ExampleProxyHttp {
             .and_then(|v| v.parse::<u64>().ok())
         {
             peer.options.read_timeout = Some(std::time::Duration::from_millis(ms));
+        }
+
+        if let Some(ms) = req
+            .headers
+            .get("x-write-timeout-ms")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            peer.options.write_timeout = Some(std::time::Duration::from_millis(ms));
         }
 
         Ok(peer)
@@ -576,6 +688,7 @@ impl HandleMiss for FinishFailMissHandler {
 // #[allow(clippy::upper_case_acronyms)]
 pub struct CacheCTX {
     upstream_status: Option<u16>,
+    response_features: response_feature_support::CacheResponseFeatureState,
 }
 
 pub struct ExampleProxyCache {}
@@ -597,6 +710,7 @@ impl ProxyHttp for ExampleProxyCache {
     fn new_ctx(&self) -> Self::CTX {
         CacheCTX {
             upstream_status: None,
+            response_features: response_feature_support::CacheResponseFeatureState::default(),
         }
     }
 
@@ -605,6 +719,7 @@ impl ProxyHttp for ExampleProxyCache {
         session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<()> {
+        response_feature_support::configure_cache_upstream_compression(session);
         if session
             .req_header()
             .headers
@@ -652,6 +767,7 @@ impl ProxyHttp for ExampleProxyCache {
         if session.get_header_bytes("x-h2") == b"true" {
             // default is 1, 1
             peer.options.set_http_version(2, 2);
+            response_feature_support::configure_cache_h2_windows(req, &mut peer);
         }
 
         Ok(peer)
@@ -871,6 +987,59 @@ impl ProxyHttp for ExampleProxyCache {
         ))
     }
 
+    fn response_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        response_feature_support::http_response_body_filter(session, body, end_of_stream)
+    }
+
+    /// Same withholding processor as `ExampleProxyHttp`, so the terminal
+    /// dispatch can be observed through cache admission: the cached entity must
+    /// be byte-identical to what the client received on the miss.
+    ///
+    /// Note: `x-eos-probe` recording lives on `ExampleProxyHttp` only. A probe
+    /// assertion written against this service would read 0 and pass vacuously;
+    /// add `record_eos_dispatch` here first.
+    async fn upstream_response_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        _sink: &mut ResponseBodySink,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        response_feature_support::cache_upstream_response_body_filter(
+            session,
+            body,
+            end_of_stream,
+            _sink,
+            &mut ctx.response_features,
+        )
+        .await
+    }
+
+    async fn upstream_response_body_filter_event(
+        &self,
+        session: &mut Session,
+        body: &mut Option<Bytes>,
+        event: UpstreamResponseBodyEvent,
+        sink: &mut ResponseBodySink,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        response_feature_support::cache_upstream_response_body_filter_event(
+            session,
+            body,
+            event,
+            sink,
+            &mut ctx.response_features,
+        )
+        .await
+    }
+
     async fn upstream_response_filter(
         &self,
         session: &mut Session,
@@ -906,6 +1075,10 @@ impl ProxyHttp for ExampleProxyCache {
     where
         Self::CTX: Send + Sync,
     {
+        response_feature_support::add_cache_connection_observation_headers(
+            upstream_response,
+            &ctx.response_features,
+        )?;
         if session.cache.enabled() {
             match session.cache.phase() {
                 CachePhase::Hit => upstream_response.insert_header("x-cache-status", "hit")?,
@@ -937,6 +1110,23 @@ impl ProxyHttp for ExampleProxyCache {
             upstream_response.insert_header("x-upstream-status", up_stat.to_string())?;
         }
         Ok(())
+    }
+
+    async fn connected_to_upstream(
+        &self,
+        _http_session: &mut Session,
+        reused: bool,
+        _peer: &HttpPeer,
+        #[cfg(unix)] _fd: std::os::unix::io::RawFd,
+        #[cfg(windows)] _sock: std::os::windows::io::RawSocket,
+        digest: Option<&Digest>,
+        ctx: &mut CacheCTX,
+    ) -> Result<()> {
+        response_feature_support::record_cache_upstream_connection(
+            reused,
+            digest,
+            &mut ctx.response_features,
+        )
     }
 
     async fn fail_to_proxy(
@@ -1127,6 +1317,24 @@ impl Server {
         let server_handle = thread::spawn(|| {
             test_main();
         });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let address = "127.0.0.1:6147";
+        loop {
+            if std::net::TcpStream::connect(address).is_ok() {
+                break;
+            }
+            assert!(
+                !server_handle.is_finished(),
+                "Pingora test server exited before binding {address}"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Pingora test server failed to bind {address} within 10s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
         Server {
             handle: server_handle,
         }
@@ -1224,6 +1432,15 @@ use super::mock_origin::MOCK_ORIGIN;
 pub fn init() {
     let _ = *TEST_SERVER;
     let _ = *MOCK_ORIGIN;
+    #[cfg(feature = "s2n")]
+    let _ = *TEST_PSK_TLS_SERVER;
+}
+
+/// Start the in-process Pingora test services without requiring the external
+/// OpenResty mock origin. Tests that provide every origin themselves should
+/// use this entry point so unrelated local tooling cannot block them.
+pub fn init_without_mock_origin() {
+    let _ = *TEST_SERVER;
     #[cfg(feature = "s2n")]
     let _ = *TEST_PSK_TLS_SERVER;
 }
