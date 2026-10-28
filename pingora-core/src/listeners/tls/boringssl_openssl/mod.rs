@@ -185,16 +185,16 @@ impl Acceptor {
         if let Some(offload) = self.offload.as_ref() {
             let ssl_acceptor = self.ssl_acceptor.clone();
             let callbacks = self.callbacks.clone();
-            let rt = offload.get_runtime(stream.id() as u64);
-            rt.spawn(async move {
-                if let Some(cb) = callbacks.as_ref() {
-                    handshake_with_callback(&ssl_acceptor, stream, cb.as_ref()).await
-                } else {
-                    handshake(&ssl_acceptor, stream).await
-                }
-            })
-            .await
-            .or_err(InternalError, "TLS offload runtime failure")?
+            offload
+                .spawn_abort_on_drop(stream.id() as u64, async move {
+                    if let Some(cb) = callbacks.as_ref() {
+                        handshake_with_callback(&ssl_acceptor, stream, cb.as_ref()).await
+                    } else {
+                        handshake(&ssl_acceptor, stream).await
+                    }
+                })
+                .await
+                .or_err(InternalError, "TLS offload runtime failure")?
         } else if let Some(cb) = self.callbacks.as_ref() {
             handshake_with_callback(&self.ssl_acceptor, stream, cb.as_ref()).await
         } else {
@@ -266,5 +266,129 @@ mod alpn {
             Some(p) => Ok(p),
             _ => Err(AlpnError::ALERT_FATAL), // cannot agree
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::future::pending;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    struct CaptureThread(Mutex<Option<oneshot::Sender<String>>>);
+    struct BlockCertificate(Mutex<Option<oneshot::Sender<()>>>);
+
+    #[test]
+    fn default_tls_settings_have_no_offload_runtime() {
+        let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+        let settings = TlsSettings::intermediate(&cert_path, &key_path).unwrap();
+        assert!(settings.build().offload.is_none());
+    }
+
+    #[async_trait]
+    impl crate::listeners::TlsAccept for CaptureThread {
+        async fn handshake_complete_callback(
+            &self,
+            _ssl: &crate::protocols::tls::TlsRef,
+        ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+            if let Some(sender) = self.0.lock().unwrap().take() {
+                let _ = sender.send(std::thread::current().name().unwrap_or_default().to_owned());
+            }
+            None
+        }
+    }
+
+    #[async_trait]
+    impl crate::listeners::TlsAccept for BlockCertificate {
+        async fn certificate_callback(&self, _ssl: &mut crate::protocols::tls::TlsRef) {
+            if let Some(sender) = self.0.lock().unwrap().take() {
+                let _ = sender.send(());
+            }
+            pending::<()>().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_handshake_runs_callback_on_offload_thread() {
+        let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+        let (sender, receiver) = oneshot::channel();
+        let mut settings = TlsSettings::intermediate(&cert_path, &key_path).unwrap();
+        settings.callbacks = Some(Box::new(CaptureThread(Mutex::new(Some(sender)))));
+        settings.set_offload_threadpool(1, 1);
+        let acceptor = settings.build();
+        let (client, server) = tokio::io::duplex(4096);
+
+        let client_handshake = async move {
+            let ssl_context =
+                crate::tls::ssl::SslContext::builder(crate::tls::ssl::SslMethod::tls())
+                    .unwrap()
+                    .build();
+            let mut ssl = crate::tls::ssl::Ssl::new(&ssl_context).unwrap();
+            ssl.set_hostname("pingora.org").unwrap();
+            ssl.set_verify(crate::tls::ssl::SslVerifyMode::NONE);
+            let mut stream = crate::protocols::tls::SslStream::new(ssl, client).unwrap();
+            Pin::new(&mut stream).connect().await.unwrap();
+        };
+        let (server_result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(acceptor.tls_handshake(server), client_handshake)
+        })
+        .await
+        .unwrap();
+        server_result.unwrap();
+        assert_eq!(receiver.await.unwrap(), "downstream TLS offload 0.0");
+    }
+
+    #[tokio::test]
+    async fn timed_out_offloaded_handshake_closes_client_connection() {
+        let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+        let mut settings = TlsSettings::intermediate(&cert_path, &key_path).unwrap();
+        let (started_sender, started_receiver) = oneshot::channel();
+        settings.callbacks = Some(Box::new(BlockCertificate(Mutex::new(Some(started_sender)))));
+        settings.set_offload_threadpool(1, 1);
+        let acceptor = std::sync::Arc::new(settings.build());
+        let server_acceptor = acceptor.clone();
+        let (client, server) = tokio::io::duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                server_acceptor.tls_handshake(server),
+            )
+            .await
+        });
+        let client_task = tokio::spawn(async move {
+            let ssl_context =
+                crate::tls::ssl::SslContext::builder(crate::tls::ssl::SslMethod::tls())
+                    .unwrap()
+                    .build();
+            let mut ssl = crate::tls::ssl::Ssl::new(&ssl_context).unwrap();
+            ssl.set_hostname("pingora.org").unwrap();
+            ssl.set_verify(crate::tls::ssl::SslVerifyMode::NONE);
+            let mut stream = crate::protocols::tls::SslStream::new(ssl, client).unwrap();
+            Pin::new(&mut stream).connect().await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started_receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert!(tokio::time::timeout(Duration::from_secs(1), client_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        drop(acceptor);
     }
 }

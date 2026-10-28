@@ -15,8 +15,12 @@
 use log::debug;
 use once_cell::sync::OnceCell;
 use rand::Rng;
+#[cfg(feature = "any_tls")]
+use std::future::Future;
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::oneshot::{channel, Sender};
+#[cfg(feature = "any_tls")]
+use tokio_util::task::AbortOnDropHandle;
 
 // NOTE: use dedicated current-thread runtimes until pingora-runtime can preserve
 // the lazy-after-daemonize initialization behavior below.
@@ -103,5 +107,148 @@ impl OffloadRuntime {
         let thread_in_shard = rng.gen_range(0..self.thread_per_shard);
         let pools = self.pools.get_or_init(|| self.init_pools());
         &pools[shard * self.thread_per_shard + thread_in_shard].0
+    }
+
+    /// Spawn work that is aborted when its awaiting task is canceled.
+    #[cfg(feature = "any_tls")]
+    pub fn spawn_abort_on_drop<F>(&self, hash: u64, future: F) -> AbortOnDropHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        AbortOnDropHandle::new(self.get_runtime(hash).spawn(future))
+    }
+}
+
+#[cfg(all(test, feature = "any_tls"))]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::{future::pending, time::Duration};
+
+    struct DropSignal(Option<Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn spawned_task_is_aborted_when_handle_is_dropped() {
+        let offload = OffloadRuntime::new("test offload", 1, 1);
+        let (started_sender, started_receiver) = channel();
+        let (dropped_sender, dropped_receiver) = channel();
+        let task = offload.spawn_abort_on_drop(0, async move {
+            let _drop_signal = DropSignal(Some(dropped_sender));
+            started_sender.send(()).unwrap();
+            pending::<()>().await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started_receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(task);
+        tokio::time::timeout(Duration::from_secs(1), dropped_receiver)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawned_task_uses_a_dedicated_runtime_thread() {
+        let offload = OffloadRuntime::new("test TLS offload", 1, 1);
+        let thread_name = offload
+            .spawn_abort_on_drop(0, async {
+                std::thread::current().name().unwrap_or_default().to_owned()
+            })
+            .await
+            .unwrap();
+        assert_eq!(thread_name, "test TLS offload 0.0");
+    }
+
+    #[tokio::test]
+    async fn dropping_runtime_releases_pending_task() {
+        let offload = OffloadRuntime::new("test offload", 1, 1);
+        let (started_sender, started_receiver) = channel();
+        let (dropped_sender, dropped_receiver) = channel();
+        let task = offload.spawn_abort_on_drop(0, async move {
+            let _drop_signal = DropSignal(Some(dropped_sender));
+            started_sender.send(()).unwrap();
+            pending::<()>().await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_receiver)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(offload);
+        assert!(tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .is_err());
+        tokio::time::timeout(Duration::from_secs(1), dropped_receiver)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn independent_pools_release_all_owned_threads() {
+        let first = OffloadRuntime::new("first acceptor", 2, 2);
+        let second = OffloadRuntime::new("second acceptor", 2, 2);
+        first.get_runtime(0);
+        second.get_runtime(0);
+
+        let mut started = Vec::new();
+        let mut dropped = Vec::new();
+        let mut tasks = Vec::new();
+        for runtime in [&first, &second] {
+            for (handle, _) in runtime.pools.get().unwrap().iter() {
+                let (started_sender, started_receiver) = channel();
+                let (dropped_sender, dropped_receiver) = channel();
+                tasks.push(handle.spawn(async move {
+                    let _drop_signal = DropSignal(Some(dropped_sender));
+                    started_sender
+                        .send(std::thread::current().name().unwrap_or_default().to_owned())
+                        .unwrap();
+                    pending::<()>().await;
+                }));
+                started.push(started_receiver);
+                dropped.push(dropped_receiver);
+            }
+        }
+
+        let mut names = HashSet::new();
+        for receiver in started {
+            names.insert(
+                tokio::time::timeout(Duration::from_secs(1), receiver)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(names.len(), 8);
+        assert!(names.iter().any(|name| name.starts_with("first acceptor ")));
+        assert!(names
+            .iter()
+            .any(|name| name.starts_with("second acceptor ")));
+
+        drop(first);
+        drop(second);
+        for task in tasks {
+            assert!(tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .is_err());
+        }
+        for receiver in dropped {
+            tokio::time::timeout(Duration::from_secs(1), receiver)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 }
