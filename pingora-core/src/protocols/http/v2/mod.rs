@@ -23,6 +23,7 @@ use bytes::Bytes;
 use h2::SendStream;
 
 pub mod client;
+pub(crate) mod end_stream_watch;
 pub mod server;
 
 async fn reserve_and_send(
