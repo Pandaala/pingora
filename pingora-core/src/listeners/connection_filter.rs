@@ -69,6 +69,11 @@ pub trait ConnectionFilter: Debug + Send + Sync {
     /// This method is called after a TCP connection is accepted but before
     /// any further processing (including TLS handshake).
     ///
+    /// Note that this runs before any PROXY protocol header is parsed, so on
+    /// a listener with [`crate::listeners::TcpSocketOptions::proxy_protocol`]
+    /// enabled `addr` is the load balancer's address, never the real client's.
+    /// Filtering clients by IP has to happen above this layer.
+    ///
     /// # Arguments
     ///
     /// * `addr` - The socket address of the incoming connection

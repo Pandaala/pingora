@@ -88,6 +88,13 @@ pub struct SocketDigest {
     pub local_addr: OnceCell<Option<SocketAddr>>,
     /// Original destination address
     pub original_dst: OnceCell<Option<SocketAddr>>,
+    /// Transport-level peer address, before any PROXY protocol override.
+    ///
+    /// Equal to [`Self::peer_addr`] on an ordinary connection. On a listener
+    /// with inbound PROXY protocol this stays the load balancer while
+    /// `peer_addr` becomes the real client, which is what makes it possible to
+    /// tell which hop produced an address when debugging a gateway chain.
+    pub raw_peer_addr: OnceCell<Option<SocketAddr>>,
 }
 
 impl SocketDigest {
@@ -98,6 +105,7 @@ impl SocketDigest {
             peer_addr: OnceCell::new(),
             local_addr: OnceCell::new(),
             original_dst: OnceCell::new(),
+            raw_peer_addr: OnceCell::new(),
         }
     }
 
@@ -108,6 +116,7 @@ impl SocketDigest {
             peer_addr: OnceCell::new(),
             local_addr: OnceCell::new(),
             original_dst: OnceCell::new(),
+            raw_peer_addr: OnceCell::new(),
         }
     }
 
@@ -130,6 +139,33 @@ impl SocketDigest {
     #[cfg(windows)]
     pub fn peer_addr(&self) -> Option<&SocketAddr> {
         self.peer_addr
+            .get_or_init(|| SocketAddr::from_raw_socket(self.raw_sock, true))
+            .as_ref()
+    }
+
+    /// The transport peer, ignoring any PROXY protocol override applied to
+    /// [`Self::peer_addr`].
+    ///
+    /// Listener accept paths fill this eagerly so a retained digest cannot
+    /// resolve through a recycled fd after the connection closes. Digests made
+    /// directly with [`Self::from_raw_fd`] or `from_raw_socket` still resolve it
+    /// lazily, so callers using those constructors must query it while the
+    /// socket is open. The same caveat applies to [`Self::local_addr`] and
+    /// [`Self::original_dst`].
+    ///
+    /// The PROXY protocol path is the exception: when a header replaces the
+    /// digest, `apply_proxy_protocol` primes this cell with the transport peer
+    /// it already had in hand, so no fd lookup ever happens there.
+    #[cfg(unix)]
+    pub fn raw_peer_addr(&self) -> Option<&SocketAddr> {
+        self.raw_peer_addr
+            .get_or_init(|| SocketAddr::from_raw_fd(self.raw_fd, true))
+            .as_ref()
+    }
+
+    #[cfg(windows)]
+    pub fn raw_peer_addr(&self) -> Option<&SocketAddr> {
+        self.raw_peer_addr
             .get_or_init(|| SocketAddr::from_raw_socket(self.raw_sock, true))
             .as_ref()
     }

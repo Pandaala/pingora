@@ -16,6 +16,7 @@
 
 pub mod ext;
 pub mod listener;
+pub mod proxy_protocol;
 pub mod socket;
 pub mod stream;
 pub mod virt;
