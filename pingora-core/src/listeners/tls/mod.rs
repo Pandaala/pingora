@@ -29,3 +29,31 @@ mod s2n;
 
 #[cfg(feature = "s2n")]
 pub use s2n::*;
+
+#[cfg(all(test, feature = "any_tls"))]
+mod tests {
+    use super::TlsSettings;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn canceled_offloaded_handshake_drops_stream() {
+        let cert_path = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key_path = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+        let mut settings = TlsSettings::intermediate(&cert_path, &key_path).unwrap();
+        settings.set_offload_threadpool(1, 1);
+        let acceptor = settings.build();
+        let (mut client, server) = tokio::io::duplex(1024);
+
+        let mut handshake = Box::pin(acceptor.tls_handshake(server));
+        assert!(futures::poll!(handshake.as_mut()).is_pending());
+        drop(handshake);
+
+        let mut buf = [0];
+        let bytes_read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes_read, 0);
+    }
+}

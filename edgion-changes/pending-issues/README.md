@@ -20,9 +20,8 @@ next action, and closure evidence.
 | Ticket | 状态 | 归属 |
 | --- | --- | --- |
 | [03 路由前请求体缓冲与重试重放](upstream-main/03-request-body-replay.md) | open | cross-repository |
-| [06 Custom 未完成响应的会话清理](upstream-main/06-custom-session-cleanup.md) | open | fork |
 
-官方 0.9.1 已带入的八项发布线改动无需再移植。上游缓存断开监测与本地缓存字节顺序属于不同契约，其与 custom 会话清理的交点见 06。
+官方 0.9.1 已带入的八项发布线改动无需再移植。上游缓存断开监测与本地缓存字节顺序属于不同契约，相关清理责任见 [Custom 上游会话清理](../features/request-body-transport.md#custom-upstream-session-cleanup)。
 
 ## Resolved history
 

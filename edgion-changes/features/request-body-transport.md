@@ -201,9 +201,12 @@ settling the failed current AI predispatch reservation.
   original upstream writer error across joined-future teardown. See the
   [custom writer error contract](../review/custom/custom-writer-error-context.md).
 - Natural request-body completion retains the downstream idle/disconnect
-  watcher while a custom upstream response is pending. A completed early
-  response or a writer rejection can end request-body polling; an unexpected successful custom idle
-  return never manufactures a second terminal event.
+  watcher while a custom upstream response is pending. On H2 this includes
+  a completed request whose final custom write or finish failed. The pump
+  still observes a downstream reset without dispatching another body event.
+  A completed early response or a writer rejection can end request-body polling.
+  An unexpected successful custom idle return never generates a second terminal
+  event.
 - H1 downstream connections with unread body state are not reused. H2 keeps
   the connection and ends only the affected stream.
 - An H2 native-replay write that fails because the upstream send half closed
@@ -221,6 +224,25 @@ settling the failed current AI predispatch reservation.
   Unsupported sessions never enter optional placeholder methods; connect or
   header failures may still retry while the live source is unread, but an
   attempt that reaches body pumping becomes structurally non-retryable.
+
+## Custom upstream session cleanup
+
+Upstream-main issue 06 adopts the failed-exchange cleanup from upstream
+`33a9e21`. After a successful request-header write, a message setup error
+abandons the upstream session if its response is unfinished. A forwarding
+task failure abandons the exchange even if the response reader has finished.
+When abandonment is required, the pump awaits `CustomSession::abandon`
+once and returns the error selected by the pump. If restoring a downstream
+message handle after a setup-hook failure also fails, the restore error takes
+precedence. Each retry owns its own session.
+
+The fork's outer connector loop only releases sessions marked reusable. It
+has no separate cache-fill cancellation owner. If that upstream feature is
+adopted, reconcile ownership before adding an outer abandon call. A pristine
+session rejected by a pre-write request filter can still be returned to the
+pool. A complete response delivered after upload rejection retires its writer
+and session without transport abandonment. This cleanup does not dispatch
+application request-body events.
 
 ## Tests
 

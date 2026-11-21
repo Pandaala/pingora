@@ -197,26 +197,17 @@ where
 
         let Some(mut upstream_custom_message_reader) = client_session.take_custom_message_reader()
         else {
-            return (
-                false,
-                false,
-                Some(Error::explain(
-                    ReadError,
-                    "can't extract custom reader from upstream",
-                )),
-            );
+            let error = Error::explain(ReadError, "can't extract custom reader from upstream");
+            return fail_custom_setup(client_session, error).await;
         };
 
         let Some(mut upstream_custom_message_writer) = client_session.take_custom_message_writer()
         else {
-            return (
-                false,
-                false,
-                Some(Error::explain(
-                    WriteError,
-                    "custom upstream must have a custom message writer",
-                )),
+            let error = Error::explain(
+                WriteError,
+                "custom upstream must have a custom message writer",
             );
+            return fail_custom_setup(client_session, error).await;
         };
 
         // A channel to inject custom messages to upstream from server logic.
@@ -227,7 +218,7 @@ where
         let mut downstream_custom_message_reader = match session.downstream_custom_message() {
             Ok(Some(rx)) => rx,
             Ok(None) => Box::new(futures::stream::empty::<Result<Bytes>>()),
-            Err(err) => return (false, false, Some(err)),
+            Err(err) => return fail_custom_setup(client_session, err).await,
         };
 
         // Downstream writer
@@ -277,16 +268,16 @@ where
                 if let Err(restore_error) =
                     custom_session.restore_custom_message_writer(downstream_custom_message_writer)
                 {
-                    return (false, false, Some(restore_error));
+                    return fail_custom_setup(client_session, restore_error).await;
                 }
 
                 if let Err(restore_error) =
                     custom_session.restore_custom_message_reader(downstream_custom_message_reader)
                 {
-                    return (false, false, Some(restore_error));
+                    return fail_custom_setup(client_session, restore_error).await;
                 }
             }
-            return (false, false, Some(e));
+            return fail_custom_setup(client_session, e).await;
         }
 
         let upstream_custom_message_forwarder = CustomMessageForwarder {
@@ -334,6 +325,10 @@ where
             upstream_custom_message_forwarder.proxy(),
             downstream_custom_message_forwarder.proxy(),
         );
+
+        if ret.is_err() || request_body_error.is_some() {
+            abandon_custom_exchange(client_session).await;
+        }
 
         if let Some(custom_session) = session.downstream_session.as_custom_mut() {
             custom_session
@@ -574,7 +569,6 @@ where
             let mut await_producer = false;
             let mut upload_response_pending = false;
             if upload_failed {
-                // Only an upgraded stream needs further raw reads, to observe its half-close.
                 if let Some(cancel) = cancel_downstream_reader_tx.take() {
                     pipe_state.store(PipeState::UploadFailed as u8, Ordering::Release);
                     let _ = cancel.send(());
@@ -588,10 +582,12 @@ where
                     !complete && !producer_done && !serve_from_cache.should_discard_upstream();
                 response_state.maybe_set_upstream_done(complete);
                 downstream_state.maybe_finished(true);
-                poll_downstream_body_or_idle = session.was_upgraded()
+                // A completed H2 request still watches for reset while the response is pending.
+                let watch_h2_reset = session.as_http2().is_some_and(|h2| h2.is_body_done());
+                let read_upgraded_body = session.was_upgraded()
                     && reads_after_upload_failure < TASK_BUFFER_SIZE
-                    && !upgraded_half_closed
-                    && !complete;
+                    && !upgraded_half_closed;
+                poll_downstream_body_or_idle = !complete && (watch_h2_reset || read_upgraded_body);
             }
             if !upload_response_pending
                 && downstream_state.is_done()
@@ -631,7 +627,7 @@ where
             let upgraded = session.was_upgraded();
 
             tokio::select! {
-                body = session.downstream_session.read_body_or_idle(downstream_state.is_done() && !upload_failed),
+                body = session.downstream_session.read_body_or_idle(downstream_state.is_done() && !(upload_failed && upgraded)),
                     if downstream_state.can_poll() && poll_downstream_body_or_idle => {
                     let reading_body = downstream_state.is_reading();
                     let body = match body {
@@ -1059,6 +1055,26 @@ where
 
         Ok(end_of_body)
     }
+}
+
+/// A failed forwarding task can leave the exchange unusable even after
+/// the connector has finished reading the response.
+async fn abandon_custom_exchange<S: CustomSession>(client: &mut S) {
+    client
+        .abandon("custom upstream proxy ended before response completion")
+        .await;
+}
+
+/// Called only after the upstream request header was written. The caller
+/// drops a non-reusable session without another transport cleanup call.
+async fn fail_custom_setup<S: CustomSession>(
+    client: &mut S,
+    error: Box<Error>,
+) -> (bool, bool, Option<Box<Error>>) {
+    if !client.response_finished() {
+        abandon_custom_exchange(client).await;
+    }
+    (false, false, Some(error))
 }
 
 /* Read response header, body and trailer from custom upstream and send them to tx */

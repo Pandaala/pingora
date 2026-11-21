@@ -92,6 +92,8 @@ The `status` inside each record is authoritative.
   idle monitoring; the second correction is independently reviewed and fixed.
 - [Custom writer error context](custom/custom-writer-error-context.md): preserve
   the original upload error when a complete custom response cannot be delivered.
+- [Custom upstream session cleanup](../features/request-body-transport.md#custom-upstream-session-cleanup):
+  attempt-local ownership of failed setup and forwarding.
 - [Custom request contract coverage](custom/custom-request-contract-coverage.md):
   actual-pump termination, framing rejection and stale source EOF tests.
 - [Negative-test observation](testing/negative-tests-need-out-of-band-observation.md):

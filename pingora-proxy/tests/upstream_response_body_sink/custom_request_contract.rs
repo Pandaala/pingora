@@ -10,6 +10,13 @@ use super::*;
 use pingora_proxy::{RequestRelayPlan, RequestReplayPolicy, UpstreamRequestBodyDisposition};
 
 pub(super) const SOURCE_EOF: &str = "contract-source-eof";
+pub(super) const SETUP_NO_WRITER: &str = "setup-missing-writer";
+pub(super) const SETUP_HOOK_ERROR: &str = "setup-hook-error";
+pub(super) const SETUP_UNFINISHED: &str = "setup-unfinished";
+pub(super) const SETUP_FINISHED: &str = "setup-finished";
+pub(super) const RETRY_FIRST: &str = "retry-first-session";
+pub(super) const RETRY_SECOND: &str = "retry-second-session";
+pub(super) const RETRY_SUCCESS: &str = "retry-final-session";
 const TERMINATE: &str = "contract-terminate";
 const ORDINARY: &str = "contract-ordinary";
 const BODYLESS: &str = "contract-bodyless";
@@ -26,6 +33,7 @@ pub(super) enum Event {
     Finished,
     Cleanup,
     Released,
+    SessionAbandoned,
     Hook(RequestBodyEvent),
     TerminationArmed,
     Terminate,
@@ -145,6 +153,21 @@ impl Probe {
         );
     }
 
+    pub(super) fn assert_session_cleanup(&self, abandoned: usize, released: usize) {
+        assert_eq!(
+            self.count(|e| *e == Event::SessionAbandoned),
+            abandoned,
+            "{:?}",
+            self.snapshot()
+        );
+        assert_eq!(
+            self.count(|e| *e == Event::Released),
+            released,
+            "{:?}",
+            self.snapshot()
+        );
+    }
+
     fn snapshot(&self) -> Vec<Event> {
         self.events.lock().unwrap().clone()
     }
@@ -204,7 +227,7 @@ impl Probe {
         .unwrap_or_else(|_| panic!("missing {expected:?}; events: {:?}", self.snapshot()));
     }
 
-    async fn expect_none(&self, predicate: impl Fn(&Event) -> bool) {
+    pub(super) async fn expect_none(&self, predicate: impl Fn(&Event) -> bool) {
         let result = tokio::time::timeout(ABSENCE_BOUND, async {
             loop {
                 let notified = self.changed.notified();
@@ -293,6 +316,7 @@ async fn ordinary_custom_upload_observes_real_writes_and_completion() {
     assert_eq!(probe.count(|event| *event == Event::HeaderWritten), 1);
     assert_eq!(probe.count(|event| *event == Event::Finished), 1);
     assert_eq!(probe.written(), b"datablocked");
+    probe.assert_session_cleanup(0, 1);
     probe.expect_none(|event| *event == Event::Terminate).await;
 }
 
@@ -447,6 +471,7 @@ async fn custom_finish_failure_still_delivers_complete_response() {
         }
         assert_eq!(probe.count(|e| *e == Event::Finished), 1);
         probe.assert_failed_writer_retired();
+        probe.assert_session_cleanup(0, 0);
     }
 }
 
@@ -465,6 +490,7 @@ async fn custom_header_error_cancels_blocked_upload_writer() {
         .unwrap()
         .contains("header failed while writer was pending"));
     probe.assert_failed_writer_retired();
+    probe.assert_session_cleanup(1, 0);
 }
 
 #[tokio::test]
@@ -489,6 +515,7 @@ async fn custom_failed_upgraded_upload_finishes_on_downstream_half_close() {
     let record = wait_for_custom_request_body_record(path).await;
     assert!(!record.had_error, "{record:?}");
     probe.assert_failed_writer_retired();
+    probe.assert_session_cleanup(0, 0);
 }
 
 #[tokio::test]
@@ -523,4 +550,73 @@ async fn custom_truncated_response_keeps_failed_upload_error() {
         .unwrap()
         .contains("scripted custom request-body writer rejection"));
     probe.assert_failed_writer_retired();
+    probe.assert_session_cleanup(1, 0);
+}
+
+#[tokio::test]
+async fn custom_session_setup_abandons_only_an_unfinished_response() {
+    for (script, expected_error, abandons) in [
+        (
+            SETUP_UNFINISHED,
+            "can't extract custom reader from upstream",
+            1,
+        ),
+        (
+            SETUP_FINISHED,
+            "can't extract custom reader from upstream",
+            0,
+        ),
+        (
+            SETUP_NO_WRITER,
+            "custom upstream must have a custom message writer",
+            1,
+        ),
+        (SETUP_HOOK_ERROR, "custom forwarding setup failed", 1),
+    ] {
+        let probe = Probe::register(script);
+        let response = reqwest::Client::new()
+            .get(format!("{}/{script}", init().custom_base_url()))
+            .header(CUSTOM_REQUEST_BODY_SCRIPT_HEADER, script)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_server_error());
+        let record = completed_record(script, &probe).await;
+        assert!(record
+            .error_text
+            .as_deref()
+            .unwrap()
+            .contains(expected_error));
+        assert!(record.events.is_empty());
+        assert_eq!(probe.count(|e| *e == Event::HeaderWritten), 1);
+        probe.assert_session_cleanup(abandons, 0);
+    }
+}
+
+#[tokio::test]
+async fn custom_retry_abandons_each_failed_session_once_and_releases_success() {
+    let first = Probe::register(RETRY_FIRST);
+    let second = Probe::register(RETRY_SECOND);
+    let success = Probe::register(RETRY_SUCCESS);
+    let response = reqwest::Client::new()
+        .get(format!("{}/{RETRY_SUCCESS}", init().custom_base_url()))
+        .header(CUSTOM_REQUEST_BODY_SCRIPT_HEADER, RETRY_SUCCESS)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+    success.wait(Event::Logged).await;
+    let record = wait_for_custom_request_body_record(&format!("/{RETRY_SUCCESS}")).await;
+    assert!(!record.had_error);
+    assert!(!record.events.contains(&RequestBodyEvent::Abandoned));
+    assert_eq!(record.logging_calls, 1);
+    assert_eq!(success.count(|e| *e == Event::UpstreamReady), 3);
+    for probe in [&first, &second] {
+        assert_eq!(probe.count(|e| *e == Event::HeaderWritten), 1);
+        // The scripted connector already reports response_finished() == true,
+        // but a joined task has failed, so the exchange still needs explicit cleanup.
+        probe.assert_session_cleanup(1, 0);
+    }
+    assert_eq!(success.count(|e| *e == Event::HeaderWritten), 1);
+    success.assert_session_cleanup(0, 1);
 }

@@ -13,9 +13,9 @@ With the `connection_filter` feature, `ConnectionFilter` has a defaulted
   `admission_permit`). Dropping the stream releases the permit exactly once.
   This covers socket-setting and PROXY parse failures as well as normal close.
   If an offloaded TLS handshake still owns the stream when the listener times
-  out, it retains the permit. On this fork, BoringSSL requests cancellation of
-  the handshake task when the wait is dropped. Rustls and s2n offload tasks
-  can continue holding the stream after that timeout.
+  out, all TLS backends request cancellation when the wait is dropped. The
+  permit is released when the task actually drops the stream, which can be
+  delayed by synchronous handshake work.
   See [TLS offload cancellation](downstream-tls-offload.md).
 
   This list follows from ownership: the field is private, only

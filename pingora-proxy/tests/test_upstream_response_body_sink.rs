@@ -163,6 +163,7 @@ const CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_PATH: &str =
 const CUSTOM_COMPLETE_UPLOAD_SCRIPT: &str = "complete-upload";
 const CUSTOM_DOWNSTREAM_EARLY_RESPONSE_SCRIPT: &str = "custom-downstream-early-response";
 const CUSTOM_WAIT_FOR_H1_CLOSE_SCRIPT: &str = "wait-for-h1-close";
+const CUSTOM_REJECT_FINISH_WAIT_FOR_H2_CLOSE: &str = "reject-finish-wait-for-h2-close";
 const CUSTOM_WAIT_FOR_H2_CLOSE_SCRIPT: &str = "wait-for-h2-close";
 const SUPPRESS_DOWNSTREAM_BODY_HEADER: (&str, &str) = ("x-suppress-downstream-body", "1");
 const RESPONSE_FILTER_CALLS_HEADER: &str = "x-test-response-filter-calls";
@@ -434,6 +435,7 @@ static SUPPRESSION_SHARED_BATCH_SEEN: AtomicBool = AtomicBool::new(false);
 static SUPPRESSION_BATCH_STARTS: AtomicUsize = AtomicUsize::new(0);
 static TERMINAL_HOOK_RAN_AFTER_HEADER_FILTER_ERROR: AtomicBool = AtomicBool::new(false);
 static FAILED_CUSTOM_SESSION_RELEASED: AtomicBool = AtomicBool::new(false);
+static PRISTINE_CUSTOM_SESSION_ABANDONED: AtomicBool = AtomicBool::new(false);
 static PRE_WRITE_CUSTOM_SESSION_RELEASED: AtomicBool = AtomicBool::new(false);
 static CUSTOM_POST_TERMINAL_FAILURE_EMITTED: AtomicBool = AtomicBool::new(false);
 static TERMINAL_CUSTOM_RANGE_FILTER_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -754,21 +756,29 @@ impl BodyWrite for NoopBodyWriter {
         self.progress.changed.notify_one();
         if matches!(
             self.script.as_deref(),
-            Some(CUSTOM_REJECT_FINISH | CUSTOM_REJECT_FILTERED_FINISH)
-        ) {
-            return pingora_error::Error::e_explain(
-                pingora_error::ErrorType::WriteError,
-                "scripted custom request-body finish rejection",
-            );
-        }
-        if matches!(
-            self.script.as_deref(),
-            Some(CUSTOM_WAIT_FOR_H1_CLOSE_SCRIPT | CUSTOM_WAIT_FOR_H2_CLOSE_SCRIPT)
+            Some(
+                CUSTOM_WAIT_FOR_H1_CLOSE_SCRIPT
+                    | CUSTOM_WAIT_FOR_H2_CLOSE_SCRIPT
+                    | CUSTOM_REJECT_FINISH_WAIT_FOR_H2_CLOSE
+            )
         ) {
             CUSTOM_STALLED_UPLOAD_FINISHED
                 .lock()
                 .unwrap()
                 .insert(self.script.clone().unwrap());
+        }
+        if matches!(
+            self.script.as_deref(),
+            Some(
+                CUSTOM_REJECT_FINISH
+                    | CUSTOM_REJECT_FILTERED_FINISH
+                    | CUSTOM_REJECT_FINISH_WAIT_FOR_H2_CLOSE
+            )
+        ) {
+            return pingora_error::Error::e_explain(
+                pingora_error::ErrorType::WriteError,
+                "scripted custom request-body finish rejection",
+            );
         }
         Ok(())
     }
@@ -836,7 +846,8 @@ impl HeaderOnlyCustomSession {
                 | CUSTOM_REJECT_FINISH
                 | CUSTOM_REJECT_FILTERED_FINISH
                 | CUSTOM_WAIT_FOR_H1_CLOSE_SCRIPT
-                | CUSTOM_WAIT_FOR_H2_CLOSE_SCRIPT,
+                | CUSTOM_WAIT_FOR_H2_CLOSE_SCRIPT
+                | CUSTOM_REJECT_FINISH_WAIT_FOR_H2_CLOSE,
             ) => self.request_body_progress.finished.load(Ordering::SeqCst),
             _ => true,
         };
@@ -973,6 +984,18 @@ impl CustomSession for HeaderOnlyCustomSession {
 
     async fn read_response_header(&mut self) -> Result<()> {
         self.wait_for_scripted_request_body_state().await;
+        if matches!(
+            self.request_body_script.as_deref(),
+            Some(custom_request_contract::RETRY_FIRST | custom_request_contract::RETRY_SECOND)
+        ) {
+            assert!(self.response_finished());
+            let mut error = pingora_error::Error::explain(
+                pingora_error::ErrorType::ReadError,
+                "scripted retryable custom header error",
+            );
+            error.set_retry(true);
+            return Err(error);
+        }
         if self.request_body_script.as_deref() == Some(CUSTOM_BLOCK_WRITE) {
             return pingora_error::Error::e_explain(
                 pingora_error::ErrorType::ReadError,
@@ -990,7 +1013,11 @@ impl CustomSession for HeaderOnlyCustomSession {
         }
         if matches!(
             self.request_body_script.as_deref(),
-            Some(CUSTOM_WAIT_FOR_H1_CLOSE_SCRIPT | CUSTOM_WAIT_FOR_H2_CLOSE_SCRIPT)
+            Some(
+                CUSTOM_WAIT_FOR_H1_CLOSE_SCRIPT
+                    | CUSTOM_WAIT_FOR_H2_CLOSE_SCRIPT
+                    | CUSTOM_REJECT_FINISH_WAIT_FOR_H2_CLOSE
+            )
         ) {
             return std::future::pending().await;
         }
@@ -1060,6 +1087,9 @@ impl CustomSession for HeaderOnlyCustomSession {
                     | CUSTOM_TRUNCATED_AFTER_REJECTION
                     | CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_SCRIPT
                     | CUSTOM_UPGRADE_REJECT_WRITE
+                    | custom_request_contract::SETUP_UNFINISHED
+                    | custom_request_contract::SETUP_NO_WRITER
+                    | custom_request_contract::SETUP_HOOK_ERROR
             )
         ) {
             return false;
@@ -1067,6 +1097,16 @@ impl CustomSession for HeaderOnlyCustomSession {
         self.pending_body.is_empty()
             && !self.pending_trailers
             && (!self.upgraded || self.terminal_upgrade || self.body_eof_observed)
+    }
+
+    async fn abandon(&mut self, _ctx: &str) {
+        if !self.request_header_written {
+            PRISTINE_CUSTOM_SESSION_ABANDONED.store(true, Ordering::SeqCst);
+        }
+        custom_request_contract::record(
+            self.request_body_script.as_deref(),
+            custom_request_contract::Event::SessionAbandoned,
+        );
     }
 
     async fn shutdown(&mut self, _code: u32, _ctx: &str) {}
@@ -1138,6 +1178,14 @@ impl CustomSession for HeaderOnlyCustomSession {
     fn take_custom_message_reader(
         &mut self,
     ) -> Option<Box<dyn FuturesStream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>> {
+        if matches!(
+            self.request_body_script.as_deref(),
+            Some(
+                custom_request_contract::SETUP_UNFINISHED | custom_request_contract::SETUP_FINISHED
+            )
+        ) {
+            return None;
+        }
         if self.request_body_script.as_deref() == Some(CUSTOM_DOWNSTREAM_EARLY_RESPONSE_SCRIPT) {
             return Some(Box::new(ResponseGatedEndStream::new()));
         }
@@ -1149,6 +1197,9 @@ impl CustomSession for HeaderOnlyCustomSession {
     }
 
     fn take_custom_message_writer(&mut self) -> Option<Box<dyn CustomMessageWrite>> {
+        if self.request_body_script.as_deref() == Some(custom_request_contract::SETUP_NO_WRITER) {
+            return None;
+        }
         Some(Box::new(()))
     }
 }
@@ -1159,6 +1210,24 @@ impl ProxyHttp for EmitProxy {
 
     fn new_ctx(&self) -> Self::CTX {
         EmitCtx::default()
+    }
+
+    async fn custom_forwarding(
+        &self,
+        session: &mut Session,
+        _ctx: &mut Self::CTX,
+        _to_upstream: Option<tokio::sync::mpsc::Sender<Bytes>>,
+        _to_downstream: tokio::sync::mpsc::Sender<Bytes>,
+    ) -> Result<()> {
+        if session.get_header_bytes(CUSTOM_REQUEST_BODY_SCRIPT_HEADER)
+            == custom_request_contract::SETUP_HOOK_ERROR.as_bytes()
+        {
+            return pingora_error::Error::e_explain(
+                pingora_error::ErrorType::InternalError,
+                "custom forwarding setup failed",
+            );
+        }
+        Ok(())
     }
 
     async fn request_body_filter_action(
@@ -1470,6 +1539,16 @@ impl ProxyHttp for EmitProxy {
                 pingora_error::ErrorType::InternalError,
                 "scripted custom request rejection before the upstream write",
             );
+        }
+        if session.get_header_bytes(CUSTOM_REQUEST_BODY_SCRIPT_HEADER)
+            == custom_request_contract::RETRY_SUCCESS.as_bytes()
+        {
+            let script = match session.request_attempt_id().unwrap().get() {
+                1 => custom_request_contract::RETRY_FIRST,
+                2 => custom_request_contract::RETRY_SECOND,
+                _ => custom_request_contract::RETRY_SUCCESS,
+            };
+            upstream_request.insert_header(CUSTOM_REQUEST_BODY_SCRIPT_HEADER, script)?;
         }
         // The scripted origin answers the same fixed body no matter the path;
         // normalizing the upstream-side URI keeps its request parsing trivial
@@ -3681,6 +3760,7 @@ async fn custom_writer_rejection_delivers_complete_response_without_abandoned() 
             .unwrap();
         assert_eq!(&body, b"result");
         probe.assert_failed_writer_retired();
+        probe.assert_session_cleanup(0, 0);
         assert!(!record.events.is_empty());
         assert!(
             record
@@ -3827,42 +3907,76 @@ async fn custom_upstream_watches_h1_disconnect_after_completed_upload() {
 
 #[tokio::test]
 async fn custom_upstream_watches_h2_reset_after_completed_upload() {
-    let path = "/custom_completed_upload_then_h2_reset";
-    CUSTOM_REQUEST_BODY_RECORDS.lock().unwrap().remove(path);
-    CUSTOM_STALLED_UPLOAD_FINISHED
-        .lock()
-        .unwrap()
-        .remove(CUSTOM_WAIT_FOR_H2_CLOSE_SCRIPT);
     let harness = init();
     let tcp = TcpStream::connect(("127.0.0.1", harness.custom_proxy_port))
         .await
         .unwrap();
-    let (h2, connection) = h2::client::handshake(tcp).await.unwrap();
+    let (mut h2, connection) = h2::client::handshake(tcp).await.unwrap();
     tokio::spawn(async move {
         let _ = connection.await;
     });
-    let mut h2 = h2.ready().await.unwrap();
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("http://localhost{path}"))
-        .header(http::header::CONTENT_LENGTH, "4")
-        .header(
-            CUSTOM_REQUEST_BODY_SCRIPT_HEADER,
+    for (path, script) in [
+        (
+            "/custom_completed_upload_then_h2_reset",
             CUSTOM_WAIT_FOR_H2_CLOSE_SCRIPT,
-        )
-        .body(())
-        .unwrap();
-    let (_response, mut request_body) = h2.send_request(request, false).unwrap();
-    request_body
-        .send_data(Bytes::from_static(b"data"), true)
-        .unwrap();
+        ),
+        (
+            "/custom_rejected_finish_then_h2_reset",
+            CUSTOM_REJECT_FINISH_WAIT_FOR_H2_CLOSE,
+        ),
+    ] {
+        h2 = h2.ready().await.unwrap();
+        let probe = custom_request_contract::Probe::register(script);
 
-    wait_for_custom_stalled_upload(CUSTOM_WAIT_FOR_H2_CLOSE_SCRIPT).await;
-    request_body.send_reset(h2::Reason::CANCEL);
+        CUSTOM_REQUEST_BODY_RECORDS.lock().unwrap().remove(path);
+        CUSTOM_STALLED_UPLOAD_FINISHED
+            .lock()
+            .unwrap()
+            .remove(script);
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("http://localhost{path}"))
+            .header(http::header::CONTENT_LENGTH, "4")
+            .header(CUSTOM_REQUEST_BODY_SCRIPT_HEADER, script)
+            .body(())
+            .unwrap();
+        let (_response, mut request_body) = h2.send_request(request, false).unwrap();
+        request_body
+            .send_data(Bytes::from_static(b"data"), true)
+            .unwrap();
 
-    let record = wait_for_custom_request_body_record(path).await;
-    assert_completed_body_before_disconnect(&record);
+        wait_for_custom_stalled_upload(script).await;
+        use custom_request_contract::Event;
+        probe
+            .expect_none(|event| {
+                matches!(
+                    event,
+                    Event::Logged | Event::SessionAbandoned | Event::Released
+                )
+            })
+            .await;
+        request_body.send_reset(h2::Reason::CANCEL);
 
+        let record = wait_for_custom_request_body_record(path).await;
+        assert_completed_body_before_disconnect(&record);
+
+        probe.assert_session_cleanup(1, 0);
+        if script == CUSTOM_REJECT_FINISH_WAIT_FOR_H2_CLOSE {
+            assert_eq!(
+                record.error_source,
+                Some(pingora_error::ErrorSource::Upstream)
+            );
+            assert_eq!(
+                record.error_type,
+                Some(pingora_error::ErrorType::WriteError)
+            );
+            assert!(record
+                .error_text
+                .as_deref()
+                .unwrap()
+                .contains("scripted custom request-body finish rejection"));
+        }
+    }
     h2 = h2.ready().await.unwrap();
     let next = http::Request::builder()
         .uri("http://localhost/bodyless")
@@ -4361,6 +4475,7 @@ async fn custom_pre_write_rejection_releases_pristine_upstream() {
         PRE_WRITE_CUSTOM_SESSION_RELEASED.load(Ordering::SeqCst),
         "the pristine custom upstream session was not returned to the connector"
     );
+    assert!(!PRISTINE_CUSTOM_SESSION_ABANDONED.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
