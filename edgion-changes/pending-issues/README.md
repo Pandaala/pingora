@@ -20,7 +20,6 @@ next action, and closure evidence.
 | Ticket | 状态 | 归属 |
 | --- | --- | --- |
 | [03 路由前请求体缓冲与重试重放](upstream-main/03-request-body-replay.md) | open | cross-repository |
-| [04 异步响应 body 和 trailer 回调](upstream-main/04-response-filters.md) | open | cross-repository |
 | [05 Custom 上传失败后的提前响应](upstream-main/05-custom-early-response.md) | open | fork |
 | [06 Custom 未完成响应的会话清理](upstream-main/06-custom-session-cleanup.md) | open | fork |
 

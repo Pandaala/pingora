@@ -613,7 +613,9 @@ where
             let terminal_event = terminal.claim_for(task);
             let duration = match task {
                 HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => {
-                    self.inner.response_body_filter(session, data, *eos, ctx)?
+                    self.inner
+                        .response_body_filter(session, data, *eos, ctx)
+                        .await?
                 }
                 _ if terminal_event.is_some() => {
                     // Notify the observer without adding a wire-level EOS before
@@ -621,7 +623,8 @@ where
                     let mut body = None;
                     let duration = self
                         .inner
-                        .response_body_filter(session, &mut body, true, ctx)?;
+                        .response_body_filter(session, &mut body, true, ctx)
+                        .await?;
                     if body.as_ref().is_some_and(|body| !body.is_empty()) {
                         return Error::e_explain(
                             InternalError,

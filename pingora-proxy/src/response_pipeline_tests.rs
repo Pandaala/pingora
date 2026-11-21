@@ -238,7 +238,7 @@ impl ProxyHttp for HoldReleaseProxy {
         Ok(None)
     }
 
-    fn response_body_filter(
+    async fn response_body_filter(
         &self,
         _session: &mut Session,
         _body: &mut Option<Bytes>,
@@ -361,7 +361,7 @@ impl ProxyHttp for ParityProxy {
         Ok(())
     }
 
-    fn response_body_filter(
+    async fn response_body_filter(
         &self,
         _session: &mut Session,
         _body: &mut Option<Bytes>,

@@ -1601,13 +1601,14 @@ impl ProxyHttp for EmitProxy {
         Ok(None)
     }
 
-    fn response_body_filter(
+    async fn response_body_filter(
         &self,
         session: &mut Session,
         body: &mut Option<Bytes>,
         end_of_stream: bool,
         _ctx: &mut Self::CTX,
     ) -> Result<Option<Duration>> {
+        tokio::task::yield_now().await;
         match session.req_header().uri.path() {
             "/cache/terminal_head/bodyless" => {
                 TERMINAL_CACHED_HEAD_BODY_FILTER_CALLS.fetch_add(1, Ordering::SeqCst);

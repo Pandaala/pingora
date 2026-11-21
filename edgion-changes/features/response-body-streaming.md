@@ -58,6 +58,10 @@ flag.
 
 ## Downstream terminal observation
 
+Upstream-main issue 04 adopts the downstream async signature from upstream
+`018abe0`. Live, terminal, and cache-hit dispatch await the callback before
+applying its optional delay or forwarding the task.
+
 `ProxyHttp::response_body_filter` observes the downstream representation after
 cache and Range selection. It does not acquire the upstream hook's buffering
 or extra-output contract. `ResponsePipelineState::downstream_terminal_body`

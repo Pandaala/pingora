@@ -482,7 +482,7 @@ impl ProxyHttp for ExampleProxyHttp {
         .await
     }
 
-    fn response_body_filter(
+    async fn response_body_filter(
         &self,
         session: &mut Session,
         body: &mut Option<Bytes>,
@@ -997,7 +997,7 @@ impl ProxyHttp for ExampleProxyCache {
         ))
     }
 
-    fn response_body_filter(
+    async fn response_body_filter(
         &self,
         session: &mut Session,
         body: &mut Option<Bytes>,

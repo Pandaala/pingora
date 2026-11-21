@@ -37,7 +37,7 @@ impl ProxyHttp for Observer {
         unreachable!("the pipeline test does not connect to an origin")
     }
 
-    fn response_body_filter(
+    async fn response_body_filter(
         &self,
         _: &mut Session,
         body: &mut Option<Bytes>,

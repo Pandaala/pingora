@@ -990,6 +990,8 @@ pub trait ProxyHttp {
     }
 
     /// Similar to [Self::response_filter()] but for response body chunks.
+    /// The proxy awaits this callback before applying its optional delay
+    /// and passing the task to the downstream modules.
     ///
     /// # Length-changing filters
     ///
@@ -1023,7 +1025,7 @@ pub trait ProxyHttp {
     /// The original trailers remain the wire-level termination. Aborted
     /// responses do not receive a synthetic successful completion, and paths
     /// that suppress downstream body filtering retain that behavior.
-    fn response_body_filter(
+    async fn response_body_filter(
         &self,
         _session: &mut Session,
         _body: &mut Option<Bytes>,
