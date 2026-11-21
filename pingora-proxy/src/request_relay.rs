@@ -489,10 +489,9 @@ pub(crate) enum RequestRelayOutcome {
 
 /// Call-site proof attached to an `Abandoned` request-body event.
 ///
-/// Response selection alone does not prove response completion: a writer
-/// rejection can abandon the request while the selected response is still
-/// incomplete. Only a pump branch that has independently qualified the whole
-/// response may preserve it when the application returns `Terminate`.
+/// A selected response can still have body or trailers awaiting delivery.
+/// Only a pump branch that has independently qualified the whole response
+/// may preserve it when the application returns `Terminate`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AbandonmentResponsePolicy {
     Abort,
@@ -510,7 +509,8 @@ where
     /// function, preserving the pumps' existing backpressure ordering. Empty
     /// output suppression, `Bodyless` validation, and every actual write stay
     /// in the caller because their consequences remain protocol-specific.
-    pub(crate) async fn request_relay_event(
+    #[cfg(test)]
+    async fn request_relay_event(
         &self,
         protocol: RequestRelayProtocol,
         session: &mut Session,

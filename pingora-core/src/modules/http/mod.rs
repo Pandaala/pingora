@@ -41,6 +41,9 @@ use std::sync::Arc;
 /// that the downstream transport's real end-of-stream was observed. A later
 /// upstream retry may replay buffered body events through the same hooks; the
 /// retry does not change whether the original downstream body completed.
+/// A custom upstream writer rejecting a write or finish stops upload forwarding
+/// without generating a terminal event. A filter may therefore see only `Data`
+/// for an unfinished upload on that path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestBodyEvent {
     /// A non-terminal request-body chunk.

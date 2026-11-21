@@ -332,6 +332,9 @@ pub trait ProxyHttp {
     /// end-of-stream was observed. [`RequestBodyEvent::Abandoned`] is also
     /// terminal, but the bytes delivered so far are only a prefix because the
     /// proxy deliberately stopped reading the downstream body.
+    /// A custom upstream writer rejecting a write or finish stops the upload
+    /// without invoking this hook again. A completed early response that stops
+    /// a still-active custom upload delivers `Abandoned`.
     /// A later upstream retry may replay buffered body events through the same
     /// hook; it does not change the original downstream completion cause.
     ///
@@ -410,7 +413,7 @@ pub trait ProxyHttp {
     /// - The pump abandoned the downstream read before observing EOF. This can
     ///   happen when the read became futile after an upstream response, or when
     ///   an upstream leg stopped consuming a partially uploaded body. The pump
-    ///   emits [`RequestBodyEvent::Abandoned`] through
+    ///   can report [`RequestBodyEvent::Abandoned`] through
     ///   [`Self::request_body_filter_action`], but the trailer-presence fact was
     ///   never established, so a request that would have sent TRAILERS later
     ///   yields no trailer event.

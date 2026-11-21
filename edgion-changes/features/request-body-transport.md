@@ -98,7 +98,10 @@ unchanged. The existing configured drain deadline takes precedence.
 
 Modules and application hooks see the same event classification. Every
 live downstream delivery sequence gets at most one terminal event, including
-bodyless requests and upstreams that stop receiving mid-upload. A retry can
+bodyless requests and upstreams that stop receiving mid-upload. A custom
+writer rejecting a write or finish generates no request-body event: an
+unfinished upload can end after its last `Data`, and an upload that already
+delivered `Complete` keeps that single terminal event. A retry can
 replay a separate `Data`/`Complete` sequence through the same application hook;
 that replay completion does not change the original downstream completion
 cause. The request-trailer hook has a different lifetime and remains at most
@@ -175,12 +178,12 @@ settling the failed current AI predispatch reservation.
 - The main branch's batch processing and downstream proxy-task backpressure
   remain authoritative; Edgion filtering state is passed through the shared
   batch helpers rather than duplicating inline loops.
-- When an upstream response completes and the upstream stops receiving, the
-  application still receives one `Abandoned` event.
+- When a completed early response stops a still-active upload, the application
+  receives one `Abandoned` event.
 - `request_relay_event` distinguishes ordinary application-owned termination
   from qualified `Abandoned + Terminate` after pipeline response selection.
-  Response selection alone is insufficient: writer rejection and other
-  unqualified abandonment, a request-trailer termination, and a nonterminal request event that terminates
+  Response selection alone is insufficient: unqualified abandonment, a request-trailer
+  termination, and a nonterminal request event that terminates
   after response selection, use `AbortSelectedResponse`. H1 closes without a
   final chunk, H2 resets the stream, and custom downstreams invoke their abort
   boundary; no client can mistake the partial representation for a clean
@@ -191,14 +194,15 @@ settling the failed current AI predispatch reservation.
   then closed rather than pooled.
 - The custom pump dispatches that event independently from its `BodyWrite`:
   abandonment never calls `finish()`, because a deliberately truncated upload
-  is not a clean custom-upstream request EOS. A mid-upload writer rejection
-  dispatches the same terminal event before the error return path. The pump
-  preserves that first upstream-classified writer error through joined-future
-  teardown; an error raised while dispatching the subsequent `Abandoned` event
-  is secondary and cannot replace the writer type, source, or context.
+  is not a clean custom-upstream request EOS. A custom writer rejection stops forwarding
+  without dispatching another application or module request-body event. Under upstream-main issue 05
+  (upstream `7de472d`), a completed early response can succeed after the
+  custom writer rejects a write or finish. A failed exchange retains the
+  original upstream writer error across joined-future teardown. See the
+  [custom writer error contract](../review/custom/custom-writer-error-context.md).
 - Natural request-body completion retains the downstream idle/disconnect
-  watcher while a custom upstream response is pending. Only application
-  abandonment disables that watcher; an unexpected successful custom idle
+  watcher while a custom upstream response is pending. A completed early
+  response or a writer rejection can end request-body polling; an unexpected successful custom idle
   return never manufactures a second terminal event.
 - H1 downstream connections with unread body state are not reused. H2 keeps
   the connection and ends only the affected stream.
@@ -250,11 +254,10 @@ independent rejection of pre-buffered pipelining. The proxy-local table test
 owns case/OWS, multiple-field, duplicate, empty, deflate, and unknown variants.
 
 `pingora-proxy/tests/test_upstream_response_body_sink.rs` owns the custom
-connector harness. It covers early final responses and writer rejection with
-unfinished H1/H2 downstream uploads, exactly-once `Abandoned` delivery,
-first-error classification/context preservation (including a simultaneous
-`Abandoned` hook failure), protocol-specific cleanup, a completed-upload
-`Complete` control, and a
+connector harness. It covers early final responses with unfinished H1/H2
+uploads, exactly-once `Abandoned` on that path, writer rejection without a
+synthetic terminal event, writer-error priority when response delivery fails,
+protocol-specific cleanup, a completed-upload `Complete` control, and a
 custom-downstream case that keeps the opposite custom-message direction alive
 to prove abandonment stops further request-body polling. Completed-upload H1
 FIN and H2 reset controls prove natural completion still watches downstream

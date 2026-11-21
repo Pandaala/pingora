@@ -19,20 +19,16 @@ the application hook. Qualified `Abandoned + Terminate` with a preselected
 pipeline response produces an internal `PreserveSelectedResponse` outcome.
 H1, H2, and custom pumps stop request-side work without manufacturing a clean
 request EOS or finalizing the response, and their existing response lanes keep
-draining. Selection alone does not preserve a response: custom writer rejection
-and other unqualified abandonment, as well as nonterminal body-hook or trailer-hook
-termination, produce `AbortSelectedResponse`. H1 closes without a final chunk,
+draining. Unqualified abandonment, nonterminal body-hook termination and
+trailer-hook termination after response selection produce `AbortSelectedResponse`. H1 closes without a final chunk,
 H2 resets the stream, and custom downstreams invoke their abort boundary.
 Ordinary termination is also unchanged when no pipeline response was selected,
 including a local response written by the application during the hook.
 
-A follow-up multi-agent audit found that the custom-upstream writer-rejection
-callback computed `AbortSelectedResponse` but discarded the successful typed
-outcome. That caller now invokes the same shared abort helper before returning
-the original writer error. This matters specifically for custom downstreams:
-ordinary trait-object drop has no contract equivalent to
-`CustomSession::abandon()`, even though H1/H2 drop already supplies a transport
-failure signal.
+A historical follow-up applied the same abort helper to `Terminate` from a
+custom writer-rejection callback. Upstream-main issue 05 removed that callback.
+The [custom writer contract](../custom/custom-writer-error-context.md) governs
+the response and error outcome after a rejected write or finish.
 
 `Session::response_head_selected_by_pipeline()` exposes the ownership fact to
 consumers; it is not response-completion proof. Edgion still returns
@@ -42,7 +38,7 @@ when the response pipeline does not already own the response.
 ## Preserved boundaries
 
 - Retry remains closed from final-response selection.
-- Abandonment remains the single terminal request-body event.
+- A delivered `Abandoned` terminates that request-body sequence.
 - No clean upstream request EOS is inferred from abandonment.
 - H1 unread-body non-reuse, H2 stream-local cleanup, cache finalization, and
   protocol-specific response draining remain pump-owned.
@@ -72,13 +68,10 @@ across H1, H2, and custom. Trailer-hook tests pin the same pre-hook ownership
 snapshot and prove that a local response first written inside the hook remains
 ordinary application-owned termination.
 
-`custom_writer_rejection_aborts_a_selected_incomplete_custom_response` holds a
-custom response open after committing its head, rejects the first real request
-body write, and returns `Terminate` from the resulting `Abandoned` callback.
-The scripted response side cannot fail until it observes downstream abandon,
-so the test proves one `abandon()` call, no clean `finish()`, exactly one
-terminal request event, and preservation of the original upstream
-`WriteError` over the later response teardown error.
+The historical `custom_writer_rejection_aborts_a_selected_incomplete_custom_response`
+regression exercised the former writer-rejection callback and its explicit
+custom downstream abort. Current issue 05 tests cover the independent writer
+error policy.
 
 ## Re-evaluation triggers
 

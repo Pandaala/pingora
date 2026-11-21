@@ -91,8 +91,7 @@ The `status` inside each record is authoritative.
   abandonment stops body polling while natural completion retains downstream
   idle monitoring; the second correction is independently reviewed and fixed.
 - [Custom writer error context](custom/custom-writer-error-context.md): preserve
-  the first upstream writer root cause before asynchronous abandonment and
-  joined-future teardown can replace it.
+  the original upload error when a complete custom response cannot be delivered.
 - [Custom request contract coverage](custom/custom-request-contract-coverage.md):
   actual-pump termination, framing rejection and stale source EOF tests.
 - [Negative-test observation](testing/negative-tests-need-out-of-band-observation.md):

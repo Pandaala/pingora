@@ -1,6 +1,6 @@
 ---
 name: custom-writer-error-context
-description: The custom upstream pump preserves the first request-body writer error across asynchronous abandonment and joined-future teardown.
+description: The custom upstream pump preserves the first request-body writer error while resolving early response delivery and joined-future teardown.
 status: fixed
 ---
 
@@ -30,28 +30,42 @@ writer root cause.
 
 ## Resolution
 
-- The root request-body path error lives outside the joined futures and is
-  returned before any `try_join!` result.
+- The root request-body path error lives outside the joined futures. Issue 05
+  adopts the completed-response exception from upstream `7de472d`: a failed
+  upload writer can coexist with a successfully delivered response. A partial
+  response or failed response reader still reports the saved upload error.
 - A writer failure is converted to `Upstream` and placed in that durable slot
-  before the next `await`.
-- The required `Abandoned` hook still runs exactly once. Its immediate failure
-  is logged as secondary; if it remains pending and a sibling fails, future
-  cancellation cannot erase the already stored writer error.
-- A private upstream `WriteError` marker only stops the body state machine.
-  All three private call sites, including retry-buffer replay, pass through the
-  outer root-error priority check, so the marker cannot reach request logging.
-- Non-writer filter, completion, finish, early-response, and custom-message
-  errors keep their existing propagation behavior.
+  before the next `await`. The rejection does not dispatch a new request-body
+  event. `Complete` may already have been delivered before a failing terminal
+  write or finish; an unfinished sequence can end with `Data`.
+- A rejected writer receives no further writes, finish, or cleanup. The pump
+  may still deliver the response. Ordinary downstream framing can establish
+  completion without waiting for the custom reader to return from a stalled
+  body or trailer read. Cache admission, upgrade half-close, and application
+  termination have distinct completion conditions. A failed writer makes its
+  upstream session ineligible for reuse even when delivery succeeds.
+- A transport failure in `BodyWrite::finish` also rejects the upload. A
+  request filter failure is an application failure and cannot be cleared by a
+  successful response.
 
 No public API changed.
 
 ## Regression and review evidence
 
-`pingora-proxy/tests/test_upstream_response_body_sink.rs` now covers first-write
+For upstream-main issue 05, the custom transport tests exercise completed
+responses after first/later writes and finish failures, truncated responses,
+a blocked writer with a header-read failure, and upgraded half-close. They
+check the delivered bytes, request-body events, logged outcome, and retirement
+of the failed writer. The pump unit tests also exercise replay from the native
+retry buffer and distinguish downstream framing from active cache admission.
+
+### Historical verification
+
+Before issue 05, `pingora-proxy/tests/test_upstream_response_body_sink.rs` covered first-write
 and later-write rejection, an immediate secondary `Abandoned` hook failure, and
-a deterministic cancellation race. The race holds the hook pending, emits a
-separately marked custom response `ReadError`, proves both secondary events
-occurred, and still requires final logging to observe the original
+a deterministic cancellation race. The race held the hook pending, emitted a
+separately marked custom response `ReadError`, and verified that final logging
+observed the original
 `WriteError`, `Upstream`, and writer context.
 
 Reverse validation against the pre-fix path produced the old unset-source

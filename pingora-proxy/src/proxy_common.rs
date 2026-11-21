@@ -546,23 +546,24 @@ impl ResponseStateMachine {
 /// closure (downstream finished the response by its own framing) from an
 /// unexpected one.
 ///
-/// Stored in an `AtomicU8` shared via `Arc`: the downstream half stores with
-/// [`Release`](std::sync::atomic::Ordering::Release) and the upstream half loads
-/// with [`Acquire`](std::sync::atomic::Ordering::Acquire), comparing against
-/// `PipeState::DownstreamComplete as u8`.
+/// The custom pump additionally distinguishes a rejected upload, so it can
+/// stop a response reader stalled past the downstream framing boundary.
+/// Stores use release ordering and loads use acquire ordering.
 #[derive(Debug)]
 #[repr(u8)]
 pub(crate) enum PipeState {
     Active = 0,
     DownstreamComplete = 1,
+    UploadFailed = 2,
+    DownstreamCompleteAfterUploadFailure = 3,
 }
 
 impl PipeState {
     /// Whether `raw` — a value previously read from the shared `AtomicU8` — is
-    /// [`DownstreamComplete`](Self::DownstreamComplete). Centralizes the `as u8`
-    /// comparison the upstream halves perform on a task-pipe closure.
+    /// one of the successful downstream completion states.
     pub(crate) fn is_downstream_complete(raw: u8) -> bool {
         raw == PipeState::DownstreamComplete as u8
+            || raw == PipeState::DownstreamCompleteAfterUploadFailure as u8
     }
 }
 

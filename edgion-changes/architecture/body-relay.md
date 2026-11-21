@@ -239,14 +239,15 @@ stream or connection cleanup, cache finalization, and reuse decisions.
 
 - Natural downstream completion produces one `Complete` event per delivery
   sequence.
-- An early upstream response stops an unfinished live upload and delivers
-  `Abandoned` once.
+- A completed early upstream response that stops a still-active upload delivers
+  `Abandoned` once. A custom writer rejecting a write or finish stops upload
+  forwarding without dispatching a request-body event.
 - A response selected by the response pipeline before that `Abandoned` hook
   remains response-pump-owned only when the abandonment call site also proves
   the response complete. If the hook then returns `Terminate`, the shared relay
   reports `PreserveSelectedResponse`: each protocol pump ends request-side work
   without calling response finalization, then drains the already-selected
-  response. Writer rejection, nonterminal termination, and other unqualified
+  response. Nonterminal termination and other unqualified
   selected-response cases report `AbortSelectedResponse`: the downstream
   protocol closes or resets without a clean terminator. A response first
   written inside the hook remains application-owned and follows ordinary

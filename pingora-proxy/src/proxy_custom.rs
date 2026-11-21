@@ -37,6 +37,34 @@ use tokio::sync::oneshot;
 
 use super::*;
 
+/// A closed response channel and a selected response head do not establish completion.
+fn upload_response_complete(
+    session: &mut Session,
+    producer_done: bool,
+    cached_response_complete: bool,
+    upgraded_half_closed: bool,
+) -> bool {
+    let Some(status) = session.response_written().map(|header| header.status) else {
+        return false;
+    };
+    if is_informational_except_101(status.as_u16() as u32) {
+        return false;
+    }
+    if producer_done || cached_response_complete || upgraded_half_closed {
+        return true;
+    }
+    // A verified producer Done is required while filling cache. For an ordinary
+    // response the downstream can finish by framing before the producer ends.
+    let admission_active = matches!(
+        session.cache.phase(),
+        pingora_cache::CachePhase::Miss | pingora_cache::CachePhase::Expired
+    ) && session.cache.miss_handler().is_some();
+    !status.is_informational()
+        && !admission_active
+        && !session.has_pending_downstream_tasks()
+        && session.response_body_finished() == Some(true)
+}
+
 impl<SV, C> HttpProxy<SV, C>
 where
     C: custom::Connector,
@@ -286,7 +314,7 @@ where
         // stopped. Keep the actual first request-body path error outside the
         // joined future so it survives any later response/forwarder teardown
         // error returned by `try_join!`.
-        let mut request_body_error: Option<Box<Error>> = None;
+        let mut request_body_error = None;
 
         /* read downstream body and upstream response at the same time */
         let ret = tokio::try_join!(
@@ -358,6 +386,7 @@ where
         serve_from_cache: &mut ServeFromCache,
         response_state: &mut ResponseStateMachine,
         pipeline: &mut ResponsePipelineState,
+        producer_done: &mut bool,
     ) -> Result<Option<bool>>
     where
         SV: ProxyHttp + Send + Sync,
@@ -382,6 +411,7 @@ where
         let mut filtered_tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
         pipeline.sink.reset_batch();
         for mut t in tasks {
+            *producer_done |= matches!(t, HttpTask::Done);
             if self.revalidate_or_stale(session, &mut t, ctx).await {
                 serve_from_cache.enable();
                 response_state.enable_cached_response();
@@ -516,6 +546,9 @@ where
         }
 
         let mut response_state = ResponseStateMachine::new();
+        let mut producer_done = false;
+        let mut upgraded_half_closed = false;
+        let mut reads_after_upload_failure = 0;
 
         // these two below can be wrapped into an internal ctx
         // use cache when upstream revalidates (or TODO: error)
@@ -536,11 +569,38 @@ where
         /* duplex mode
          * see the Same function for h1 for more comments
          */
-        while !downstream_state.is_done()
-            || !response_state.is_done()
-            || upstream_custom
-            || downstream_custom
-        {
+        loop {
+            let upload_failed = request_body_error.is_some();
+            let mut await_producer = false;
+            let mut upload_response_pending = false;
+            if upload_failed {
+                // Only an upgraded stream needs further raw reads, to observe its half-close.
+                if let Some(cancel) = cancel_downstream_reader_tx.take() {
+                    pipe_state.store(PipeState::UploadFailed as u8, Ordering::Release);
+                    let _ = cancel.send(());
+                }
+                let cached =
+                    serve_from_cache.should_discard_upstream() && response_state.cached_done();
+                let complete =
+                    upload_response_complete(session, producer_done, cached, upgraded_half_closed);
+                upload_response_pending = !complete;
+                await_producer =
+                    !complete && !producer_done && !serve_from_cache.should_discard_upstream();
+                response_state.maybe_set_upstream_done(complete);
+                downstream_state.maybe_finished(true);
+                poll_downstream_body_or_idle = session.was_upgraded()
+                    && reads_after_upload_failure < TASK_BUFFER_SIZE
+                    && !upgraded_half_closed
+                    && !complete;
+            }
+            if !upload_response_pending
+                && downstream_state.is_done()
+                && response_state.is_done()
+                && !upstream_custom
+                && !downstream_custom
+            {
+                break;
+            }
             if response_state.is_done() && downstream_state.is_reading() {
                 // The custom upstream has completed the whole response while
                 // the downstream upload is still open. Nothing can consume
@@ -571,7 +631,7 @@ where
             let upgraded = session.was_upgraded();
 
             tokio::select! {
-                body = session.downstream_session.read_body_or_idle(downstream_state.is_done()),
+                body = session.downstream_session.read_body_or_idle(downstream_state.is_done() && !upload_failed),
                     if downstream_state.can_poll() && poll_downstream_body_or_idle => {
                     let reading_body = downstream_state.is_reading();
                     let body = match body {
@@ -600,6 +660,14 @@ where
                             }
                         }
                     };
+                    if upload_failed {
+                        reads_after_upload_failure += 1;
+                        upgraded_half_closed = body.is_none();
+                        continue;
+                    }
+                    if upgraded && body.is_none() {
+                        upgraded_half_closed = true;
+                    }
                     if !reading_body {
                         // Built-in downstreams resolve an idle watch only with
                         // an error. A custom implementation may instead return
@@ -611,39 +679,16 @@ where
                     let is_body_done = session.is_body_done();
                     let event = RequestBodyEvent::from(is_body_done);
 
-                    match self
-                        .send_body_to_custom(
-                            session,
-                            body,
-                            event,
-                            AbandonmentResponsePolicy::Abort,
-                            client_body,
-                            ctx,
-                            request_body_error,
-                        )
-                        .await
-                    {
-                        Ok(request_done) =>  {
-                            downstream_state.maybe_finished(request_done);
-                        },
-                        Err(e) => {
-                            // mark request done, attempt to drain receive
-                            if request_body_error.is_none() {
-                                warn!("body send error: {e}");
-                                *request_body_error = Some(e);
-                            } else if let Some(error) = request_body_error.as_deref() {
-                                warn!("body send error: {error}");
-                            }
-
-                            // upstream is what actually errored but we don't want to continue
-                            // polling the downstream body
-                            downstream_state.to_errored();
-
-                            // downstream still trying to send something, but the upstream is already stooped
-                            // cancel the custom downstream to upstream coroutine, because the proxy will not see EOS.
-                            let _ = cancel_downstream_reader_tx.take().expect("cancel must be set and called once").send(());
-                        }
-                    };
+                    let request_done = self.send_body_to_custom(
+                        session,
+                        body,
+                        event,
+                        AbandonmentResponsePolicy::Abort,
+                        client_body,
+                        ctx,
+                        request_body_error,
+                    ).await?;
+                    downstream_state.maybe_finished(request_done);
                 },
 
                 // Handle buffered upstream task from previous iteration
@@ -658,18 +703,17 @@ where
                             &mut serve_from_cache,
                             &mut response_state,
                             &mut response_pipeline,
+                            &mut producer_done,
                         ).await? else {
                             // nothing sent downstream e.g. serve_from_cache
                             continue;
                         };
                         response_state.maybe_set_upstream_done(response_done);
-                    } else {
-                        debug!("empty upstream event");
-                        response_state.maybe_set_upstream_done(true);
+
                     }
                 },
 
-                task = rx.recv(), if !response_state.upstream_done() && next_upstream_task.is_none() => {
+                task = rx.recv(), if (!response_state.upstream_done() || await_producer) && next_upstream_task.is_none() => {
                     debug!("upstream event: {:?}", task);
                     if let Some(t) = task {
                         let upgraded = session.was_upgraded();
@@ -681,6 +725,7 @@ where
                             &mut serve_from_cache,
                             &mut response_state,
                             &mut response_pipeline,
+                            &mut producer_done,
                         ).await? else {
                             // nothing sent downstream e.g. serve_from_cache
                             continue;
@@ -694,6 +739,9 @@ where
                         response_state.maybe_set_upstream_done(response_done);
                     } else {
                         debug!("empty upstream event");
+                        if await_producer {
+                            return Error::e_explain(ReadError, "custom response pipe closed before completion");
+                        }
                         response_state.maybe_set_upstream_done(true);
                     }
                 },
@@ -868,6 +916,9 @@ where
                 },
 
                 else => {
+                    if let Some(error) = request_body_error.take() {
+                        return Err(error);
+                    }
                     break;
                 }
             }
@@ -882,7 +933,10 @@ where
             return err;
         }
 
-        client_body.cleanup().await?;
+        let upload_failed = request_body_error.is_some();
+        if !upload_failed {
+            client_body.cleanup().await?;
+        }
 
         let mut reuse_downstream = !downstream_state.is_errored();
         if reuse_downstream {
@@ -891,6 +945,9 @@ where
                     debug!("finished sending body to downstream");
                 }
                 Err(e) => {
+                    if upload_failed {
+                        return Err(e);
+                    }
                     error!("Error finish sending body to downstream: {}", e);
                     reuse_downstream = false;
                 }
@@ -899,8 +956,15 @@ where
         reuse_downstream = finalize_response_downstream_reuse(session, reuse_downstream).await;
         // Signal the upstream half that the downstream half completed cleanly before
         // dropping rx, so a resulting task-pipe closure is treated as benign.
-        pipe_state.store(PipeState::DownstreamComplete as u8, Ordering::Release);
-        Ok(if response_pipeline.upstream_reusable {
+        if request_body_error.take().is_some() {
+            pipe_state.store(
+                PipeState::DownstreamCompleteAfterUploadFailure as u8,
+                Ordering::Release,
+            );
+        } else {
+            pipe_state.store(PipeState::DownstreamComplete as u8, Ordering::Release);
+        }
+        Ok(if response_pipeline.upstream_reusable && !upload_failed {
             DownstreamRequestOutcome::Complete(reuse_downstream)
         } else {
             DownstreamRequestOutcome::CompleteWithoutUpstreamReuse(reuse_downstream)
@@ -979,61 +1043,18 @@ where
             return Ok(false);
         }
 
-        if let Some(mut data) = data {
-            if let Err(e) = client_body.write_all_buf(&mut data).await {
-                let writer_error = e.into_up();
-                let writer_error_text = writer_error.to_string();
-                // `try_join!` may cancel this future at any later await when a
-                // response or custom-message sibling fails. Persist the root
-                // cause before dispatching the asynchronous Abandoned hook so
-                // teardown cannot win that race.
-                if request_body_error.is_none() {
-                    *request_body_error = Some(writer_error);
-                }
-                if event == RequestBodyEvent::Data {
-                    match self
-                        .request_relay_event(
-                            RequestRelayProtocol::Custom,
-                            session,
-                            None,
-                            RequestBodyEvent::Abandoned,
-                            ctx,
-                        )
-                        .await
-                    {
-                        Ok(RequestRelayOutcome::AbortSelectedResponse) => {
-                            abort_selected_response(session).await;
-                        }
-                        Ok(
-                            RequestRelayOutcome::Continue(_)
-                            | RequestRelayOutcome::PreserveSelectedResponse
-                            | RequestRelayOutcome::Terminate(_),
-                        ) => {}
-                        Err(abandon_error) => {
-                            warn!(
-                                "request-body Abandoned hook failed after custom writer rejection: \
-                                 {abandon_error}; preserving first error: {writer_error_text}"
-                            );
-                        }
-                    }
-                }
-                // The durable slot owns the real error. This marker only stops
-                // the request-body state machine; the outer pump returns the
-                // stored root cause before considering this or a sibling error.
-                return Err(Error::new_up(WriteError));
-            }
-            if end_of_body {
-                client_body.finish().await.map_err(|e| e.into_up())?;
-            }
-        } else {
-            debug!("Read downstream body done");
-            client_body
-                .finish()
-                .await
-                .map_err(|e| {
-                    Error::because(WriteError, "while shutdown send data stream on no data", e)
-                })
-                .map_err(|e| e.into_up())?;
+        let write_result = match data {
+            Some(mut data) => match client_body.write_all_buf(&mut data).await {
+                Ok(()) if end_of_body => client_body.finish().await,
+                result => result,
+            },
+            None => client_body.finish().await.map_err(|e| {
+                Error::because(WriteError, "while shutdown send data stream on no data", e)
+            }),
+        };
+        if let Err(error) = write_result {
+            *request_body_error = Some(error.into_up());
+            return Ok(true);
         }
 
         Ok(end_of_body)
@@ -1046,16 +1067,42 @@ async fn custom_pipe_up_to_down_response<S: CustomSession>(
     tx: mpsc::Sender<HttpTask>,
     pipe_state: Arc<AtomicU8>,
 ) -> Result<()> {
+    let response = read_custom_response(client, &tx, &pipe_state);
+    tokio::pin!(response);
+    tokio::select! {
+        biased;
+        result = &mut response => result,
+        _ = tx.closed() => {
+            if pipe_state.load(Ordering::Acquire) == PipeState::DownstreamCompleteAfterUploadFailure as u8 {
+                Ok(())
+            } else {
+                response.await
+            }
+        }
+    }
+}
+
+async fn read_custom_response<S: CustomSession>(
+    client: &mut S,
+    tx: &mpsc::Sender<HttpTask>,
+    pipe_state: &AtomicU8,
+) -> Result<()> {
     let mut is_informational = true;
     // Set when a final `101` arrived together with clean end-of-stream, i.e.
     // the whole response is complete at the header. See the normalization
     // below for why that end-of-stream cannot ride on the header task.
     let mut upgrade_ended = false;
     while is_informational {
-        client
-            .read_response_header()
-            .await
-            .map_err(|e| e.into_up())?;
+        if let Err(error) = client.read_response_header().await {
+            if pipe_state.load(Ordering::Acquire) == PipeState::UploadFailed as u8 {
+                // Upload forwarding has stopped. Let the consumer finish an
+                // already-selected cached response or report the saved upload error.
+                let _ = tx.send(HttpTask::Failed(error.into_up())).await;
+                return Ok(());
+            }
+            // Returning directly lets try_join! cancel a pending writer.
+            return Err(error.into_up());
+        }
         let resp_header = Box::new(client.response_header().expect("just read").clone());
         // `101 Switching Protocols` is a response to the http1 Upgrade header and it's final response.
         // The WebSocket Protocol https://datatracker.ietf.org/doc/html/rfc6455

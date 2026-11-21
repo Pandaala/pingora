@@ -1,6 +1,6 @@
 ---
 name: custom-upstream-early-response-abandonment
-description: The custom upstream pump stops unfinished uploads with exactly one Abandoned event after a final response or mid-upload writer rejection, without calling BodyWrite::finish for abandonment.
+description: A completed custom early response stops a still-active upload with one Abandoned event. A rejected body writer stops forwarding without dispatching a request-body event.
 status: fixed
 ---
 
@@ -8,7 +8,7 @@ status: fixed
 
 ## Classification
 
-Fork-owned correctness defect introduced by `600ac49`. Medium for public fork
+The original fork-owned correctness defect was introduced by `600ac49`. Medium for public fork
 users that install a custom connector; unreachable in the reviewed Edgion
 checkout (`83408c11`), which registers no custom connector. The Edgion lockfile
 still selects fork commit `57f6183`, so the sibling checkout is not deployment
@@ -23,8 +23,8 @@ response state became complete. `send_body_to_custom` derived
 to `Errored`; neither path could dispatch `Abandoned`.
 
 This drift was specific to the fork's custom pump. The H1 and H2 pumps already
-implemented the public contract that an intentionally unfinished downstream
-upload receives exactly one terminal `Abandoned` event.
+delivered a terminal `Abandoned` when a completed early response stopped a
+still-active downstream upload.
 
 ## Resolution
 
@@ -38,18 +38,17 @@ upload receives exactly one terminal `Abandoned` event.
   ignored and disables the arm without dispatching another terminal event.
 - Request-body hook dispatch is separate from custom writer operations.
   `Abandoned` never writes bytes and never calls `BodyWrite::finish()`.
-- A non-terminal writer rejection dispatches `Abandoned` before following the
-  existing error return path. Filter errors and failures after `Complete` are
-  not mislabeled as abandonment.
+- Under upstream-main issue 05, writer rejection stops forwarding without
+  dispatching a new request-body event. The pump resolves the
+  [writer error against response completion](custom-writer-error-context.md).
+  A later completed response does not retroactively dispatch `Abandoned`.
 - The existing downstream protocol owns cleanup: an H1 response committed
   before its request body completes disables connection reuse, while H2 ends
   only the affected stream. Custom writer cleanup and upstream reuse decisions
   remain on their existing paths.
 
 The downstream state transition plus the pump-local polling latch enforces
-exactly-once dispatch without removing natural-completion idle monitoring. No
-shared state or public API was added, and the H1/H2/custom pumps remain
-separate.
+exactly-once dispatch when a completed response stops a still-active upload.
 
 ## Regression coverage
 
@@ -68,14 +67,17 @@ separate.
 - completed H1 and H2 uploads followed by a stalled custom response and H1 FIN
   or H2 reset; both reach logging promptly with one `Complete`, while the H2
   connection remains usable;
-- custom writers rejecting the first or a later body write, with exactly one
-  `Abandoned` terminal event before the error path; and
+- custom writers rejecting the first or a later body write while the upload
+  is unfinished, with no synthetic terminal event; and
 - a completed-upload control that records one or more `Data` events followed by
   `Complete` and reuses its H1 connection. H1 parser boundaries may produce
   more than one `Data` callback; the tests intentionally assert the terminal
   invariant rather than an exact non-terminal callback count.
 
-## Fourth reopened review and closure evidence
+## Historical closure evidence
+
+The following checks predate issue 05. At the time, writer rejection also
+dispatched `Abandoned`; its former test expectations describe that revision.
 
 A fresh whole-stack review found that the H1 early-response and completed-upload
 controls still hard-coded an exact `Data` callback count. The same legal empty

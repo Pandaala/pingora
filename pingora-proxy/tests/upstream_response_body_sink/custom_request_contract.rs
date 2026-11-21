@@ -24,6 +24,8 @@ pub(super) enum Event {
     HeaderWritten,
     Written(Bytes),
     Finished,
+    Cleanup,
+    Released,
     Hook(RequestBodyEvent),
     TerminationArmed,
     Terminate,
@@ -35,7 +37,7 @@ pub(super) enum Event {
 }
 
 #[derive(Default)]
-struct Probe {
+pub(super) struct Probe {
     events: Mutex<Vec<Event>>,
     changed: tokio::sync::Notify,
 }
@@ -119,7 +121,7 @@ pub(super) async fn filter_action(
 }
 
 impl Probe {
-    fn register(script: &str) -> Arc<Self> {
+    pub(super) fn register(script: &str) -> Arc<Self> {
         let probe = Arc::new(Self::default());
         assert!(
             PROBES
@@ -130,6 +132,17 @@ impl Probe {
             "each scenario must own its probe"
         );
         probe
+    }
+
+    pub(super) fn assert_failed_writer_retired(&self) {
+        assert_eq!(self.count(|event| *event == Event::HeaderWritten), 1);
+        assert_eq!(self.count(|event| *event == Event::Logged), 1);
+        assert_eq!(
+            self.count(|event| matches!(event, Event::Cleanup | Event::Released)),
+            0,
+            "{:?}",
+            self.snapshot()
+        );
     }
 
     fn snapshot(&self) -> Vec<Event> {
@@ -393,4 +406,121 @@ async fn custom_source_eof_finishes_once_despite_stale_body_done() {
         .await;
     assert_eq!(probe.count(|event| *event == Event::SourceRead), 2);
     assert_eq!(probe.count(|event| *event == Event::Finished), 1);
+}
+
+#[tokio::test]
+async fn custom_finish_failure_still_delivers_complete_response() {
+    for (path, script, end_upload) in [
+        ("/custom_reject_finish", CUSTOM_REJECT_FINISH, true),
+        (
+            "/custom_reject_filtered_finish",
+            CUSTOM_REJECT_FILTERED_FINISH,
+            false,
+        ),
+    ] {
+        let probe = Probe::register(script);
+        let (mut io, record) =
+            run_h1_custom_upload_script(path, script, &[b"upload"], end_upload).await;
+        let mut body = [0; 6];
+        tokio::time::timeout(BOUND, io.read_exact(&mut body))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&body, b"result");
+        assert!(!record.had_error, "{record:?}");
+        if end_upload {
+            assert_request_body_terminal_events(
+                &record.events,
+                RequestBodyEvent::Complete,
+                DataEventCount::Any,
+                script,
+            );
+        } else {
+            assert!(!record.events.is_empty());
+            assert!(
+                record
+                    .events
+                    .iter()
+                    .all(|event| *event == RequestBodyEvent::Data),
+                "{script}: {record:?}"
+            );
+        }
+        assert_eq!(probe.count(|e| *e == Event::Finished), 1);
+        probe.assert_failed_writer_retired();
+    }
+}
+
+#[tokio::test]
+async fn custom_header_error_cancels_blocked_upload_writer() {
+    let path = "/custom_blocked_writer";
+    let probe = Probe::register(CUSTOM_BLOCK_WRITE);
+    let mut io = TcpStream::connect(("127.0.0.1", init().custom_proxy_port))
+        .await
+        .unwrap();
+    io.write_all(format!("POST {path} HTTP/1.1\r\nHost: local\r\nTransfer-Encoding: chunked\r\n{CUSTOM_REQUEST_BODY_SCRIPT_HEADER}: {CUSTOM_BLOCK_WRITE}\r\n\r\n1\r\na\r\n").as_bytes()).await.unwrap();
+    let record = wait_for_custom_request_body_record(path).await;
+    assert!(record
+        .error_text
+        .as_deref()
+        .unwrap()
+        .contains("header failed while writer was pending"));
+    probe.assert_failed_writer_retired();
+}
+
+#[tokio::test]
+async fn custom_failed_upgraded_upload_finishes_on_downstream_half_close() {
+    let path = "/custom_upgrade_failed_upload";
+    let probe = Probe::register(CUSTOM_UPGRADE_REJECT_WRITE);
+    let mut io = TcpStream::connect(("127.0.0.1", init().custom_proxy_port))
+        .await
+        .unwrap();
+    io.write_all(format!("GET {path} HTTP/1.1\r\nHost: local\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n{}: {}\r\n{CUSTOM_REQUEST_BODY_SCRIPT_HEADER}: {CUSTOM_UPGRADE_REJECT_WRITE}\r\n\r\n", CUSTOM_EMPTY_UPGRADE_HEADER.0, CUSTOM_EMPTY_UPGRADE_HEADER.1).as_bytes()).await.unwrap();
+    assert!(read_h1_response_header(&mut io)
+        .await
+        .starts_with(b"HTTP/1.1 101"));
+    io.write_all(b"client").await.unwrap();
+    let mut body = [0; 6];
+    tokio::time::timeout(BOUND, io.read_exact(&mut body))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&body, b"server");
+    io.shutdown().await.unwrap();
+    let record = wait_for_custom_request_body_record(path).await;
+    assert!(!record.had_error, "{record:?}");
+    probe.assert_failed_writer_retired();
+}
+
+#[tokio::test]
+async fn custom_truncated_response_keeps_failed_upload_error() {
+    let path = "/custom_truncated_after_rejection";
+    let script = CUSTOM_TRUNCATED_AFTER_REJECTION;
+    let probe = Probe::register(script);
+    let mut io = TcpStream::connect(("127.0.0.1", init().custom_proxy_port))
+        .await
+        .unwrap();
+    io.write_all(format!("POST {path} HTTP/1.1\r\nHost: local\r\nTransfer-Encoding: chunked\r\n{CUSTOM_REQUEST_BODY_SCRIPT_HEADER}: {script}\r\n\r\n1\r\na\r\n").as_bytes()).await.unwrap();
+    let record = wait_for_custom_request_body_record(path).await;
+    assert!(!record.events.is_empty());
+    assert!(
+        record
+            .events
+            .iter()
+            .all(|event| *event == RequestBodyEvent::Data),
+        "{script}: {record:?}"
+    );
+    assert_eq!(
+        record.error_type,
+        Some(pingora_error::ErrorType::WriteError)
+    );
+    assert_eq!(
+        record.error_source,
+        Some(pingora_error::ErrorSource::Upstream)
+    );
+    assert!(record
+        .error_text
+        .as_deref()
+        .unwrap()
+        .contains("scripted custom request-body writer rejection"));
+    probe.assert_failed_writer_retired();
 }

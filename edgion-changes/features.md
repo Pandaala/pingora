@@ -27,7 +27,7 @@ v2/v3 commits and review records remain provenance, not the current v4 layout.
 | Inbound PROXY protocol | Strict v1/v2 parsing before TLS, explicit transport trust, preserved raw peer | core listeners, L4 parser, digest | [proxy-protocol.md](features/proxy-protocol.md) |
 | Connection admission permit | `ConnectionFilter::admit` is consulted for every accepted stream (with `None` for a non-inet peer) and may return an opaque `ConnectionPermit` owned by the l4 `Stream` until it drops on any exit path; `should_accept`-only filters keep their decisions | core listeners (`connection_filter.rs`, `l4.rs`) and l4 stream | [connection-admission-permit.md](features/connection-admission-permit.md) |
 | Replayable request body | Full capture/replay or bounded pre-forwarding prefix followed by live bytes; cancellation fails closed | core body buffer and H1/H2 server sessions | [request-body-buffering.md](features/request-body-buffering.md) |
-| Request-body transport controls | H1 transfer-coding admission, consistent events, dispositions, termination, trailers, retry gates, cleanup | proxy entry, trait/common and pumps | [request-body-transport.md](features/request-body-transport.md) |
+| Request-body transport controls | H1 transfer-coding admission, consistent events, dispositions, termination, trailers, retry gates, custom early responses after upload failure | proxy entry, trait/common and pumps | [request-body-transport.md](features/request-body-transport.md) |
 | Response-body streaming controls | Async downstream body filter, upstream filter/sink with allocation-free defaults, bounded emitted bytes and chunk count, typed termination, upstream/downstream terminal dispatch, cache/live ordering | trait, shared pipeline, sink, pumps, cache | [response-body-streaming.md](features/response-body-streaming.md) |
 | Response trailer lifecycle | Typed pre-trailer boundary, awaited application hook, H1 parsing/writing with session write bounds, planned framing capability, HTTP/1.0 downgrade | core H1, proxy trait and pumps | [response-trailers.md](features/response-trailers.md) |
 | Bounded response-head commit barrier | Default-Immediate final-head plan; opt-in hard-bounded Hold with Release/Replace/Fail, cache bypass, absolute deadline across response and concurrent upload waits, writer claim, released-head capability planning before downstream trailer hooks, and protocol-safe origin abandonment | proxy trait, shared response pipeline/sink, H1/H2 pumps, cache; Edgion Guardrail claimant | [response-head-commit-barrier.md](features/response-head-commit-barrier.md) |
@@ -49,7 +49,8 @@ snapshot are tracked in
    `Complete` or `Abandoned`; a retry may replay a new `Data`/`Complete`
    sequence through the application hook, while the request-trailer hook stays
    at most once across attempts. H1, H2, and custom upstream pumps all stop an
-   unfinished live upload with `Abandoned` after the response completes.
+   unfinished live upload with `Abandoned` when response completion stops it.
+   A custom writer rejecting a write or finish generates no terminal callback.
 2. A fork-owned `RequestBodyBuffer` capture that is partial, cancelled,
    drained, or poisoned is never replayed as a complete request body. This
    guarantee does not cover upstream's alpha subrequest `SavedBody` API: its

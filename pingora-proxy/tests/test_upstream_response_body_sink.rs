@@ -146,9 +146,14 @@ const TRAILERED_ORIGIN_HEADER: (&str, &str) = ("x-trailered-origin", "1");
 const CUSTOM_POST_TERMINAL_FAILURE_HEADER: (&str, &str) = ("x-custom-post-terminal-failure", "1");
 const CUSTOM_REQUEST_BODY_SCRIPT_HEADER: &str = "x-custom-request-body-script";
 const CUSTOM_EARLY_RESPONSE_SCRIPT: &str = "early-response";
+const CUSTOM_TRUNCATED_AFTER_REJECTION: &str = "truncated-after-rejection";
+const CUSTOM_REJECT_H2_WRITE: &str = "reject-h2-write";
+const CUSTOM_REJECT_FILTERED_FINISH: &str = "reject-filtered-finish";
+const CUSTOM_REJECT_FINISH: &str = "reject-finish";
+const CUSTOM_BLOCK_WRITE: &str = "blocked-write-header-failure";
+const CUSTOM_UPGRADE_REJECT_WRITE: &str = "upgrade-reject-write";
 const CUSTOM_REJECT_FIRST_WRITE_SCRIPT: &str = "reject-first-write";
 const CUSTOM_REJECT_LATER_WRITE_SCRIPT: &str = "reject-later-write";
-const CUSTOM_REJECT_WRITE_AND_ABANDON_FILTER_SCRIPT: &str = "reject-write-and-abandon-filter";
 const CUSTOM_REJECT_WRITE_WITH_COMPETING_RESPONSE_ERROR_SCRIPT: &str =
     "reject-write-with-competing-response-error";
 const CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_SCRIPT: &str =
@@ -475,14 +480,8 @@ static CUSTOM_DOWNSTREAM_WRITER_CLEANUPS: AtomicUsize = AtomicUsize::new(0);
 static CUSTOM_SELECTED_RESPONSE_HEAD_WRITTEN: AtomicBool = AtomicBool::new(false);
 static CUSTOM_SELECTED_RESPONSE_HEAD_CHANGED: Lazy<tokio::sync::Notify> =
     Lazy::new(tokio::sync::Notify::new);
-static CUSTOM_SELECTED_RESPONSE_ABANDONS: AtomicUsize = AtomicUsize::new(0);
-static CUSTOM_SELECTED_RESPONSE_ABANDON_CHANGED: Lazy<tokio::sync::Notify> =
-    Lazy::new(tokio::sync::Notify::new);
 static CUSTOM_SELECTED_RESPONSE_FINISHES: AtomicUsize = AtomicUsize::new(0);
 static CUSTOM_COMPRESSED_TRAILERED_EOS_CALLS: AtomicUsize = AtomicUsize::new(0);
-static CUSTOM_WRITER_RACE_HOOK_PENDING: AtomicBool = AtomicBool::new(false);
-static CUSTOM_WRITER_RACE_HOOK_ENTERED: Lazy<tokio::sync::Notify> =
-    Lazy::new(tokio::sync::Notify::new);
 static CUSTOM_WRITER_RACE_SECONDARY_ERROR_EMITTED: AtomicBool = AtomicBool::new(false);
 static DOWNSTREAM_TRAILER_FILTER_CALLS: Lazy<Mutex<std::collections::HashMap<String, usize>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -705,11 +704,20 @@ impl BodyWrite for NoopBodyWriter {
     async fn write_all_buf(&mut self, data: &mut Bytes) -> Result<()> {
         let attempt = self.progress.write_attempts.fetch_add(1, Ordering::SeqCst) + 1;
         self.progress.changed.notify_one();
+        if self.script.as_deref() == Some(CUSTOM_BLOCK_WRITE) {
+            return std::future::pending().await;
+        }
         let reject = matches!(
             (self.script.as_deref(), attempt),
-            (Some(CUSTOM_REJECT_FIRST_WRITE_SCRIPT), 1)
-                | (Some(CUSTOM_REJECT_LATER_WRITE_SCRIPT), 2)
-                | (Some(CUSTOM_REJECT_WRITE_AND_ABANDON_FILTER_SCRIPT), 1)
+            (
+                Some(
+                    CUSTOM_REJECT_FIRST_WRITE_SCRIPT
+                        | CUSTOM_REJECT_H2_WRITE
+                        | CUSTOM_UPGRADE_REJECT_WRITE
+                        | CUSTOM_TRUNCATED_AFTER_REJECTION
+                ),
+                1
+            ) | (Some(CUSTOM_REJECT_LATER_WRITE_SCRIPT), 2)
                 | (Some(CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_SCRIPT), 1)
                 | (
                     Some(CUSTOM_REJECT_WRITE_WITH_COMPETING_RESPONSE_ERROR_SCRIPT),
@@ -746,6 +754,15 @@ impl BodyWrite for NoopBodyWriter {
         self.progress.changed.notify_one();
         if matches!(
             self.script.as_deref(),
+            Some(CUSTOM_REJECT_FINISH | CUSTOM_REJECT_FILTERED_FINISH)
+        ) {
+            return pingora_error::Error::e_explain(
+                pingora_error::ErrorType::WriteError,
+                "scripted custom request-body finish rejection",
+            );
+        }
+        if matches!(
+            self.script.as_deref(),
             Some(CUSTOM_WAIT_FOR_H1_CLOSE_SCRIPT | CUSTOM_WAIT_FOR_H2_CLOSE_SCRIPT)
         ) {
             CUSTOM_STALLED_UPLOAD_FINISHED
@@ -757,6 +774,10 @@ impl BodyWrite for NoopBodyWriter {
     }
 
     async fn cleanup(&mut self) -> Result<()> {
+        custom_request_contract::record(
+            self.script.as_deref(),
+            custom_request_contract::Event::Cleanup,
+        );
         if self.script.as_deref() == Some(CUSTOM_DOWNSTREAM_EARLY_RESPONSE_SCRIPT) {
             CUSTOM_DOWNSTREAM_WRITER_CLEANUPS.fetch_add(1, Ordering::SeqCst);
         }
@@ -794,7 +815,9 @@ impl HeaderOnlyCustomSession {
             Some(
                 CUSTOM_EARLY_RESPONSE_SCRIPT
                 | CUSTOM_REJECT_FIRST_WRITE_SCRIPT
-                | CUSTOM_REJECT_WRITE_AND_ABANDON_FILTER_SCRIPT
+                | CUSTOM_BLOCK_WRITE
+                | CUSTOM_REJECT_H2_WRITE
+                | CUSTOM_TRUNCATED_AFTER_REJECTION
                 | CUSTOM_REJECT_WRITE_WITH_COMPETING_RESPONSE_ERROR_SCRIPT,
             ) => {
                 self.request_body_progress
@@ -810,6 +833,8 @@ impl HeaderOnlyCustomSession {
             }
             Some(
                 CUSTOM_COMPLETE_UPLOAD_SCRIPT
+                | CUSTOM_REJECT_FINISH
+                | CUSTOM_REJECT_FILTERED_FINISH
                 | CUSTOM_WAIT_FOR_H1_CLOSE_SCRIPT
                 | CUSTOM_WAIT_FOR_H2_CLOSE_SCRIPT,
             ) => self.request_body_progress.finished.load(Ordering::SeqCst),
@@ -848,6 +873,10 @@ impl CustomConnector for HeaderOnlyCustomConnector {
         _peer: &P,
         _idle_timeout: Option<Duration>,
     ) {
+        custom_request_contract::record(
+            session.request_body_script.as_deref(),
+            custom_request_contract::Event::Released,
+        );
         if session.fail_after_terminal {
             FAILED_CUSTOM_SESSION_RELEASED.store(true, Ordering::SeqCst);
         }
@@ -866,16 +895,26 @@ impl CustomSession for HeaderOnlyCustomSession {
             .get(CUSTOM_REQUEST_BODY_SCRIPT_HEADER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        if self.request_body_script.as_deref()
-            == Some(CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_SCRIPT)
-        {
+        if let Some(script) = self.request_body_script.as_deref() {
             self.response = ResponseHeader::build(200, None)?;
+            let length = match script {
+                CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_SCRIPT => 4,
+                CUSTOM_REJECT_FIRST_WRITE_SCRIPT
+                | CUSTOM_REJECT_H2_WRITE
+                | CUSTOM_REJECT_LATER_WRITE_SCRIPT
+                | CUSTOM_REJECT_FINISH
+                | CUSTOM_REJECT_FILTERED_FINISH => {
+                    self.pending_body.push_back(Bytes::from_static(b"result"));
+                    6
+                }
+                CUSTOM_TRUNCATED_AFTER_REJECTION => {
+                    self.pending_body.push_back(Bytes::from_static(b"res"));
+                    6
+                }
+                _ => 0,
+            };
             self.response
-                .insert_header(http::header::CONTENT_LENGTH, "4")?;
-        } else if self.request_body_script.is_some() {
-            self.response = ResponseHeader::build(200, None)?;
-            self.response
-                .insert_header(http::header::CONTENT_LENGTH, "0")?;
+                .insert_header(http::header::CONTENT_LENGTH, length.to_string())?;
         }
         self.fail_after_terminal = req
             .headers
@@ -899,6 +938,9 @@ impl CustomSession for HeaderOnlyCustomSession {
             self.response
                 .insert_header(http::header::UPGRADE, "websocket")?;
             self.upgraded = true;
+        }
+        if self.request_body_script.as_deref() == Some(CUSTOM_UPGRADE_REJECT_WRITE) {
+            self.pending_body.push_back(Bytes::from_static(b"server"));
         }
         if req.headers.get(CUSTOM_TERMINAL_UPGRADE_HEADER.0).is_some() {
             self.response =
@@ -931,12 +973,15 @@ impl CustomSession for HeaderOnlyCustomSession {
 
     async fn read_response_header(&mut self) -> Result<()> {
         self.wait_for_scripted_request_body_state().await;
+        if self.request_body_script.as_deref() == Some(CUSTOM_BLOCK_WRITE) {
+            return pingora_error::Error::e_explain(
+                pingora_error::ErrorType::ReadError,
+                "header failed while writer was pending",
+            );
+        }
         if self.request_body_script.as_deref()
             == Some(CUSTOM_REJECT_WRITE_WITH_COMPETING_RESPONSE_ERROR_SCRIPT)
         {
-            while !CUSTOM_WRITER_RACE_HOOK_PENDING.load(Ordering::SeqCst) {
-                CUSTOM_WRITER_RACE_HOOK_ENTERED.notified().await;
-            }
             CUSTOM_WRITER_RACE_SECONDARY_ERROR_EMITTED.store(true, Ordering::SeqCst);
             return pingora_error::Error::e_explain(
                 pingora_error::ErrorType::ReadError,
@@ -953,15 +998,34 @@ impl CustomSession for HeaderOnlyCustomSession {
     }
 
     async fn read_response_body(&mut self) -> Result<Option<Bytes>> {
+        if self.request_body_script.as_deref() == Some(CUSTOM_UPGRADE_REJECT_WRITE) {
+            if self.pending_body.is_empty() {
+                return std::future::pending().await;
+            }
+            while self
+                .request_body_progress
+                .write_attempts
+                .load(Ordering::SeqCst)
+                == 0
+            {
+                self.request_body_progress.changed.notified().await;
+            }
+            return Ok(self.pending_body.pop_front());
+        }
         if self.request_body_script.as_deref()
             == Some(CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_SCRIPT)
         {
-            while CUSTOM_SELECTED_RESPONSE_ABANDONS.load(Ordering::SeqCst) == 0 {
-                CUSTOM_SELECTED_RESPONSE_ABANDON_CHANGED.notified().await;
+            while self
+                .request_body_progress
+                .write_attempts
+                .load(Ordering::SeqCst)
+                == 0
+            {
+                self.request_body_progress.changed.notified().await;
             }
             return pingora_error::Error::e_explain(
                 pingora_error::ErrorType::ReadError,
-                "scripted response teardown after downstream abandon",
+                "scripted response truncation after writer rejection",
             );
         }
         if self.terminal_upgrade {
@@ -970,6 +1034,12 @@ impl CustomSession for HeaderOnlyCustomSession {
         }
         if let Some(chunk) = self.pending_body.pop_front() {
             return Ok(Some(chunk));
+        }
+        if self.request_body_script.as_deref() == Some(CUSTOM_TRUNCATED_AFTER_REJECTION) {
+            return pingora_error::Error::e_explain(
+                pingora_error::ErrorType::ReadError,
+                "custom response stopped before Content-Length",
+            );
         }
         if self.fail_after_terminal {
             CUSTOM_POST_TERMINAL_FAILURE_EMITTED.store(true, Ordering::SeqCst);
@@ -983,9 +1053,15 @@ impl CustomSession for HeaderOnlyCustomSession {
     }
 
     fn response_finished(&self) -> bool {
-        if self.request_body_script.as_deref()
-            == Some(CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_SCRIPT)
-        {
+        if matches!(
+            self.request_body_script.as_deref(),
+            Some(
+                CUSTOM_REJECT_FIRST_WRITE_SCRIPT
+                    | CUSTOM_TRUNCATED_AFTER_REJECTION
+                    | CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_SCRIPT
+                    | CUSTOM_UPGRADE_REJECT_WRITE
+            )
+        ) {
             return false;
         }
         self.pending_body.is_empty()
@@ -1020,6 +1096,10 @@ impl CustomSession for HeaderOnlyCustomSession {
     }
 
     async fn read_trailers(&mut self) -> Result<Option<HeaderMap>> {
+        if self.request_body_script.as_deref() == Some(CUSTOM_REJECT_FIRST_WRITE_SCRIPT) {
+            // All six promised bytes are already on the wire; the producer never sends Done.
+            return std::future::pending().await;
+        }
         if self.terminal_upgrade {
             TERMINAL_UPGRADE_SESSION_READ_AFTER_EOS.store(true, Ordering::SeqCst);
             return Ok(None);
@@ -1092,15 +1172,11 @@ impl ProxyHttp for EmitProxy {
         if custom_request_contract::filter_action(session, body, event).await? {
             return Ok(RequestBodyAction::Terminate);
         }
-        if event == RequestBodyEvent::Abandoned
+        if event == RequestBodyEvent::Data
             && session.get_header_bytes(CUSTOM_REQUEST_BODY_SCRIPT_HEADER)
-                == CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_SCRIPT.as_bytes()
+                == CUSTOM_REJECT_FILTERED_FINISH.as_bytes()
         {
-            assert!(
-                session.response_head_selected_by_pipeline(),
-                "the custom writer must reject after the response head was selected"
-            );
-            return Ok(RequestBodyAction::Terminate);
+            *body = None;
         }
         Ok(RequestBodyAction::Continue)
     }
@@ -1115,29 +1191,12 @@ impl ProxyHttp for EmitProxy {
 
     async fn request_body_filter(
         &self,
-        session: &mut Session,
+        _session: &mut Session,
         _body: &mut Option<Bytes>,
         event: RequestBodyEvent,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         ctx.request_body_events.push(event);
-        if event == RequestBodyEvent::Abandoned
-            && session.get_header_bytes(CUSTOM_REQUEST_BODY_SCRIPT_HEADER)
-                == CUSTOM_REJECT_WRITE_AND_ABANDON_FILTER_SCRIPT.as_bytes()
-        {
-            return pingora_error::Error::e_explain(
-                pingora_error::ErrorType::InternalError,
-                "scripted abandonment filter teardown rejection",
-            );
-        }
-        if event == RequestBodyEvent::Abandoned
-            && session.get_header_bytes(CUSTOM_REQUEST_BODY_SCRIPT_HEADER)
-                == CUSTOM_REJECT_WRITE_WITH_COMPETING_RESPONSE_ERROR_SCRIPT.as_bytes()
-        {
-            CUSTOM_WRITER_RACE_HOOK_PENDING.store(true, Ordering::SeqCst);
-            CUSTOM_WRITER_RACE_HOOK_ENTERED.notify_waiters();
-            return std::future::pending().await;
-        }
         Ok(())
     }
 
@@ -1870,6 +1929,9 @@ impl CustomServerSession for ScriptedCustomDownstream {
     async fn response_duplex_vec(&mut self, tasks: Vec<HttpTask>) -> Result<bool> {
         let finished = tasks.iter().any(HttpTask::is_end);
         for task in tasks {
+            if let HttpTask::Failed(error) = task {
+                return Err(error);
+            }
             if let HttpTask::Header(response, _) = task {
                 self.response = Some(*response);
                 if self.is_selected_response_writer_rejection() {
@@ -1918,13 +1980,6 @@ impl CustomServerSession for ScriptedCustomDownstream {
     }
 
     async fn shutdown(&mut self, _code: u32, _ctx: &str) {}
-
-    async fn abandon(&mut self, _ctx: &str) {
-        if self.is_selected_response_writer_rejection() {
-            CUSTOM_SELECTED_RESPONSE_ABANDONS.fetch_add(1, Ordering::SeqCst);
-            CUSTOM_SELECTED_RESPONSE_ABANDON_CHANGED.notify_waiters();
-        }
-    }
 
     fn is_body_done(&mut self) -> bool {
         if self.source_eof_contract && self.body_reads == 2 {
@@ -3411,7 +3466,21 @@ async fn custom_early_response_abandons_h1_upload_and_closes_connection() {
 
 #[tokio::test]
 async fn custom_early_response_abandons_only_the_h2_stream() {
-    let path = "/custom_early_response_h2";
+    assert_h2_early_response(
+        "/custom_early_response_h2",
+        CUSTOM_EARLY_RESPONSE_SCRIPT,
+        b"",
+    )
+    .await;
+    assert_h2_early_response(
+        "/custom_rejected_upload_h2",
+        CUSTOM_REJECT_H2_WRITE,
+        b"result",
+    )
+    .await;
+}
+
+async fn assert_h2_early_response(path: &str, script: &str, expected_body: &[u8]) {
     CUSTOM_REQUEST_BODY_RECORDS.lock().unwrap().remove(path);
     let harness = init();
     let tcp = TcpStream::connect(("127.0.0.1", harness.custom_proxy_port))
@@ -3426,10 +3495,7 @@ async fn custom_early_response_abandons_only_the_h2_stream() {
         .method("POST")
         .uri(format!("http://localhost{path}"))
         .header(http::header::CONTENT_LENGTH, "8")
-        .header(
-            CUSTOM_REQUEST_BODY_SCRIPT_HEADER,
-            CUSTOM_EARLY_RESPONSE_SCRIPT,
-        )
+        .header(CUSTOM_REQUEST_BODY_SCRIPT_HEADER, script)
         .body(())
         .unwrap();
     let (response, mut request_body) = h2.send_request(request, false).unwrap();
@@ -3441,13 +3507,28 @@ async fn custom_early_response_abandons_only_the_h2_stream() {
         .expect("custom H2 response did not complete within one second")
         .unwrap();
     assert_eq!(response.status(), http::StatusCode::OK);
+    let mut body = response.into_body();
+    let received = tokio::time::timeout(Duration::from_secs(1), async {
+        let mut received = Vec::new();
+        while let Some(chunk) = body.data().await {
+            received.extend_from_slice(&chunk.unwrap());
+        }
+        received
+    })
+    .await
+    .expect("custom H2 response body did not complete");
+    assert_eq!(received, expected_body);
     let record = wait_for_custom_request_body_record(path).await;
-    assert_request_body_terminal_events(
-        &record.events,
-        RequestBodyEvent::Abandoned,
-        DataEventCount::Exactly(1),
-        "H2 early response",
-    );
+    if script == CUSTOM_REJECT_H2_WRITE {
+        assert_eq!(record.events, [RequestBodyEvent::Data]);
+    } else {
+        assert_request_body_terminal_events(
+            &record.events,
+            RequestBodyEvent::Abandoned,
+            DataEventCount::Exactly(1),
+            "H2 early response",
+        );
+    }
     assert_eq!(record.logging_calls, 1);
     assert!(!record.had_error);
 
@@ -3512,7 +3593,7 @@ async fn custom_early_response_stops_polling_a_custom_downstream() {
 }
 
 #[tokio::test]
-async fn custom_writer_rejection_aborts_a_selected_incomplete_custom_response() {
+async fn custom_writer_rejection_preserves_error_for_selected_incomplete_response() {
     let path = CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_PATH;
     let script = CUSTOM_REJECT_WRITE_AFTER_SELECTED_RESPONSE_SCRIPT;
     let harness = init();
@@ -3526,7 +3607,6 @@ async fn custom_writer_rejection_aborts_a_selected_incomplete_custom_response() 
         .unwrap()
         .remove(script);
     CUSTOM_SELECTED_RESPONSE_HEAD_WRITTEN.store(false, Ordering::SeqCst);
-    CUSTOM_SELECTED_RESPONSE_ABANDONS.store(0, Ordering::SeqCst);
     CUSTOM_SELECTED_RESPONSE_FINISHES.store(0, Ordering::SeqCst);
 
     let _io = TcpStream::connect(("127.0.0.1", harness.custom_abort_downstream_proxy_port))
@@ -3538,12 +3618,7 @@ async fn custom_writer_rejection_aborts_a_selected_incomplete_custom_response() 
         CUSTOM_SELECTED_RESPONSE_HEAD_WRITTEN.load(Ordering::SeqCst),
         "the response head was not selected before the writer rejected request data"
     );
-    assert_request_body_terminal_events(
-        &record.events,
-        RequestBodyEvent::Abandoned,
-        DataEventCount::Exactly(1),
-        script,
-    );
+    assert_eq!(record.events, [RequestBodyEvent::Data]);
     assert_eq!(
         CUSTOM_REJECTED_WRITER_ATTEMPTS
             .lock()
@@ -3552,11 +3627,6 @@ async fn custom_writer_rejection_aborts_a_selected_incomplete_custom_response() 
             .copied(),
         Some(1),
         "the fixture did not reject the first real writer attempt"
-    );
-    assert_eq!(
-        CUSTOM_SELECTED_RESPONSE_ABANDONS.load(Ordering::SeqCst),
-        1,
-        "the selected incomplete custom response was not explicitly abandoned exactly once"
     );
     assert_eq!(
         CUSTOM_SELECTED_RESPONSE_FINISHES.load(Ordering::SeqCst),
@@ -3582,7 +3652,7 @@ async fn custom_writer_rejection_aborts_a_selected_incomplete_custom_response() 
 }
 
 #[tokio::test]
-async fn custom_writer_rejection_dispatches_abandoned_exactly_once() {
+async fn custom_writer_rejection_delivers_complete_response_without_abandoned() {
     for (path, script, chunks, expected_writer_attempt) in [
         (
             "/custom_reject_first_write",
@@ -3596,24 +3666,28 @@ async fn custom_writer_rejection_dispatches_abandoned_exactly_once() {
             &[[b'a'; 4], [b'b'; 4]][..],
             2,
         ),
-        (
-            "/custom_reject_write_and_abandon_filter",
-            CUSTOM_REJECT_WRITE_AND_ABANDON_FILTER_SCRIPT,
-            &[[b'a'; 4]][..],
-            1,
-        ),
     ] {
         CUSTOM_REJECTED_WRITER_ATTEMPTS
             .lock()
             .unwrap()
             .remove(script);
         let chunk_refs: Vec<&[u8]> = chunks.iter().map(|chunk| chunk.as_slice()).collect();
-        let (_io, record) = run_h1_custom_upload_script(path, script, &chunk_refs, false).await;
-        assert_request_body_terminal_events(
-            &record.events,
-            RequestBodyEvent::Abandoned,
-            DataEventCount::Any,
-            script,
+        let probe = custom_request_contract::Probe::register(script);
+        let (mut io, record) = run_h1_custom_upload_script(path, script, &chunk_refs, false).await;
+        let mut body = [0; 6];
+        tokio::time::timeout(Duration::from_secs(1), io.read_exact(&mut body))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&body, b"result");
+        probe.assert_failed_writer_retired();
+        assert!(!record.events.is_empty());
+        assert!(
+            record
+                .events
+                .iter()
+                .all(|event| *event == RequestBodyEvent::Data),
+            "{script}: {record:?}"
         );
         assert_eq!(
             CUSTOM_REJECTED_WRITER_ATTEMPTS
@@ -3625,34 +3699,12 @@ async fn custom_writer_rejection_dispatches_abandoned_exactly_once() {
             "{script} rejected the wrong real writer attempt"
         );
         assert_eq!(record.logging_calls, 1);
-        assert!(
-            record.had_error,
-            "writer rejection must remain an upstream error"
-        );
-        assert_eq!(
-            record.error_type.as_ref(),
-            Some(&pingora_error::ErrorType::WriteError),
-            "{script} lost the writer error type: {record:?}"
-        );
-        assert_eq!(
-            record.error_source.as_ref(),
-            Some(&pingora_error::ErrorSource::Upstream),
-            "{script} lost the upstream source: {record:?}"
-        );
-        let error_text = record.error_text.as_deref().unwrap();
-        assert!(
-            error_text.contains("scripted custom request-body writer rejection"),
-            "{script} lost the writer context: {error_text}"
-        );
-        assert!(
-            !error_text.contains("scripted abandonment filter teardown rejection"),
-            "{script} let a teardown failure replace the writer root cause: {error_text}"
-        );
+        assert!(!record.had_error, "{script}: {record:?}");
     }
 }
 
 #[tokio::test]
-async fn custom_writer_error_survives_cancellation_while_abandoned_hook_is_pending() {
+async fn custom_writer_rejection_takes_priority_over_later_header_read_error() {
     let path = "/custom_reject_write_with_competing_response_error";
     let script = CUSTOM_REJECT_WRITE_WITH_COMPETING_RESPONSE_ERROR_SCRIPT;
     CUSTOM_REQUEST_BODY_RECORDS.lock().unwrap().remove(path);
@@ -3660,7 +3712,6 @@ async fn custom_writer_error_survives_cancellation_while_abandoned_hook_is_pendi
         .lock()
         .unwrap()
         .remove(script);
-    CUSTOM_WRITER_RACE_HOOK_PENDING.store(false, Ordering::SeqCst);
     CUSTOM_WRITER_RACE_SECONDARY_ERROR_EMITTED.store(false, Ordering::SeqCst);
 
     let harness = init();
@@ -3681,18 +3732,16 @@ async fn custom_writer_error_survives_cancellation_while_abandoned_hook_is_pendi
 
     let record = wait_for_custom_request_body_record(path).await;
     assert!(
-        CUSTOM_WRITER_RACE_HOOK_PENDING.load(Ordering::SeqCst),
-        "the abandonment hook never entered its deterministic pending state"
-    );
-    assert!(
         CUSTOM_WRITER_RACE_SECONDARY_ERROR_EMITTED.load(Ordering::SeqCst),
         "the competing response error was not emitted"
     );
-    assert_request_body_terminal_events(
-        &record.events,
-        RequestBodyEvent::Abandoned,
-        DataEventCount::Any,
-        script,
+    assert!(!record.events.is_empty());
+    assert!(
+        record
+            .events
+            .iter()
+            .all(|event| *event == RequestBodyEvent::Data),
+        "{script}: {record:?}"
     );
     assert_eq!(
         CUSTOM_REJECTED_WRITER_ATTEMPTS
