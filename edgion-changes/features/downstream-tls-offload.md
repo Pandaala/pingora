@@ -1,7 +1,8 @@
 # Downstream TLS handshake offload cancellation
 
-The BoringSSL acceptor can move a server-side TLS handshake to dedicated
-current-thread runtimes when its `TlsSettings` enables offload. Each built
+The BoringSSL/OpenSSL, rustls, and s2n acceptors can move a server-side TLS
+handshake to dedicated current-thread runtimes when their `TlsSettings`
+enable offload. Each built
 acceptor owns a separate, lazily started `OffloadRuntime`; its configured
 `shards * threads_per_shard` threads are not a process-global pool. This
 mechanism does not limit the number of concurrent handshakes or reserve CPU.
@@ -12,18 +13,25 @@ caller cancellation drops the wait, the dispatched handshake task is aborted
 and its socket is released. This cancels the async task; synchronous
 cryptographic work already executing is not preemptible.
 
-This is a scoped adoption of the BoringSSL and offload-runtime behavior from
+For upstream-main issue 02, all TLS backends use the cancellation mechanism from
 official upstream commit `4487f7b2ab50f159e4a2cf4f6a6b813f61bb6e19`.
-It is not a full synchronization with upstream `main`. The fork's focused
-tests exercise the abort-on-drop primitive, a completed BoringSSL handshake
-whose callback observes the dedicated thread, and an incomplete BoringSSL
-handshake held inside its certificate callback until the outer wait times out.
+Upstream tests cover the abort-on-drop handle and client EOF after the caller
+drops a pending handshake. Fork tests additionally cover a completed handshake
+whose callback observes the dedicated thread and an incomplete handshake
+held inside its certificate callback until the outer wait times out.
 The test keeps the acceptor alive until the client observes closure; restoring
 the old bare spawn makes the client-closure assertion time out. The tests use
 a shorter controlled deadline rather than the listener's 60-second production
 deadline. A separate test drops the owning runtime while a task is pending,
 and another checks that two independent pools create and release all of their
 threads.
+
+Issue 02 verification on macOS used
+`cargo test --locked -p pingora-core --lib --features <backend> offload`.
+All selected tests passed for BoringSSL (13), OpenSSL (13), rustls (9), and
+s2n (9). All four runs exercised listener handshakes and runtime teardown.
+The two OpenSSL-derived runs also exercised direct cancellation and the
+certificate callback timeout with a client observing closure.
 
 Edgion owns process configuration, per-acceptor and process-total thread
 budgets, and the choice of terminating listener types. Plaintext, passthrough,

@@ -19,7 +19,6 @@ next action, and closure evidence.
 
 | Ticket | 状态 | 归属 |
 | --- | --- | --- |
-| [02 TLS offload 握手取消](upstream-main/02-tls-offload.md) | open | fork |
 | [03 路由前请求体缓冲与重试重放](upstream-main/03-request-body-replay.md) | open | cross-repository |
 | [04 异步响应 body 和 trailer 回调](upstream-main/04-response-filters.md) | open | cross-repository |
 | [05 Custom 上传失败后的提前响应](upstream-main/05-custom-early-response.md) | open | fork |

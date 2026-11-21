@@ -36,6 +36,8 @@ The `status` inside each record is authoritative.
 
 ## Implemented or resolved conclusions
 
+- [Downstream TLS offload cancellation](../features/downstream-tls-offload.md)
+  covers caller cancellation across TLS backends and runtime teardown.
 - [Connection admission permit](../features/connection-admission-permit.md#upstream-ownership-and-the-091-extension):
   upstream-main task 01 compared the upstream endpoint permit and listener tracer
   with the stream-owned custom filter guard on the 0.9.1 fork.
