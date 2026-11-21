@@ -32,7 +32,7 @@ use std::{fs::Permissions, sync::Arc};
 use tokio::net::TcpSocket;
 
 #[cfg(feature = "connection_filter")]
-use super::connection_filter::ConnectionFilter;
+use super::connection_filter::{ConnectionAdmission, ConnectionFilter};
 #[cfg(feature = "connection_filter")]
 use crate::listeners::AcceptAllFilter;
 
@@ -508,25 +508,22 @@ impl ListenerEndpoint {
                     .await
                     .or_err(AcceptError, "Fail to accept()")?;
 
-                // Performance: nested if-let avoids cloning/allocations on each connection accept
-                let should_accept = if let Some(digest) = stream.get_socket_digest() {
-                    if let Some(peer_addr) = digest.peer_addr() {
-                        self.connection_filter
-                            .should_accept(peer_addr.as_inet())
-                            .await
-                    } else {
-                        // No peer address available - accept by default
-                        true
-                    }
-                } else {
-                    // No socket digest available - accept by default
-                    true
-                };
-
-                if !should_accept {
+                // Every stream is admitted, including one without an inet peer
+                // (`None`), so a permit-tracking filter sees each accepted stream.
+                let digest = stream.get_socket_digest();
+                let peer_addr = digest
+                    .as_deref()
+                    .and_then(|digest| digest.peer_addr())
+                    .and_then(|addr| addr.as_inet());
+                let ConnectionAdmission::Accept(permit) =
+                    self.connection_filter.admit(peer_addr).await
+                else {
                     debug!("Connection rejected by filter");
                     drop(stream);
                     continue;
+                };
+                if let Some(permit) = permit {
+                    stream.set_admission_permit(permit);
                 }
 
                 self.apply_stream_settings(&mut stream)?;
@@ -746,6 +743,138 @@ mod test {
 
         assert_eq!(accept_count.load(Ordering::SeqCst), 3);
         assert_eq!(reject_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "connection_filter")]
+    #[tokio::test]
+    async fn test_connection_filter_permit_lives_with_accepted_stream() {
+        use crate::listeners::{ConnectionAdmission, ConnectionFilter, ConnectionPermit};
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Release(Arc<AtomicUsize>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        // Admits every other connection with a permit; rejects the rest.
+        #[derive(Debug)]
+        struct PermitFilter {
+            calls: AtomicUsize,
+            issued: Arc<AtomicUsize>,
+            released: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl ConnectionFilter for PermitFilter {
+            async fn admit(&self, addr: Option<&SocketAddr>) -> ConnectionAdmission {
+                assert!(
+                    addr.is_some(),
+                    "TCP peers are always admitted with an address"
+                );
+                if self.calls.fetch_add(1, Ordering::SeqCst) % 2 == 1 {
+                    return ConnectionAdmission::Reject;
+                }
+                self.issued.fetch_add(1, Ordering::SeqCst);
+                ConnectionAdmission::Accept(Some(ConnectionPermit::new(Release(
+                    self.released.clone(),
+                ))))
+            }
+        }
+
+        let issued = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicUsize::new(0));
+        let mut builder = ListenerEndpoint::builder();
+        builder
+            .listen_addr(ServerAddress::Tcp("127.0.0.1:0".into(), None))
+            .connection_filter(Arc::new(PermitFilter {
+                calls: AtomicUsize::new(0),
+                issued: issued.clone(),
+                released: released.clone(),
+            }));
+
+        #[cfg(unix)]
+        let listener = builder.listen(None).await.unwrap();
+        #[cfg(windows)]
+        let listener = builder.listen().await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let _client1 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let first = listener.accept().await.unwrap();
+        assert_eq!(issued.load(Ordering::SeqCst), 1);
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+
+        // The second connection is rejected inside accept(); the third one is
+        // returned with its own permit.
+        let _client2 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _client3 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let third = listener.accept().await.unwrap();
+        assert_eq!(issued.load(Ordering::SeqCst), 2);
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+
+        drop(first);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        drop(third);
+        assert_eq!(released.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(all(unix, feature = "connection_filter"))]
+    #[tokio::test]
+    async fn test_connection_filter_admits_non_inet_peer_with_none() {
+        use crate::listeners::{ConnectionAdmission, ConnectionFilter, ConnectionPermit};
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Release(Arc<AtomicUsize>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        // Records the peer it was consulted with and hands out a permit.
+        #[derive(Debug)]
+        struct NoneFilter {
+            saw_none: Arc<AtomicUsize>,
+            released: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl ConnectionFilter for NoneFilter {
+            async fn admit(&self, addr: Option<&SocketAddr>) -> ConnectionAdmission {
+                if addr.is_none() {
+                    self.saw_none.fetch_add(1, Ordering::SeqCst);
+                }
+                ConnectionAdmission::Accept(Some(ConnectionPermit::new(Release(
+                    self.released.clone(),
+                ))))
+            }
+        }
+
+        let path =
+            std::env::temp_dir().join(format!("pingora_admit_none_{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let saw_none = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicUsize::new(0));
+        let mut builder = ListenerEndpoint::builder();
+        builder
+            .listen_addr(ServerAddress::Uds(path.to_str().unwrap().into(), None))
+            .connection_filter(Arc::new(NoneFilter {
+                saw_none: saw_none.clone(),
+                released: released.clone(),
+            }));
+        let listener = builder.listen(None).await.unwrap();
+
+        // An unbound UDS client is admitted with `None` and carries its permit.
+        let _client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let stream = listener.accept().await.unwrap();
+        assert_eq!(saw_none.load(Ordering::SeqCst), 1);
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        drop(stream);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[cfg(feature = "connection_filter")]

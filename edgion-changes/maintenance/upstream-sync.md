@@ -133,8 +133,11 @@ unchanged. This ledger begins with subsequent periodic synchronization events.
 
 The expected shared-main conflict surface is intentionally concentrated:
 
-- `pingora-core/src/listeners/{l4.rs,mod.rs}`: L4 buffer, pre-TLS callback and
-  PROXY policy must all remain present and ordered.
+- `pingora-core/src/listeners/{l4.rs,mod.rs,connection_filter.rs}` and
+  `protocols/l4/stream.rs`: L4 buffer, pre-TLS callback and PROXY policy must all
+  remain present and ordered; every accepted stream must still go through
+  `ConnectionFilter::admit` and keep its admission permit until the l4 stream
+  drops (see [connection admission permit](../features/connection-admission-permit.md)).
 - `pingora-core/src/protocols/http/v1/server.rs` and `v2/server.rs`: session body
   facts, replay lifecycle and upstream main's proxy-task API.
 - `pingora-core/src/connectors/http/v2.rs`: keep configurable H2 windows while

@@ -122,6 +122,8 @@ terminal changes therefore require reading `proxy_cache.rs` too.
 - `../Edgion/Cargo.toml`: selected fork dependencies and local patches.
 - `../Edgion/edgion-gateway/src/runtime/server/listener_builder.rs`: listener,
   h2c/TLS/keepalive, connection-filter, and PROXY setup.
+- `../Edgion/edgion-gateway/src/runtime/server/downstream_connections.rs`: the
+  `ConnectionFilter::admit` implementation and its connection permit.
 - `../Edgion/edgion-gateway/src/routes/http/proxy_http/mod.rs`:
   `impl ProxyHttp for EdgionHttpProxy`.
 - Its sibling `pg_*.rs`: body filters, retry/framing, failures, and local reply.
@@ -134,6 +136,8 @@ consumer tree.
 
 - PROXY: `listeners/l4.rs` -> `listeners/mod.rs` ->
   `protocols/l4/proxy_protocol.rs` -> L4 stream/digest.
+- Admission permit: `listeners/connection_filter.rs` -> `listeners/l4.rs`
+  (`accept`) -> `protocols/l4/stream.rs` (`admission_permit`).
 - Replay: `protocols/http/request_body_buffer.rs` -> unified server -> H1/H2 sessions ->
   proxy retry and pumps.
 - H2 evidence: `protocols/http/v2/end_stream_watch.rs` -> H2 client -> connector

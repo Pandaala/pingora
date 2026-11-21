@@ -36,6 +36,9 @@ The `status` inside each record is authoritative.
 
 ## Implemented or resolved conclusions
 
+- [Connection admission permit](../features/connection-admission-permit.md#upstream-ownership-and-the-091-extension):
+  upstream-main task 01 compared the upstream endpoint permit and listener tracer
+  with the stream-owned custom filter guard on the 0.9.1 fork.
 - [H1 trailer write timeout](http1/h1-trailer-write-timeout.md): ISSUE-001;
   direct and queued nonempty trailer delivery uses the existing session write
   policy through flush, retaining cancellation progress and terminal accounting.

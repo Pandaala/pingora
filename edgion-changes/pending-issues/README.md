@@ -13,6 +13,20 @@ next action, and closure evidence.
 | [Non-streaming cache trailer completion](non-streaming-cache-trailer-completion.md) | Open | Fork | Discovered while closing [trailer filter parity](../review/response-trailer-filter-error-parity.md) |
 | [Custom conditional-filter gate](custom-conditional-filter-gate.md) | Open investigation | Fork custom response pump | Preserved explicitly by the shared response pipeline |
 
+## 与官方 main 的重叠项
+
+2026-11-21 对照官方 `3f87e92`、本地 `edgion_v0.9.1` 的 `e5f4287` 及当时暂存的连接准入改动。工作分支为 `edgion_v0.9.1_main`。
+
+| Ticket | 状态 | 归属 |
+| --- | --- | --- |
+| [02 TLS offload 握手取消](upstream-main/02-tls-offload.md) | open | fork |
+| [03 路由前请求体缓冲与重试重放](upstream-main/03-request-body-replay.md) | open | cross-repository |
+| [04 异步响应 body 和 trailer 回调](upstream-main/04-response-filters.md) | open | cross-repository |
+| [05 Custom 上传失败后的提前响应](upstream-main/05-custom-early-response.md) | open | fork |
+| [06 Custom 未完成响应的会话清理](upstream-main/06-custom-session-cleanup.md) | open | fork |
+
+官方 0.9.1 已带入的八项发布线改动无需再移植。上游缓存断开监测与本地缓存字节顺序属于不同契约，其与 custom 会话清理的交点见 06。
+
 ## Resolved history
 
 | Issue | Closure | Ownership | Canonical records |

@@ -72,9 +72,9 @@
 //!
 //! #[async_trait]
 //! impl ConnectionFilter for MyFilter {
-//!     async fn should_accept(&self, addr: &SocketAddr) -> bool {
-//!         // Custom logic to filter connections
-//!         !is_blocked_ip(addr.ip())
+//!     async fn should_accept(&self, addr: Option<&SocketAddr>) -> bool {
+//!         // Custom logic to filter connections; `None` means a non-inet peer
+//!         addr.map_or(true, |addr| !is_blocked_ip(addr.ip()))
 //!     }
 //! }
 //!

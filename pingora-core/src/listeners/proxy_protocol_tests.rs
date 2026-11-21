@@ -509,3 +509,88 @@ async fn test_trusted_peer_with_header_is_honoured() {
     client.write_all(&v2_inet_header()).await.unwrap();
     server.await.unwrap();
 }
+
+#[cfg(feature = "connection_filter")]
+mod admission_permit {
+    use super::*;
+    use crate::listeners::{ConnectionAdmission, ConnectionFilter, ConnectionPermit};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct Release(Arc<AtomicUsize>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct PermitFilter(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl ConnectionFilter for PermitFilter {
+        async fn admit(&self, _addr: Option<&std::net::SocketAddr>) -> ConnectionAdmission {
+            ConnectionAdmission::Accept(Some(ConnectionPermit::new(Release(self.0.clone()))))
+        }
+    }
+
+    async fn proxy_listener(released: &Arc<AtomicUsize>) -> TransportStack {
+        let mut listeners = Listeners::new();
+        listeners.add_tcp_with_settings(
+            "127.0.0.1:0",
+            TcpSocketOptions {
+                proxy_protocol: true,
+                ..Default::default()
+            },
+        );
+        listeners.set_connection_filter(Arc::new(PermitFilter(released.clone())));
+        listeners
+            .build(
+                #[cfg(unix)]
+                None,
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+    }
+
+    // The permit must survive the PROXY rewrite of the stream and be released
+    // only when the handshaken IO drops.
+    #[tokio::test]
+    async fn test_permit_survives_proxy_handshake_until_io_drops() {
+        let released = Arc::new(AtomicUsize::new(0));
+        let listener = proxy_listener(&released).await;
+        let addr = listener.l4.local_addr().unwrap();
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"PROXY TCP4 192.168.0.1 10.0.0.2 56324 443\r\nhello")
+            .await
+            .unwrap();
+
+        let mut stream = listener.accept().await.unwrap().handshake().await.unwrap();
+        let mut buf = [0; 5];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+        assert_eq!(released.load(Ordering::SeqCst), 0, "released before the IO dropped");
+        drop(stream);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_failed_proxy_handshake_releases_permit() {
+        let released = Arc::new(AtomicUsize::new(0));
+        let listener = proxy_listener(&released).await;
+        let addr = listener.l4.local_addr().unwrap();
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+
+        let stream = listener.accept().await.unwrap();
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        assert!(stream.handshake().await.is_err());
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+}

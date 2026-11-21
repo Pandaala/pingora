@@ -42,9 +42,10 @@
 //! narrow as possible and ensure each trusted peer injects the header rather
 //! than forwarding attacker-controlled leading bytes.
 //!
-//! Note that with the `connection_filter` feature, `should_accept()` runs at
-//! accept time, before this header is parsed, so it always observes the load
-//! balancer's address rather than the real client's.
+//! Note that with the `connection_filter` feature, `ConnectionFilter::admit()`
+//! (which defaults to `should_accept()`) runs at accept time, before this header
+//! is parsed, so it always observes the load balancer's address rather than the
+//! real client's.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr as StdSockAddr};
 

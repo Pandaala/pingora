@@ -540,9 +540,18 @@ pub struct Stream {
     write_pending_time: AccumulatedDuration,
     /// Last rx timestamp associated with the last recvmsg call.
     pub rx_ts: Option<SystemTime>,
+    /// Listener admission permit; dropped together with this stream.
+    #[cfg(feature = "connection_filter")]
+    admission_permit: Option<crate::listeners::ConnectionPermit>,
 }
 
 impl Stream {
+    /// Attach the listener admission permit owned by this accepted stream.
+    #[cfg(feature = "connection_filter")]
+    pub(crate) fn set_admission_permit(&mut self, permit: crate::listeners::ConnectionPermit) {
+        self.admission_permit = Some(permit);
+    }
+
     fn stream(&self) -> &BufferedStream {
         self.stream.as_ref().expect("stream should always be set")
     }
@@ -660,6 +669,8 @@ impl From<TcpStream> for Stream {
             read_pending_time: AccumulatedDuration::new(),
             write_pending_time: AccumulatedDuration::new(),
             rx_ts: None,
+            #[cfg(feature = "connection_filter")]
+            admission_permit: None,
         }
     }
 }
@@ -683,6 +694,8 @@ impl From<virt::VirtualSocketStream> for Stream {
             read_pending_time: AccumulatedDuration::new(),
             write_pending_time: AccumulatedDuration::new(),
             rx_ts: None,
+            #[cfg(feature = "connection_filter")]
+            admission_permit: None,
         }
     }
 }
@@ -707,6 +720,8 @@ impl From<UnixStream> for Stream {
             read_pending_time: AccumulatedDuration::new(),
             write_pending_time: AccumulatedDuration::new(),
             rx_ts: None,
+            #[cfg(feature = "connection_filter")]
+            admission_permit: None,
         }
     }
 }

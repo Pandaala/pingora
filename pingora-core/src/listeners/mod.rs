@@ -49,7 +49,9 @@ mod l4;
 pub mod connection_filter;
 
 #[cfg(feature = "connection_filter")]
-pub use connection_filter::{AcceptAllFilter, ConnectionFilter};
+pub use connection_filter::{
+    AcceptAllFilter, ConnectionAdmission, ConnectionFilter, ConnectionPermit,
+};
 
 #[cfg(not(feature = "connection_filter"))]
 #[derive(Debug, Clone)]

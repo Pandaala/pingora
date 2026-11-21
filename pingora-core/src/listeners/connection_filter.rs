@@ -28,8 +28,44 @@
 //! When the feature is disabled, a no-op implementation is provided for API compatibility.
 
 use async_trait::async_trait;
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 use std::net::SocketAddr;
+
+/// Opaque value that an accepted downstream stream owns for its whole lifetime.
+///
+/// A filter returns a permit from [`ConnectionFilter::admit`]; the listener
+/// attaches it to the accepted l4 stream, and it is dropped exactly once when
+/// that stream is dropped. An offloaded TLS handshake that still owns the
+/// stream after the caller times out also retains its permit.
+/// Implement `Drop` on the wrapped value to
+/// observe the end of the connection, for example to release a counter slot.
+pub struct ConnectionPermit {
+    _value: Box<dyn Send + Sync>,
+}
+
+impl ConnectionPermit {
+    /// Wrap a value that must live exactly as long as the accepted stream.
+    pub fn new<T: Send + Sync + 'static>(value: T) -> Self {
+        Self {
+            _value: Box::new(value),
+        }
+    }
+}
+
+impl Debug for ConnectionPermit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ConnectionPermit")
+    }
+}
+
+/// Admission decision returned by [`ConnectionFilter::admit`].
+#[derive(Debug)]
+pub enum ConnectionAdmission {
+    /// Accept the connection, optionally attaching a permit to the stream.
+    Accept(Option<ConnectionPermit>),
+    /// Drop the connection immediately.
+    Reject,
+}
 
 /// A trait for filtering incoming connections at the TCP level.
 ///
@@ -66,8 +102,10 @@ use std::net::SocketAddr;
 pub trait ConnectionFilter: Debug + Send + Sync {
     /// Determines whether an incoming connection should be accepted.
     ///
-    /// This method is called after a TCP connection is accepted but before
-    /// any further processing (including TLS handshake).
+    /// The default [`Self::admit`] calls this method after a TCP connection is
+    /// accepted but before any further processing (including TLS handshake).
+    /// A filter that overrides `admit` replaces this decision for listener
+    /// admission.
     ///
     /// Note that this runs before any PROXY protocol header is parsed, so on
     /// a listener with [`crate::listeners::TcpSocketOptions::proxy_protocol`]
@@ -96,6 +134,30 @@ pub trait ConnectionFilter: Debug + Send + Sync {
     ///
     async fn should_accept(&self, _addr: Option<&SocketAddr>) -> bool {
         true
+    }
+
+    /// Admit an incoming connection, optionally returning a [`ConnectionPermit`]
+    /// that the accepted stream owns until it is dropped.
+    ///
+    /// The listener calls this method for every accepted stream, with `None`
+    /// when the peer has no inet address. The default implementation keeps the
+    /// [`Self::should_accept`] decision and attaches no permit. Implementations
+    /// that override `admit` replace `should_accept` for listener admission.
+    ///
+    /// Each accept task awaits this method before accepting its next connection.
+    /// With multiple accept tasks per listening socket, other tasks can continue
+    /// accepting connections while this call is pending.
+    ///
+    /// The returned future may be dropped before it completes (listener
+    /// shutdown cancels a pending accept). Any reservation taken before an
+    /// `.await` must therefore release itself on drop (RAII) rather than rely on
+    /// reaching the end of the method.
+    async fn admit(&self, addr: Option<&SocketAddr>) -> ConnectionAdmission {
+        if self.should_accept(addr).await {
+            ConnectionAdmission::Accept(None)
+        } else {
+            ConnectionAdmission::Reject
+        }
     }
 }
 
@@ -148,5 +210,47 @@ mod tests {
 
         assert!(!filter.should_accept(Some(&blocked_addr)).await);
         assert!(filter.should_accept(Some(&allowed_addr)).await);
+    }
+
+    #[tokio::test]
+    async fn test_default_admit_keeps_should_accept_decision_without_permit() {
+        let filter = BlockListFilter {
+            blocked_ips: vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))],
+        };
+        let blocked_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8080);
+        let allowed_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 8080);
+
+        assert!(matches!(
+            filter.admit(Some(&blocked_addr)).await,
+            ConnectionAdmission::Reject
+        ));
+        assert!(matches!(
+            filter.admit(Some(&allowed_addr)).await,
+            ConnectionAdmission::Accept(None)
+        ));
+        assert!(matches!(
+            filter.admit(None).await,
+            ConnectionAdmission::Accept(None)
+        ));
+    }
+
+    #[test]
+    fn test_permit_drops_wrapped_value_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct Release(Arc<AtomicUsize>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let released = Arc::new(AtomicUsize::new(0));
+        let permit = ConnectionPermit::new(Release(released.clone()));
+        assert_eq!(format!("{permit:?}"), "ConnectionPermit");
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        drop(permit);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
     }
 }

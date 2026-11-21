@@ -43,3 +43,26 @@ oversized trailer blocks before publishing trailers. Then:
 An upstream release preserving received END_STREAM across reset is not enough
 on its own: byte delivery, terminal HEADERS validation, local reset ordering,
 and GOAWAY/connection state remain separate contracts.
+
+## `pingora-http` `insert_header_value` uses the panicking `HeaderMap::insert`
+
+Status: open upstream limitation; consumer-side bounds in Edgion (2026-11-12).
+
+`insert_header_value` (`pingora-http/src/lib.rs`) calls `http::HeaderMap::insert` for both the
+case map and the value map. `http` 1.5.0 panics there once the map cannot grow: in the
+displacement-danger state at raw capacity 32,768 with at least 6,554 distinct names, or at 24,576
+names. Upstream commit `e21646b` moved only the sibling `append_header_value` to `try_append`;
+upstream `main` still has the panicking `insert`. The code is inherited unchanged, so the fork does
+not patch it.
+
+Edgion bounds the callers that feed untrusted names into `insert_header`: ExtProc header mutations
+(at most 256 set entries) and Wasm guest header writes (at most 1,024 per hook phase). See Edgion
+`skills/04-review/ext-proc/regression-guards/header-mutation-operation-cap.md`,
+`skills/04-review/wasm/regression-guards/header-write-cap-per-phase.md`, and the residual task
+`tasks/todo/header-map-insert-max-size-residuals.md`.
+
+### Revisit trigger
+
+Re-evaluate when upstream makes `insert_header_value` fallible (for example `try_insert` mapped
+to `InvalidHTTPHeader`, like `append_header_value`). Adopt it normally and add a regression test
+that inserts past the map limit without panicking.

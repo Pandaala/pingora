@@ -30,12 +30,14 @@ back to `None`, because `None` means mandatory PROXY parsing for every peer.
 
 ## Ordering
 
-The optional `ConnectionFilter` runs at socket acceptance and sees the kernel
-peer address. Accepted streams then receive configured L4 buffer sizes. The
-built-in PROXY parser runs before TLS because the PROXY header precedes
-ClientHello. The generic pre-TLS callback remains available and runs
-afterwards; it can inspect the rewritten digest but does not retroactively
-change the earlier connection-filter decision.
+The optional `ConnectionFilter` runs at socket acceptance (through
+`ConnectionFilter::admit`) and sees the kernel peer address; an admission permit
+it returns is owned by the accepted stream, see
+[connection admission permit](connection-admission-permit.md). Accepted streams
+then receive configured L4 buffer sizes. The built-in PROXY parser runs before
+TLS because the PROXY header precedes ClientHello. The generic pre-TLS callback
+remains available and runs afterwards; it can inspect the rewritten digest but
+does not retroactively change the earlier connection-filter decision.
 
 Listener accept paths snapshot the transport peer into both `peer_addr` and
 `raw_peer_addr`. The latter therefore remains the original socket peer after
